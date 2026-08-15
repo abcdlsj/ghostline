@@ -6,24 +6,24 @@ import (
 	"sync"
 )
 
-// queryResponder answers terminal capability queries while a session has no
+// QueryResponder answers terminal capability queries while a session has no
 // attached terminal client. TUIs such as Codex send DA/DSR/OSC/kitty
 // keyboard queries at startup; tmux answers them through its own emulator,
 // but a raw PTY has nobody to answer until a client attaches, so the
 // application would downgrade itself (for example disabling colors). Replies
 // are written back into the PTY as input, never into the output spool.
-type queryResponder struct {
+type QueryResponder struct {
 	mu      sync.Mutex
 	pending []byte
 	rows    int
 	cols    int
 }
 
-func newQueryResponder() *queryResponder {
-	return &queryResponder{rows: 36, cols: 120}
+func NewQueryResponder() *QueryResponder {
+	return &QueryResponder{rows: 36, cols: 120}
 }
 
-func (r *queryResponder) Resize(columns, rows int) {
+func (r *QueryResponder) Resize(columns, rows int) {
 	if columns <= 0 || rows <= 0 {
 		return
 	}
@@ -36,7 +36,7 @@ func (r *queryResponder) Resize(columns, rows int) {
 // Feed scans output bytes for complete terminal queries and returns the
 // replies to write back into the PTY. Queries split across chunks are
 // buffered until complete or until they prove not to be queries.
-func (r *queryResponder) Feed(data []byte) [][]byte {
+func (r *QueryResponder) Feed(data []byte) [][]byte {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.pending = append(r.pending, data...)
@@ -133,7 +133,7 @@ func oscEnd(body []byte) (index int, complete bool) {
 	return -1, false
 }
 
-func (r *queryResponder) csiReply(sequence []byte) []byte {
+func (r *QueryResponder) csiReply(sequence []byte) []byte {
 	final := sequence[len(sequence)-1]
 	params := sequence[:len(sequence)-1]
 	switch final {
@@ -183,7 +183,7 @@ func (r *queryResponder) csiReply(sequence []byte) []byte {
 	return nil
 }
 
-func (r *queryResponder) oscReply(sequence []byte) []byte {
+func (r *QueryResponder) oscReply(sequence []byte) []byte {
 	switch string(sequence) {
 	case "10;?":
 		return []byte("\x1b]10;rgb:ffff/ffff/ffff\x1b\\")

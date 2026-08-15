@@ -12,7 +12,7 @@ func replyStrings(replies [][]byte) []string {
 	return result
 }
 
-func assertReplies(t *testing.T, responder *queryResponder, data []byte, want ...string) {
+func assertReplies(t *testing.T, responder *QueryResponder, data []byte, want ...string) {
 	t.Helper()
 	got := replyStrings(responder.Feed(data))
 	if len(got) != len(want) {
@@ -26,7 +26,7 @@ func assertReplies(t *testing.T, responder *queryResponder, data []byte, want ..
 }
 
 func TestQueryResponderAnswersCapabilityQueries(t *testing.T) {
-	responder := newQueryResponder()
+	responder := NewQueryResponder()
 	assertReplies(t, responder, []byte("\x1b[c"), "\x1b[?62;c")
 	assertReplies(t, responder, []byte("\x1b[0c"), "\x1b[?62;c")
 	assertReplies(t, responder, []byte("\x1b[>c"), "\x1b[>0;0;0c")
@@ -40,14 +40,14 @@ func TestQueryResponderAnswersCapabilityQueries(t *testing.T) {
 }
 
 func TestQueryResponderReportsWindowSize(t *testing.T) {
-	responder := newQueryResponder()
+	responder := NewQueryResponder()
 	responder.Resize(100, 40)
 	assertReplies(t, responder, []byte("\x1b[14t"), "\x1b[4;40;100t")
 	assertReplies(t, responder, []byte("\x1b[18t"), "\x1b[8;40;100t")
 }
 
 func TestQueryResponderHandlesSplitQueries(t *testing.T) {
-	responder := newQueryResponder()
+	responder := NewQueryResponder()
 	if replies := responder.Feed([]byte("hello ")); len(replies) != 0 {
 		t.Fatalf("plain text must not reply, got %q", replyStrings(replies))
 	}
@@ -60,7 +60,7 @@ func TestQueryResponderHandlesSplitQueries(t *testing.T) {
 }
 
 func TestQueryResponderIgnoresNonQueries(t *testing.T) {
-	responder := newQueryResponder()
+	responder := NewQueryResponder()
 	assertReplies(t, responder, []byte("\x1b[31m"))
 	assertReplies(t, responder, []byte("\x1b[2J\x1b[H"))
 	assertReplies(t, responder, []byte("\x1b]0;title\x1b\\"))
@@ -72,7 +72,7 @@ func TestQueryResponderIgnoresNonQueries(t *testing.T) {
 }
 
 func TestQueryResponderBuffersAcrossPlainText(t *testing.T) {
-	responder := newQueryResponder()
+	responder := NewQueryResponder()
 	assertReplies(t, responder, []byte("a"))
 	assertReplies(t, responder, []byte("\x1b"))
 	assertReplies(t, responder, []byte("[6n"), "\x1b[1;1R")
