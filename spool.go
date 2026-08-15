@@ -1,10 +1,12 @@
 package ghostline
 
 import (
+	"fmt"
 	"context"
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,15 +29,17 @@ type SpoolRecoverer interface {
 type SpoolWatcher struct {
 	path       string
 	file       *os.File
-	offset     int64
+	offset     atomic.Int64
 	maxBytes   int64
 	interval   time.Duration
+	buffer     []byte
 	onBytes    func([]byte)
 	onRotate   func()
 	onOverflow func()
 
 	ping      chan struct{}
 	done      chan struct{}
+	startOnce sync.Once
 	closeOnce sync.Once
 	readMu    sync.Mutex
 	paused    bool
@@ -62,10 +66,9 @@ func NewSpoolWatcher(path string, offset int64, onBytes func([]byte), onRotate f
 		_ = file.Close()
 		return nil, err
 	}
-	return &SpoolWatcher{
+	w := &SpoolWatcher{
 		path:       path,
 		file:       file,
-		offset:     offset,
 		maxBytes:   64 * 1024 * 1024,
 		interval:   10 * time.Millisecond,
 		onBytes:    onBytes,
@@ -73,7 +76,9 @@ func NewSpoolWatcher(path string, offset int64, onBytes func([]byte), onRotate f
 		onOverflow: onOverflow,
 		ping:       make(chan struct{}, 1),
 		done:       make(chan struct{}),
-	}, nil
+	}
+	w.offset.Store(offset)
+	return w, nil
 }
 
 type spoolOffsetError struct {
@@ -101,7 +106,7 @@ func itoa(value int64) string {
 }
 
 func (w *SpoolWatcher) Offset() int64 {
-	return w.offset
+	return w.offset.Load()
 }
 
 // SetMaxBytes configures the spool size cap before Start. When the watcher
@@ -123,7 +128,7 @@ func (w *SpoolWatcher) Ping() {
 }
 
 func (w *SpoolWatcher) Start() {
-	go w.loop()
+	w.startOnce.Do(func() { go w.loop() })
 }
 
 func (w *SpoolWatcher) Close() {
@@ -155,10 +160,20 @@ func (w *SpoolWatcher) Resume() {
 func (w *SpoolWatcher) SkipTo(offset int64) error {
 	w.readMu.Lock()
 	defer w.readMu.Unlock()
+	if !w.paused {
+		return fmt.Errorf("skip spool watcher while running")
+	}
+	info, err := w.file.Stat()
+	if err != nil {
+		return err
+	}
+	if offset < 0 || offset > info.Size() {
+		return &spoolOffsetError{Path: w.path, Offset: offset, Size: info.Size()}
+	}
 	if _, err := w.file.Seek(offset, io.SeekStart); err != nil {
 		return err
 	}
-	w.offset = offset
+	w.offset.Store(offset)
 	return nil
 }
 
@@ -188,27 +203,35 @@ func (w *SpoolWatcher) drain() {
 	if err != nil {
 		return
 	}
-	if info.Size() < w.offset {
+	offset := w.offset.Load()
+	if info.Size() < offset {
 		// In-place compaction rotated the spool. Re-base and tell Host to
 		// bump the epoch; bytes before the truncate are intentionally
 		// replaced by a tmux snapshot reanchor.
 		if _, err := w.file.Seek(0, io.SeekStart); err != nil {
 			return
 		}
-		w.offset = 0
+		offset = 0
+		w.offset.Store(0)
 		if w.onRotate != nil {
 			w.onRotate()
 		}
 	}
+	if info.Size() == offset {
+		return
+	}
+	if w.buffer == nil {
+		w.buffer = make([]byte, 64*1024)
+	}
 	for {
-		buffer := make([]byte, 256*1024)
-		read, readErr := w.file.Read(buffer)
+		read, readErr := w.file.Read(w.buffer)
 		if read > 0 {
-			w.offset += int64(read)
+			offset += int64(read)
+			w.offset.Store(offset)
 			if w.onBytes != nil {
-				w.onBytes(buffer[:read])
+				w.onBytes(w.buffer[:read])
 			}
-			if w.maxBytes > 0 && w.offset > w.maxBytes && w.onOverflow != nil {
+			if w.maxBytes > 0 && offset > w.maxBytes && w.onOverflow != nil {
 				w.onOverflow()
 			}
 		}
