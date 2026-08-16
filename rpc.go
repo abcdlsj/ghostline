@@ -1,0 +1,116 @@
+package ghostline
+
+import (
+	"bufio"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+)
+
+const (
+	maxRPCLine     = 1 << 20
+	rpcIdleTimeout = time.Minute
+	maxConnections = 64
+)
+
+type request struct {
+	ID     int64           `json:"id"`
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params,omitempty"`
+}
+
+type response struct {
+	ID     int64           `json:"id"`
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  *rpcError       `json:"error,omitempty"`
+}
+
+type rpcError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+func rpcCode(err error) string {
+	switch {
+	case errors.Is(err, ErrUnavailable):
+		return "unavailable"
+	case errors.Is(err, ErrClosed):
+		return "closed"
+	case errors.Is(err, ErrSessionExists):
+		return "session_exists"
+	case errors.Is(err, ErrSessionNotFound):
+		return "session_not_found"
+	case errors.Is(err, ErrSessionClosed):
+		return "session_closed"
+	case errors.Is(err, ErrInvalidSessionName):
+		return "invalid_name"
+	default:
+		return "internal"
+	}
+}
+
+func decodeRPCError(rpcErr *rpcError) error {
+	if rpcErr == nil {
+		return nil
+	}
+	var sentinel error
+	switch rpcErr.Code {
+	case "unavailable":
+		sentinel = ErrUnavailable
+	case "closed":
+		sentinel = ErrClosed
+	case "session_exists":
+		sentinel = ErrSessionExists
+	case "session_not_found":
+		sentinel = ErrSessionNotFound
+	case "session_closed":
+		sentinel = ErrSessionClosed
+	case "invalid_name":
+		sentinel = ErrInvalidSessionName
+	}
+	if sentinel != nil {
+		return fmt.Errorf("%w: %s", sentinel, rpcErr.Message)
+	}
+	return errors.New(rpcErr.Message)
+}
+
+func writeResponse(writer *bufio.Writer, id int64, result any, err error) error {
+	value := response{ID: id}
+	if err != nil {
+		value.Error = &rpcError{Code: rpcCode(err), Message: err.Error()}
+	} else if result != nil {
+		encoded, marshalErr := json.Marshal(result)
+		if marshalErr != nil {
+			value.Error = &rpcError{Code: "internal", Message: marshalErr.Error()}
+		} else {
+			value.Result = encoded
+		}
+	}
+	encoded, marshalErr := json.Marshal(value)
+	if marshalErr != nil {
+		return marshalErr
+	}
+	if _, err := writer.Write(append(encoded, '\n')); err != nil {
+		return err
+	}
+	return writer.Flush()
+}
+
+func readLine(reader *bufio.Reader, limit int) ([]byte, error) {
+	line := make([]byte, 0, 256)
+	for {
+		chunk, err := reader.ReadSlice('\n')
+		line = append(line, chunk...)
+		if len(line) > limit {
+			return nil, errors.New("rpc message too large")
+		}
+		if err == nil {
+			return line, nil
+		}
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		return nil, err
+	}
+}

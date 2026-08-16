@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	"github.com/abcdlsj/ghostline"
 )
@@ -52,8 +55,13 @@ func serveCommand(args []string) {
 		fmt.Fprintf(os.Stderr, "ghostline serve: %v\n", err)
 		os.Exit(1)
 	}
-	if err := server.Serve(*socket); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := server.Serve(ctx, *socket); err != nil {
 		fmt.Fprintf(os.Stderr, "ghostline serve: %v\n", err)
 		os.Exit(1)
+	}
+	if ctx.Err() != nil {
+		_ = server.Shutdown(context.Background())
 	}
 }

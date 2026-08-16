@@ -5,29 +5,11 @@ import (
 	"context"
 	"errors"
 	"os"
-	"os/exec"
 	"testing"
 	"time"
 
 	"github.com/abcdlsj/ghostline"
 )
-
-func newHub(t *testing.T, options ghostline.Options) *ghostline.Hub {
-	t.Helper()
-	if options.OutputDir == "" {
-		options.OutputDir = t.TempDir()
-	}
-	hub, err := ghostline.New(options)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := hub.Close(); err != nil {
-			t.Errorf("Close hub: %v", err)
-		}
-	})
-	return hub
-}
 
 func waitForSpool(t *testing.T, session *ghostline.Session, needle string) {
 	t.Helper()
@@ -43,7 +25,7 @@ func waitForSpool(t *testing.T, session *ghostline.Session, needle string) {
 	t.Fatalf("spool did not contain %q; got %q", needle, data)
 }
 
-func TestManagerStartConfiguresSizeAndEnvironment(t *testing.T) {
+func TestStartConfiguresSizeAndEnvironment(t *testing.T) {
 	hub := newHub(t, ghostline.Options{
 		DefaultSize: ghostline.Size{Columns: 90, Rows: 28},
 	})
@@ -96,8 +78,8 @@ func TestSessionWatchOutputAndWait(t *testing.T) {
 		t.Fatal("timed out waiting for output")
 	}
 	waitErr := session.Wait(context.Background())
-	var exitErr *exec.ExitError
-	if !errors.As(waitErr, &exitErr) || exitErr.ExitCode() != 7 {
+	var exitErr *ghostline.ExitError
+	if !errors.As(waitErr, &exitErr) || exitErr.Code != 7 {
 		t.Fatalf("Wait error = %v, want exit code 7", waitErr)
 	}
 }
@@ -152,36 +134,7 @@ func TestSessionWaitCancellationDoesNotTerminateChild(t *testing.T) {
 	}
 }
 
-func TestSessionHandleCannotAffectReplacement(t *testing.T) {
-	hub := newHub(t, ghostline.Options{})
-	oldSession, err := hub.Start(context.Background(), ghostline.SessionOptions{
-		Name:      "reused",
-		Directory: t.TempDir(),
-		Command:   "sleep 30",
-	})
-	if err != nil {
-		t.Fatalf("Start old session: %v", err)
-	}
-	if err := oldSession.Close(); err != nil {
-		t.Fatalf("Close old session: %v", err)
-	}
-	newSession, err := hub.Start(context.Background(), ghostline.SessionOptions{
-		Name:      "reused",
-		Directory: t.TempDir(),
-		Command:   "sleep 30",
-	})
-	if err != nil {
-		t.Fatalf("Start replacement: %v", err)
-	}
-	if err := oldSession.Input(context.Background(), []byte("x")); !errors.Is(err, ghostline.ErrSessionClosed) {
-		t.Fatalf("old Input error = %v", err)
-	}
-	if !newSession.Alive() {
-		t.Fatal("old handle affected replacement session")
-	}
-}
-
-func TestManagerErrorsAreInspectable(t *testing.T) {
+func TestErrorsAreInspectable(t *testing.T) {
 	hub := newHub(t, ghostline.Options{})
 	options := ghostline.SessionOptions{Name: "duplicate", Directory: t.TempDir(), Command: "sleep 30"}
 	if _, err := hub.Start(context.Background(), options); err != nil {
@@ -201,7 +154,7 @@ func TestManagerErrorsAreInspectable(t *testing.T) {
 	}
 }
 
-func TestManagerNewRejectsInvalidDefaultSize(t *testing.T) {
+func TestNewRejectsInvalidDefaultSize(t *testing.T) {
 	for _, size := range []ghostline.Size{
 		{Columns: 0, Rows: 24},
 		{Columns: 120, Rows: 0},
@@ -237,7 +190,7 @@ func TestSessionResizeRejectsInvalidSizes(t *testing.T) {
 	}
 }
 
-func TestManagerSessionsIncludesExitedAndIsOrdered(t *testing.T) {
+func TestSessionsIncludesStoppedAndIsOrdered(t *testing.T) {
 	hub := newHub(t, ghostline.Options{})
 	first, err := hub.Start(context.Background(), ghostline.SessionOptions{
 		Name:      "session-b",
@@ -264,14 +217,16 @@ func TestManagerSessionsIncludesExitedAndIsOrdered(t *testing.T) {
 	}
 	sessions = hub.Sessions()
 	if len(sessions) != 2 {
-		t.Fatalf("Sessions after exit = %d, want 2", len(sessions))
+		t.Fatalf("Sessions after Close = %d, want 2", len(sessions))
 	}
-	if handle, ok := hub.Session(first.Name()); !ok || handle.Alive() {
-		t.Fatalf("exited session lookup = ok:%v alive:%v", ok, handle.Alive())
+	if handle, ok := hub.Session(first.Name()); !ok {
+		t.Fatal("stopped session lookup failed")
+	} else if handle.Alive() {
+		t.Fatal("stopped session reported alive")
 	}
 }
 
-func TestSessionHandleAfterManagerClose(t *testing.T) {
+func TestSessionHandleAfterHubClose(t *testing.T) {
 	hub := newHub(t, ghostline.Options{})
 	session, err := hub.Start(context.Background(), ghostline.SessionOptions{
 		Name:      "after-close",

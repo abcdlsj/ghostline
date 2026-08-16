@@ -3,27 +3,25 @@ package ghostline
 import (
 	"bufio"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
+	"time"
 )
 
-// Server owns PTY sessions in a standalone process so clients (for example a
-// headless daemon) can restart without ending any session. The server writes
-// raw PTY bytes to the same append-only spool files; clients read those files
-// directly for incremental output and recovery.
-//
-// The wire protocol is one JSON object per line on a Unix socket. Binary
-// payloads (input, snapshots) are base64 fields.
+// Server owns PTY sessions in a standalone process so clients can restart
+// without ending any session. The wire protocol is one JSON object per line
+// on a Unix socket; []byte fields use JSON base64 encoding automatically.
 type Server struct {
 	hub      *Hub
+	mu       sync.Mutex
 	listener net.Listener
 }
 
+// NewServer constructs a server with its own hub.
 func NewServer(options Options) (*Server, error) {
 	hub, err := New(options)
 	if err != nil {
@@ -32,48 +30,75 @@ func NewServer(options Options) (*Server, error) {
 	return &Server{hub: hub}, nil
 }
 
-// Serve listens on socketPath and handles requests until the listener closes.
-// The socket directory must exist and be private.
-func (s *Server) Serve(socketPath string) error {
+// Serve listens on socketPath and handles requests until ctx is canceled or
+// the listener fails. The socket is created with mode 0600.
+func (s *Server) Serve(ctx context.Context, socketPath string) error {
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
-		return fmt.Errorf("create ghostline socket directory: %w", err)
+		return fmt.Errorf("create socket dir: %w", err)
 	}
 	_ = os.Remove(socketPath)
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
-		return fmt.Errorf("listen ghostline socket: %w", err)
+		return fmt.Errorf("listen: %w", err)
 	}
+	if err := os.Chmod(socketPath, 0o600); err != nil {
+		_ = listener.Close()
+		_ = os.Remove(socketPath)
+		return fmt.Errorf("chmod socket: %w", err)
+	}
+	s.mu.Lock()
 	s.listener = listener
+	s.mu.Unlock()
 	defer listener.Close()
 	defer os.Remove(socketPath)
+	go func() {
+		<-ctx.Done()
+		_ = listener.Close()
+	}()
+
+	slots := make(chan struct{}, maxConnections)
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			return err
 		}
-		go s.handle(connection)
+		select {
+		case slots <- struct{}{}:
+			go func() {
+				defer func() { <-slots }()
+				s.handle(connection)
+			}()
+		default:
+			_ = connection.Close()
+		}
 	}
 }
 
-// Close stops accepting connections. In-flight handlers finish before the
-// process exits.
+// Close stops accepting connections. Sessions keep running.
 func (s *Server) Close() error {
-	if s.listener != nil {
-		return s.listener.Close()
+	s.mu.Lock()
+	listener := s.listener
+	s.mu.Unlock()
+	if listener == nil {
+		return nil
 	}
-	return nil
+	return listener.Close()
 }
 
-type request struct {
-	ID     int64           `json:"id"`
-	Method string          `json:"method"`
-	Params json.RawMessage `json:"params,omitempty"`
-}
-
-type response struct {
-	ID     int64           `json:"id"`
-	Result json.RawMessage `json:"result,omitempty"`
-	Error  string          `json:"error,omitempty"`
+// Shutdown stops accepting connections and terminates every session.
+func (s *Server) Shutdown(ctx context.Context) error {
+	_ = s.Close()
+	done := make(chan error, 1)
+	go func() { done <- s.hub.Close() }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (s *Server) handle(connection net.Conn) {
@@ -81,23 +106,21 @@ func (s *Server) handle(connection net.Conn) {
 	reader := bufio.NewReader(connection)
 	writer := bufio.NewWriter(connection)
 	for {
-		line, err := reader.ReadBytes('\n')
+		_ = connection.SetReadDeadline(time.Now().Add(rpcIdleTimeout))
+		line, err := readLine(reader, maxRPCLine)
 		if err != nil {
-			if err != io.EOF {
-				_, _ = writer.WriteString(marshalResponse(-1, nil, err))
-				_ = writer.Flush()
-			}
 			return
 		}
+		_ = connection.SetReadDeadline(time.Time{})
 		var req request
 		if err := json.Unmarshal(line, &req); err != nil {
-			_, _ = writer.WriteString(marshalResponse(-1, nil, err))
-			_ = writer.Flush()
+			_ = writeResponse(writer, -1, nil, fmt.Errorf("invalid request: %w", err))
+			continue
+		}
+		result, dispatchErr := s.dispatch(req.Method, req.Params)
+		if err := writeResponse(writer, req.ID, result, dispatchErr); err != nil {
 			return
 		}
-		result, err := s.dispatch(req.Method, req.Params)
-		_, _ = writer.WriteString(marshalResponse(req.ID, result, err))
-		_ = writer.Flush()
 	}
 }
 
@@ -106,27 +129,79 @@ func (s *Server) dispatch(method string, raw json.RawMessage) (any, error) {
 	switch method {
 	case "create":
 		var params struct {
-			Name    string `json:"name"`
-			Dir     string `json:"dir"`
-			Command string `json:"command"`
+			Name    string   `json:"name"`
+			Dir     string   `json:"dir"`
+			Command string   `json:"command"`
+			Cols    int      `json:"cols"`
+			Rows    int      `json:"rows"`
+			Env     []string `json:"env"`
 		}
 		if err := json.Unmarshal(raw, &params); err != nil {
 			return nil, err
 		}
-		return nil, s.hub.Create(ctx, params.Name, params.Dir, params.Command)
-	case "input":
-		var params struct {
-			Name string `json:"name"`
-			Data string `json:"data"`
-		}
-		if err := json.Unmarshal(raw, &params); err != nil {
-			return nil, err
-		}
-		data, err := base64.StdEncoding.DecodeString(params.Data)
+		session, err := s.hub.Start(ctx, SessionOptions{
+			Name:        params.Name,
+			Directory:   params.Dir,
+			Command:     params.Command,
+			Size:        Size{Columns: params.Cols, Rows: params.Rows},
+			Environment: params.Env,
+		})
 		if err != nil {
 			return nil, err
 		}
-		return nil, s.hub.Input(ctx, params.Name, data)
+		return map[string]int64{"created": session.CreatedAt().Unix()}, nil
+
+	case "status":
+		name, err := nameParam(raw)
+		if err != nil {
+			return nil, err
+		}
+		session, ok := s.hub.Session(name)
+		if !ok {
+			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, name)
+		}
+		return session.status(), nil
+
+	case "close":
+		name, err := nameParam(raw)
+		if err != nil {
+			return nil, err
+		}
+		session, ok := s.hub.Session(name)
+		if !ok {
+			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, name)
+		}
+		return nil, session.Close()
+
+	case "remove":
+		name, err := nameParam(raw)
+		if err != nil {
+			return nil, err
+		}
+		session, ok := s.hub.Session(name)
+		if !ok {
+			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, name)
+		}
+		status := session.status()
+		if err := session.Remove(); err != nil {
+			return nil, err
+		}
+		return map[string]any{"exit": status.Exit}, nil
+
+	case "input":
+		var params struct {
+			Name string `json:"name"`
+			Data []byte `json:"data"`
+		}
+		if err := json.Unmarshal(raw, &params); err != nil {
+			return nil, err
+		}
+		session, ok := s.hub.Session(params.Name)
+		if !ok {
+			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, params.Name)
+		}
+		return nil, session.Input(ctx, params.Data)
+
 	case "resize":
 		var params struct {
 			Name string `json:"name"`
@@ -136,129 +211,45 @@ func (s *Server) dispatch(method string, raw json.RawMessage) (any, error) {
 		if err := json.Unmarshal(raw, &params); err != nil {
 			return nil, err
 		}
-		return nil, s.hub.Resize(ctx, params.Name, params.Cols, params.Rows)
-	case "capture":
-		var params struct {
-			Name string `json:"name"`
+		session, ok := s.hub.Session(params.Name)
+		if !ok {
+			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, params.Name)
 		}
-		if err := json.Unmarshal(raw, &params); err != nil {
-			return nil, err
-		}
-		snapshot, err := s.hub.Capture(ctx, params.Name)
+		return nil, session.Resize(ctx, Size{Columns: params.Cols, Rows: params.Rows})
+
+	case "snapshot":
+		name, err := nameParam(raw)
 		if err != nil {
 			return nil, err
 		}
-		return map[string]string{"data": base64.StdEncoding.EncodeToString(snapshot)}, nil
-	case "checkpoint":
-		var params struct {
-			Name string `json:"name"`
+		session, ok := s.hub.Session(name)
+		if !ok {
+			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, name)
 		}
-		if err := json.Unmarshal(raw, &params); err != nil {
+		data, err := session.Snapshot(ctx)
+		if err != nil {
 			return nil, err
 		}
-		session, ok := s.hub.Session(params.Name)
+		return map[string][]byte{"data": data}, nil
+
+	case "checkpoint":
+		name, err := nameParam(raw)
+		if err != nil {
+			return nil, err
+		}
+		session, ok := s.hub.Session(name)
 		if !ok {
-			return nil, ErrSessionNotFound
+			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, name)
 		}
 		checkpoint, err := session.Checkpoint(ctx)
 		if err != nil {
 			return nil, err
 		}
 		return map[string]any{
-			"replay": base64.StdEncoding.EncodeToString(checkpoint.Replay),
+			"replay": checkpoint.Replay,
 			"offset": checkpoint.Offset,
 		}, nil
-	case "createdAt":
-		var params struct {
-			Name string `json:"name"`
-		}
-		if err := json.Unmarshal(raw, &params); err != nil {
-			return nil, err
-		}
-		session, ok := s.hub.Session(params.Name)
-		if !ok {
-			return nil, ErrSessionNotFound
-		}
-		return map[string]int64{"created": session.CreatedAt().Unix()}, nil
-	case "kill":
-		var params struct {
-			Name string `json:"name"`
-		}
-		if err := json.Unmarshal(raw, &params); err != nil {
-			return nil, err
-		}
-		return nil, s.hub.Kill(ctx, params.Name)
-	case "exists":
-		var params struct {
-			Name string `json:"name"`
-		}
-		if err := json.Unmarshal(raw, &params); err != nil {
-			return nil, err
-		}
-		return map[string]bool{"exists": s.hub.Exists(ctx, params.Name)}, nil
-	case "list":
-		sessions, err := s.hub.List(ctx)
-		if err != nil {
-			return nil, err
-		}
-		names := make([]string, 0, len(sessions))
-		for name := range sessions {
-			names = append(names, name)
-		}
-		return map[string][]string{"sessions": names}, nil
-	case "ensurePipe":
-		var params struct {
-			Name string `json:"name"`
-		}
-		if err := json.Unmarshal(raw, &params); err != nil {
-			return nil, err
-		}
-		return nil, s.hub.EnsurePipe(ctx, params.Name)
-	case "spoolPath":
-		var params struct {
-			Name string `json:"name"`
-		}
-		if err := json.Unmarshal(raw, &params); err != nil {
-			return nil, err
-		}
-		return map[string]string{"path": s.hub.SpoolPath(params.Name)}, nil
-	case "spoolSize":
-		var params struct {
-			Name string `json:"name"`
-		}
-		if err := json.Unmarshal(raw, &params); err != nil {
-			return nil, err
-		}
-		size, err := s.hub.SpoolSize(ctx, params.Name)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]int64{"size": size}, nil
-	case "truncateSpool":
-		var params struct {
-			Name string `json:"name"`
-		}
-		if err := json.Unmarshal(raw, &params); err != nil {
-			return nil, err
-		}
-		return nil, s.hub.TruncateSpool(ctx, params.Name)
-	case "archiveSpool":
-		var params struct {
-			Name string `json:"name"`
-		}
-		if err := json.Unmarshal(raw, &params); err != nil {
-			return nil, err
-		}
-		return nil, s.hub.ArchiveSpool(ctx, params.Name)
-	case "removeSpool":
-		var params struct {
-			Name string `json:"name"`
-		}
-		if err := json.Unmarshal(raw, &params); err != nil {
-			return nil, err
-		}
-		s.hub.RemoveSpool(params.Name)
-		return nil, nil
+
 	case "recover":
 		var params struct {
 			Name   string `json:"name"`
@@ -268,49 +259,75 @@ func (s *Server) dispatch(method string, raw json.RawMessage) (any, error) {
 		if err := json.Unmarshal(raw, &params); err != nil {
 			return nil, err
 		}
-		data, err := s.hub.Recover(ctx, params.Name, params.Offset, params.End)
+		path := s.hub.spoolPath(params.Name)
+		if path == "" {
+			return nil, fmt.Errorf("%w: %s", ErrInvalidSessionName, params.Name)
+		}
+		data, err := readSpool(path, params.Offset, params.End)
 		if err != nil {
 			return nil, err
 		}
-		return map[string]string{"data": base64.StdEncoding.EncodeToString(data)}, nil
-	case "listCreated":
-		created, err := s.hub.ListCreated(ctx)
+		return map[string][]byte{"data": data}, nil
+
+	case "spoolPath":
+		name, err := nameParam(raw)
 		if err != nil {
 			return nil, err
 		}
-		result := make(map[string]int64, len(created))
-		for name, when := range created {
-			result[name] = when.Unix()
+		return map[string]string{"path": s.hub.spoolPath(name)}, nil
+
+	case "spoolSize":
+		name, err := nameParam(raw)
+		if err != nil {
+			return nil, err
 		}
-		return map[string]map[string]int64{"created": result}, nil
+		size, err := spoolSize(s.hub.spoolPath(name))
+		if err != nil {
+			return nil, err
+		}
+		return map[string]int64{"size": size}, nil
+
+	case "truncateSpool":
+		name, err := nameParam(raw)
+		if err != nil {
+			return nil, err
+		}
+		return nil, truncateSpool(s.hub.spoolPath(name))
+
+	case "archiveSpool":
+		name, err := nameParam(raw)
+		if err != nil {
+			return nil, err
+		}
+		return nil, archiveSpool(s.hub.spoolPath(name))
+
+	case "removeSpool":
+		name, err := nameParam(raw)
+		if err != nil {
+			return nil, err
+		}
+		removeSpool(s.hub.spoolPath(name))
+		return nil, nil
+
+	case "list":
+		sessions := s.hub.Sessions()
+		names := make([]string, 0, len(sessions))
+		for _, session := range sessions {
+			names = append(names, session.Name())
+		}
+		return map[string][]string{"sessions": names}, nil
+
 	default:
 		return nil, fmt.Errorf("unknown method: %s", method)
 	}
 }
 
-func marshalResponse(id int64, result any, err error) string {
-	value := response{ID: id}
-	if err != nil {
-		value.Error = err.Error()
-	} else if result != nil {
-		encoded, marshalErr := json.Marshal(result)
-		if marshalErr != nil {
-			value.Error = marshalErr.Error()
-		} else {
-			value.Result = encoded
-		}
+func nameParam(raw json.RawMessage) (string, error) {
+	var params struct {
+		Name string `json:"name"`
 	}
-	encoded, _ := json.Marshal(value)
-	return string(encoded) + "\n"
-}
-
-// Ping reports whether a ghostline server is accepting connections on the
-// socket. It is also used by the client bootstrap to wait for a server.
-func Ping(socketPath string) bool {
-	connection, err := net.Dial("unix", socketPath)
-	if err != nil {
-		return false
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return "", err
 	}
-	_ = connection.Close()
-	return true
+	return params.Name, nil
 }

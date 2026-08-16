@@ -39,25 +39,10 @@ func validateEnvironment(environment []string) error {
 	return nil
 }
 
-func mergeEnvironment(base, overrides []string) []string {
-	if len(overrides) == 0 {
-		return base
+func validateName(name string) error {
+	if name == "" || name == "." || name == ".." ||
+		strings.ContainsAny(name, "/\\") || strings.IndexByte(name, 0) >= 0 {
+		return fmt.Errorf("%w: %q", ErrInvalidSessionName, name)
 	}
-	indices := make(map[string]int, len(base))
-	for index, entry := range base {
-		if separator := strings.IndexByte(entry, '='); separator > 0 {
-			indices[entry[:separator]] = index
-		}
-	}
-	for _, entry := range overrides {
-		separator := strings.IndexByte(entry, '=')
-		key := entry[:separator]
-		if index, ok := indices[key]; ok {
-			base[index] = entry
-			continue
-		}
-		indices[key] = len(base)
-		base = append(base, entry)
-	}
-	return base
+	return nil
 }

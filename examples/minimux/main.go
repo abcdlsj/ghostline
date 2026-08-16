@@ -308,6 +308,9 @@ func (m *minimux) removeWindow(target *window) (bool, error) {
 	if err := target.session.Close(); err != nil {
 		return false, err
 	}
+	if err := target.session.Remove(); err != nil {
+		return false, err
+	}
 	m.windows = append(m.windows[:index], m.windows[index+1:]...)
 	if len(m.windows) == 0 {
 		m.current = -1

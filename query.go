@@ -45,7 +45,7 @@ func (r *QueryResponder) Feed(data []byte) [][]byte {
 	for {
 		index := bytes.IndexByte(r.pending, 0x1b)
 		if index < 0 {
-			r.pending = r.pending[:0]
+			r.pending = nil
 			return replies
 		}
 		if index > 0 {
@@ -65,7 +65,7 @@ func (r *QueryResponder) Feed(data []byte) [][]byte {
 					continue
 				}
 				if len(r.pending) > 256 {
-					r.pending = r.pending[:0]
+					r.pending = nil
 				}
 				return replies
 			}
@@ -82,7 +82,7 @@ func (r *QueryResponder) Feed(data []byte) [][]byte {
 					continue
 				}
 				if len(r.pending) > 4096 {
-					r.pending = r.pending[:0]
+					r.pending = nil
 				}
 				return replies
 			}

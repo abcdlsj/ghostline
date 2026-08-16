@@ -1,7 +1,6 @@
 package ghostline
 
 import (
-	"context"
 	"errors"
 	"io"
 	"os"
@@ -10,13 +9,6 @@ import (
 	"sync/atomic"
 	"time"
 )
-
-// SpoolRecoverer reads a contiguous byte range from a session's append-only
-// spool. Hub implements it so a consumer can recover an evicted client
-// anchor without forcing a full screen reset and replay.
-type SpoolRecoverer interface {
-	Recover(context.Context, string, int64, int64) ([]byte, error)
-}
 
 // SpoolWatcher reads an append-only spool from a persisted byte offset,
 // draining to EOF whenever the file grows. The byte slice passed to onBytes is
@@ -31,7 +23,7 @@ type SpoolWatcher struct {
 	path       string
 	file       *os.File
 	offset     atomic.Int64
-	maxBytes   int64
+	maxBytes   atomic.Int64
 	interval   time.Duration
 	buffer     []byte
 	onBytes    func([]byte)
@@ -72,7 +64,6 @@ func NewSpoolWatcher(path string, offset int64, onBytes func([]byte), onRotate f
 	w := &SpoolWatcher{
 		path:       path,
 		file:       file,
-		maxBytes:   64 * 1024 * 1024,
 		interval:   10 * time.Millisecond,
 		onBytes:    onBytes,
 		onRotate:   onRotate,
@@ -80,6 +71,7 @@ func NewSpoolWatcher(path string, offset int64, onBytes func([]byte), onRotate f
 		ping:       make(chan struct{}, 1),
 		done:       make(chan struct{}),
 	}
+	w.maxBytes.Store(64 * 1024 * 1024)
 	w.offset.Store(offset)
 	return w, nil
 }
@@ -103,7 +95,7 @@ func (w *SpoolWatcher) Offset() int64 {
 // passes the cap it calls onOverflow so the consumer can compact the spool.
 func (w *SpoolWatcher) SetMaxBytes(maxBytes int64) {
 	if maxBytes > 0 {
-		w.maxBytes = maxBytes
+		w.maxBytes.Store(maxBytes)
 	}
 }
 
@@ -223,7 +215,7 @@ func (w *SpoolWatcher) drain() {
 			if w.onBytes != nil {
 				w.onBytes(w.buffer[:read])
 			}
-			if w.maxBytes > 0 && offset > w.maxBytes && w.onOverflow != nil {
+			if maxBytes := w.maxBytes.Load(); maxBytes > 0 && offset > maxBytes && w.onOverflow != nil {
 				w.onOverflow()
 			}
 		}
