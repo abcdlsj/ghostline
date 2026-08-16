@@ -134,6 +134,11 @@ func (t *adminTransport) write(value any, fd int) error {
 
 func (t *adminTransport) read(value any) error {
 	for {
+		// The legacy v0.3.4 server sent the adopt fd as a separate one-byte
+		// NUL message. When the kernel coalesces that message with the JSON
+		// response, the NUL remains buffered after the newline; strip it so
+		// the next frame still starts at valid JSON.
+		t.readBuf = bytes.TrimLeft(t.readBuf, "\x00")
 		if index := bytes.IndexByte(t.readBuf, '\n'); index >= 0 {
 			if index > adminMaxFrame {
 				return errors.New("admin message too large")
@@ -184,7 +189,48 @@ func (t *adminTransport) read(value any) error {
 
 func (t *adminTransport) takeFD() (int, error) {
 	if len(t.received) == 0 {
-		return -1, errors.New("admin response did not contain a file descriptor")
+		// Legacy v0.3.4 servers sent the fd handshake after the JSON response
+		// instead of in the same message. Read until the descriptor arrives,
+		// discarding the NUL padding without losing any JSON that shares the
+		// read.
+		for {
+			if err := t.conn.SetReadDeadline(time.Now().Add(adminTimeout)); err != nil {
+				return -1, err
+			}
+			payload := make([]byte, 64*1024)
+			oob := make([]byte, unix.CmsgSpace(4))
+			n, oobn, flags, _, err := t.conn.ReadMsgUnix(payload, oob)
+			if flags&unix.MSG_CTRUNC != 0 {
+				return -1, errors.New("admin control message truncated")
+			}
+			if oobn > 0 {
+				messages, parseErr := unix.ParseSocketControlMessage(oob[:oobn])
+				if parseErr != nil {
+					return -1, parseErr
+				}
+				for _, message := range messages {
+					fds, parseErr := unix.ParseUnixRights(&message)
+					if parseErr != nil {
+						return -1, parseErr
+					}
+					t.received = append(t.received, fds...)
+				}
+			}
+			if n > 0 {
+				if trimmed := bytes.TrimLeft(payload[:n], "\x00"); len(trimmed) > 0 {
+					t.readBuf = append(t.readBuf, trimmed...)
+				}
+			}
+			if len(t.received) > 0 {
+				break
+			}
+			if err != nil {
+				return -1, err
+			}
+			if n == 0 {
+				return -1, io.ErrUnexpectedEOF
+			}
+		}
 	}
 	fd := t.received[0]
 	t.received = t.received[1:]

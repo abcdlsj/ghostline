@@ -3,12 +3,170 @@ package ghostline
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
+
+func unixAdminPair(t *testing.T) (*net.UnixConn, *net.UnixConn) {
+	t.Helper()
+	socketDir, err := os.MkdirTemp("/tmp", "ghostline-admin-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+	socket := filepath.Join(socketDir, "admin.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatalf("ListenUnix: %v", err)
+	}
+	accepted := make(chan *net.UnixConn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		connection, err := listener.AcceptUnix()
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- connection
+	}()
+	client, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatalf("DialUnix: %v", err)
+	}
+	var server *net.UnixConn
+	select {
+	case server = <-accepted:
+	case err := <-acceptErr:
+		_ = client.Close()
+		t.Fatalf("AcceptUnix: %v", err)
+	case <-time.After(time.Second):
+		_ = client.Close()
+		t.Fatal("accept admin connection timed out")
+	}
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+		_ = listener.Close()
+	})
+	return client, server
+}
+
+func TestAdminTransportReadsLegacyFdHandshake(t *testing.T) {
+	client, server := unixAdminPair(t)
+	transport := newAdminTransport(client)
+	readFD, writeFD, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Pipe: %v", err)
+	}
+	_ = writeFD.Close()
+
+	go func() {
+		_ = server.SetWriteDeadline(time.Now().Add(time.Second))
+		if _, err := server.Write([]byte("{\"id\":1,\"result\":{\"name\":\"x\"}}\n")); err != nil {
+			t.Errorf("write adopt response: %v", err)
+			return
+		}
+		// v0.3.4 sent the descriptor as a separate one-byte NUL message.
+		if _, _, err := server.WriteMsgUnix([]byte{0}, unix.UnixRights(int(readFD.Fd())), nil); err != nil {
+			t.Errorf("write fd handshake: %v", err)
+			return
+		}
+		_ = readFD.Close()
+		if _, err := server.Write([]byte("{\"id\":2,\"result\":{}}\n")); err != nil {
+			t.Errorf("write next response: %v", err)
+		}
+	}()
+
+	var response adminResponse
+	if err := transport.read(&response); err != nil {
+		t.Fatalf("read adopt response: %v", err)
+	}
+	var meta sessionMeta
+	if err := json.Unmarshal(response.Result, &meta); err != nil {
+		t.Fatalf("decode adopt result: %v", err)
+	}
+	if meta.Name != "x" {
+		t.Fatalf("meta.Name = %q, want x", meta.Name)
+	}
+	fd, err := transport.takeFD()
+	if err != nil {
+		t.Fatalf("takeFD: %v", err)
+	}
+	received := os.NewFile(uintptr(fd), "received")
+	if received == nil {
+		t.Fatal("received fd is nil")
+	}
+	_ = received.Close()
+
+	var next adminResponse
+	if err := transport.read(&next); err != nil {
+		t.Fatalf("read next response: %v", err)
+	}
+	if next.ID != 2 {
+		t.Fatalf("response.ID = %d, want 2", next.ID)
+	}
+}
+
+func TestAdminTransportReadsCoalescedLegacyFdHandshake(t *testing.T) {
+	client, server := unixAdminPair(t)
+	transport := newAdminTransport(client)
+	readFD, writeFD, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Pipe: %v", err)
+	}
+	_ = writeFD.Close()
+
+	go func() {
+		_ = server.SetWriteDeadline(time.Now().Add(time.Second))
+		// The kernel may coalesce the JSON response and the NUL handshake
+		// into one message; the fd arrives in the same SCM_RIGHTS payload.
+		payload := append([]byte("{\"id\":1,\"result\":{\"name\":\"x\"}}\n"), 0)
+		if _, _, err := server.WriteMsgUnix(payload, unix.UnixRights(int(readFD.Fd())), nil); err != nil {
+			t.Errorf("write coalesced handshake: %v", err)
+			return
+		}
+		_ = readFD.Close()
+		if _, err := server.Write([]byte("{\"id\":2,\"result\":{}}\n")); err != nil {
+			t.Errorf("write next response: %v", err)
+		}
+	}()
+
+	var response adminResponse
+	if err := transport.read(&response); err != nil {
+		t.Fatalf("read adopt response: %v", err)
+	}
+	var meta sessionMeta
+	if err := json.Unmarshal(response.Result, &meta); err != nil {
+		t.Fatalf("decode adopt result: %v", err)
+	}
+	if meta.Name != "x" {
+		t.Fatalf("meta.Name = %q, want x", meta.Name)
+	}
+	fd, err := transport.takeFD()
+	if err != nil {
+		t.Fatalf("takeFD: %v", err)
+	}
+	received := os.NewFile(uintptr(fd), "received")
+	if received == nil {
+		t.Fatal("received fd is nil")
+	}
+	_ = received.Close()
+
+	var next adminResponse
+	if err := transport.read(&next); err != nil {
+		t.Fatalf("read next response after buffered NUL: %v", err)
+	}
+	if next.ID != 2 {
+		t.Fatalf("response.ID = %d, want 2", next.ID)
+	}
+}
 
 func startMigrateServer(t *testing.T, outputDir, tag string) (*Server, string) {
 	t.Helper()
