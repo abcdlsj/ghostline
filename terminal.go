@@ -131,6 +131,12 @@ func (v *VTTerminal) Snapshot() ([]byte, error) {
 		emit: C.GHOSTTY_FORMATTER_FORMAT_VT,
 		trim: true,
 	}
+	// The VT formatter describes screen content but not the final cursor
+	// position. Replaying a snapshot without CUP leaves the client's cursor
+	// after the last emitted row (often the status line) instead of at the
+	// application's input box, which breaks TUIs such as Codex.
+	opts.extra.screen.cursor = true
+	opts.extra.modes = true
 	if result := C.ghostty_formatter_terminal_new(nil, &formatter, v.terminal, opts); result != C.GHOSTTY_SUCCESS {
 		return nil, fmt.Errorf("ghostty formatter new failed: %d", result)
 	}

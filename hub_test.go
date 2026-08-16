@@ -110,6 +110,27 @@ func TestHubCapturePreservesStyleAndScrollback(t *testing.T) {
 	}
 }
 
+func TestHubCaptureEmitsCursorPosition(t *testing.T) {
+	hub := newHub(t, ghostline.Options{})
+	session, err := hub.Start(context.Background(), ghostline.SessionOptions{
+		Name:      "cursor",
+		Directory: t.TempDir(),
+		Command:   "printf abc",
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	waitSpool(t, session, "abc")
+
+	snapshot, err := session.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if !bytes.HasSuffix(snapshot, []byte("\x1b[1;4H")) {
+		t.Fatalf("snapshot does not restore cursor after content: %q", snapshot[len(snapshot)-min(len(snapshot), 32):])
+	}
+}
+
 func TestHubInputReachesChild(t *testing.T) {
 	hub := newHub(t, ghostline.Options{})
 	session, err := hub.Start(context.Background(), ghostline.SessionOptions{
