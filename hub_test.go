@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -44,6 +43,22 @@ func waitSpool(t *testing.T, session ghostline.Session, needle string) {
 	}
 	data, _ := os.ReadFile(session.SpoolPath())
 	t.Fatalf("spool did not contain %q; got %q", needle, data)
+}
+
+func waitOutput(t *testing.T, output <-chan []byte, needle string, timeout time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case data := <-output:
+			if bytes.Contains(data, []byte(needle)) {
+				return
+			}
+		case <-timer.C:
+			t.Fatalf("output did not contain %q", needle)
+		}
+	}
 }
 
 func TestHubStartWritesSpoolAndCapture(t *testing.T) {
@@ -371,18 +386,7 @@ func TestWatcherDoesNotFollowReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WatchOutput: %v", err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		select {
-		case data := <-output:
-			if bytes.Contains(data, []byte("old-marker")) {
-				goto oldSeen
-			}
-		case <-time.After(time.Until(deadline)):
-			t.Fatal("old watcher never saw its output")
-		}
-	}
-oldSeen:
+	waitOutput(t, output, "old-marker", 5*time.Second)
 	if err := old.Close(); err != nil {
 		t.Fatalf("Close old: %v", err)
 	}
@@ -413,16 +417,4 @@ func spoolSizeOf(t *testing.T, session ghostline.Session) int64 {
 		t.Fatalf("SpoolSize: %v", err)
 	}
 	return size
-}
-
-func waitProcessGone(t *testing.T, pid int) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("process %d still alive", pid)
 }

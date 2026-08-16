@@ -289,7 +289,7 @@ func readSpool(path string, offset, end int64) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open spool: %w", err)
 	}
-	defer file.Close()
+	defer closeQuietly(file)
 	info, err := file.Stat()
 	if err != nil {
 		return nil, err
@@ -347,7 +347,7 @@ func archiveSpool(path string) error {
 	if err != nil {
 		return err
 	}
-	defer source.Close()
+	defer closeQuietly(source)
 	destination, err := os.OpenFile(archive, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
@@ -356,12 +356,12 @@ func archiveSpool(path string) error {
 	if _, err := io.Copy(writer, source); err != nil {
 		_ = writer.Close()
 		_ = destination.Close()
-		_ = os.Remove(archive)
+		removeQuietly(archive)
 		return err
 	}
 	if err := writer.Close(); err != nil {
 		_ = destination.Close()
-		_ = os.Remove(archive)
+		removeQuietly(archive)
 		return err
 	}
 	if err := destination.Close(); err != nil {
@@ -376,21 +376,25 @@ func pruneArchives(path string) error {
 		return err
 	}
 	for len(matches) > 3 {
-		oldest := matches[0]
-		for _, match := range matches[1:] {
-			if match < oldest {
-				oldest = match
+		oldest := 0
+		for index := 1; index < len(matches); index++ {
+			if matches[index] < matches[oldest] {
+				oldest = index
 			}
 		}
-		_ = os.Remove(oldest)
-		matches = removeString(matches, oldest)
+		removeQuietly(matches[oldest])
+		matches = append(matches[:oldest], matches[oldest+1:]...)
 	}
 	return nil
 }
 
 func removeSpool(path string) {
-	_ = os.Remove(path)
-	for _, match := range mustGlob(path + ".*.gz") {
-		_ = os.Remove(match)
+	removeQuietly(path)
+	matches, err := filepath.Glob(path + ".*.gz")
+	if err != nil {
+		return
+	}
+	for _, match := range matches {
+		removeQuietly(match)
 	}
 }

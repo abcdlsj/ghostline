@@ -199,7 +199,7 @@ func appendToFile(t *testing.T, path, data string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer file.Close()
+	defer closeQuietly(file)
 	if _, err := file.WriteString(data); err != nil {
 		t.Fatal(err)
 	}

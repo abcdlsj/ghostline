@@ -2,20 +2,27 @@ package ghostline
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"os"
+	"os/exec"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
 // Client proxies Hub operations to a Server over a Unix socket.
 type Client struct {
-	socket string
+	socket    string
+	lifecycle *clientLifecycle
 }
 
 // NewClient returns a client for the server at socketPath.
@@ -23,8 +30,84 @@ func NewClient(socketPath string) *Client {
 	return &Client{socket: socketPath}
 }
 
+// ConnectOptions configures how Connect starts a missing server.
+type ConnectOptions struct {
+	// Socket is the Unix socket path the server listens on.
+	Socket string
+	// Spawn is the command used to start the server when the socket is
+	// missing. Arguments may contain {socket}, replaced by Socket. Empty uses
+	// ["ghostline", "serve", "--socket", socket].
+	Spawn []string
+	// Env overrides the spawned server's environment.
+	Env []string
+	// ReadyTimeout bounds how long Connect waits for the socket. Zero uses 5s.
+	ReadyTimeout time.Duration
+	// Log receives the spawned server's stdout and stderr. Empty discards it.
+	Log io.Writer
+}
+
+type clientLifecycle struct {
+	spawn        []string
+	env          []string
+	readyTimeout time.Duration
+	log          io.Writer
+	cmd          *exec.Cmd
+	wait         chan error
+}
+
+// Connect returns a client, spawning the server when the socket is missing.
+// The returned client owns the spawned process; Close stops it.
+func Connect(ctx context.Context, options ConnectOptions) (*Client, error) {
+	if options.Socket == "" {
+		return nil, errors.New("ghostline: socket path required")
+	}
+	client := &Client{
+		socket: options.Socket,
+		lifecycle: &clientLifecycle{
+			spawn:        options.Spawn,
+			env:          options.Env,
+			readyTimeout: options.ReadyTimeout,
+			log:          options.Log,
+		},
+	}
+	if Ping(options.Socket) {
+		return client, nil
+	}
+	if err := client.spawnAndWait(ctx); err != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
 // Socket returns the server socket path.
 func (c *Client) Socket() string { return c.socket }
+
+// Ensure starts the server if it is missing and waits until it is ready.
+func (c *Client) Ensure(ctx context.Context) error {
+	if Ping(c.socket) {
+		return nil
+	}
+	if c.lifecycle == nil {
+		return fmt.Errorf("server not running at %s", c.socket)
+	}
+	return c.spawnAndWait(ctx)
+}
+
+// Close stops the server that this client spawned. Clients that connected to
+// an existing server have nothing to stop.
+func (c *Client) Close() error {
+	if c.lifecycle == nil || c.lifecycle.cmd == nil {
+		return nil
+	}
+	process := c.lifecycle.cmd.Process
+	if process == nil {
+		return nil
+	}
+	_ = process.Signal(syscall.SIGTERM)
+	err := <-c.lifecycle.wait
+	c.lifecycle.cmd = nil
+	return err
+}
 
 // Check verifies that the server socket accepts connections.
 func (c *Client) Check(ctx context.Context) error {
@@ -32,7 +115,7 @@ func (c *Client) Check(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("connect ghostline server: %w", err)
 	}
-	_ = connection.Close()
+	closeQuietly(connection)
 	return nil
 }
 
@@ -51,17 +134,35 @@ func dial(ctx context.Context, socket string) (net.Conn, error) {
 }
 
 func (c *Client) call(ctx context.Context, method string, params, result any) error {
+	return c.callOnce(ctx, method, params, result)
+}
+
+func (c *Client) callRetryable(ctx context.Context, method string, params, result any) error {
+	err := c.callOnce(ctx, method, params, result)
+	if err == nil || c.lifecycle == nil || !isTransportError(err) {
+		return err
+	}
+	if Ping(c.socket) {
+		return err
+	}
+	if spawnErr := c.spawnAndWait(ctx); spawnErr != nil {
+		return fmt.Errorf("%v (recovery: %w)", err, spawnErr)
+	}
+	return c.callOnce(ctx, method, params, result)
+}
+
+func (c *Client) callOnce(ctx context.Context, method string, params, result any) error {
 	connection, err := dial(ctx, c.socket)
 	if err != nil {
 		return contextErr(ctx, fmt.Errorf("connect ghostline server: %w", err))
 	}
-	defer connection.Close()
+	defer closeQuietly(connection)
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = connection.Close()
+			closeQuietly(connection)
 		case <-done:
 		}
 	}()
@@ -94,6 +195,120 @@ func (c *Client) call(ctx context.Context, method string, params, result any) er
 	return nil
 }
 
+func (c *Client) spawnAndWait(ctx context.Context) error {
+	lifecycle := c.lifecycle
+	spawn := lifecycle.spawn
+	if len(spawn) == 0 {
+		spawn = []string{"ghostline", "serve", "--socket", c.socket}
+	}
+	args := make([]string, len(spawn))
+	for index, arg := range spawn {
+		args[index] = strings.ReplaceAll(arg, "{socket}", c.socket)
+	}
+	if err := validateEnvironment(lifecycle.env); err != nil {
+		return fmt.Errorf("invalid spawn environment: %w", err)
+	}
+	command := exec.Command(args[0], args[1:]...)
+	command.Env = mergeEnvironment(os.Environ(), lifecycle.env)
+	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	var output bytes.Buffer
+	if lifecycle.log != nil {
+		command.Stdout = io.MultiWriter(lifecycle.log, &output)
+		command.Stderr = io.MultiWriter(lifecycle.log, &output)
+	} else {
+		command.Stdout = &output
+		command.Stderr = &output
+	}
+	if err := command.Start(); err != nil {
+		return fmt.Errorf("spawn ghostline server: %w", err)
+	}
+	wait := make(chan error, 1)
+	go func() { wait <- command.Wait() }()
+	lifecycle.cmd = command
+	lifecycle.wait = wait
+	err, exited := c.waitReady(ctx, &output, wait)
+	if err != nil {
+		if !exited {
+			_ = command.Process.Kill()
+			<-wait
+		}
+		lifecycle.cmd = nil
+		lifecycle.wait = nil
+		return err
+	}
+	if exited {
+		// Another concurrent spawn bound the socket first. The live server
+		// is not ours to stop, so this client must not own it.
+		lifecycle.cmd = nil
+		lifecycle.wait = nil
+	}
+	return nil
+}
+
+func (c *Client) waitReady(ctx context.Context, output *bytes.Buffer, wait <-chan error) (error, bool) {
+	timeout := c.lifecycle.readyTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case waitErr := <-wait:
+			return c.readyAfterExit(waitErr, output)
+		default:
+		}
+		if Ping(c.socket) {
+			return nil, false
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err(), false
+		case <-timer.C:
+			return fmt.Errorf(
+				"server did not become ready at %s: %s",
+				c.socket,
+				strings.TrimSpace(output.String()),
+			), false
+		case waitErr := <-wait:
+			return c.readyAfterExit(waitErr, output)
+		case <-ticker.C:
+		}
+	}
+}
+
+func (c *Client) readyAfterExit(waitErr error, output *bytes.Buffer) (error, bool) {
+	if Ping(c.socket) {
+		return nil, true
+	}
+	return fmt.Errorf(
+		"spawned ghostline server exited: %v: %s",
+		waitErr,
+		strings.TrimSpace(output.String()),
+	), true
+}
+
+// isTransportError reports whether err came from the socket transport rather
+// than the RPC layer. Only transport failures are safe to retry once after a
+// respawn; server responses carry their own application errors.
+func isTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, os.ErrDeadlineExceeded) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.EPIPE)
+}
+
 func contextErr(ctx context.Context, err error) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
@@ -101,14 +316,10 @@ func contextErr(ctx context.Context, err error) error {
 	return err
 }
 
-type createResult struct {
-	Created int64 `json:"created"`
-}
-
 // Start creates a session on the server and returns its remote handle.
 func (c *Client) Start(ctx context.Context, options SessionOptions) (Session, error) {
 	var result createResult
-	err := c.call(ctx, "create", createParams{
+	err := c.callRetryable(ctx, rpcMethodCreate, createParams{
 		Name:    options.Name,
 		Dir:     options.Directory,
 		Command: options.Command,
@@ -128,10 +339,8 @@ func (c *Client) Start(ctx context.Context, options SessionOptions) (Session, er
 
 // List returns the names of all sessions known to the server.
 func (c *Client) List(ctx context.Context) ([]string, error) {
-	var result struct {
-		Sessions []string `json:"sessions"`
-	}
-	if err := c.call(ctx, "list", nil, &result); err != nil {
+	var result listResult
+	if err := c.callRetryable(ctx, rpcMethodList, nil, &result); err != nil {
 		return nil, err
 	}
 	sort.Strings(result.Sessions)
@@ -140,7 +349,7 @@ func (c *Client) List(ctx context.Context) ([]string, error) {
 
 func (c *Client) status(ctx context.Context, name string) (Status, error) {
 	var result Status
-	if err := c.call(ctx, "status", nameParams{Name: name}, &result); err != nil {
+	if err := c.callRetryable(ctx, rpcMethodStatus, nameParams{Name: name}, &result); err != nil {
 		return Status{}, err
 	}
 	return result, nil
@@ -148,7 +357,7 @@ func (c *Client) status(ctx context.Context, name string) (Status, error) {
 
 func (c *Client) wait(ctx context.Context, name string) (Status, error) {
 	var result Status
-	if err := c.call(ctx, "wait", nameParams{Name: name}, &result); err != nil {
+	if err := c.call(ctx, rpcMethodWait, nameParams{Name: name}, &result); err != nil {
 		return Status{}, err
 	}
 	return result, nil
@@ -169,6 +378,14 @@ type remoteSession struct {
 
 func (r *remoteSession) Name() string         { return r.name }
 func (r *remoteSession) CreatedAt() time.Time { return r.createdAt }
+
+func (r *remoteSession) call(ctx context.Context, method string, params, result any) error {
+	return r.client.call(ctx, method, params, result)
+}
+
+func (r *remoteSession) callRetryable(ctx context.Context, method string, params, result any) error {
+	return r.client.callRetryable(ctx, method, params, result)
+}
 
 func (r *remoteSession) Done() <-chan struct{} {
 	r.doneOnce.Do(func() {
@@ -232,41 +449,34 @@ func (r *remoteSession) Status(ctx context.Context) (Status, error) {
 }
 
 func (r *remoteSession) Input(ctx context.Context, data []byte) error {
-	return r.client.call(ctx, "input", inputParams{Name: r.name, Data: data}, nil)
+	return r.call(ctx, rpcMethodInput, inputParams{Name: r.name, Data: data}, nil)
 }
 
 func (r *remoteSession) Resize(ctx context.Context, size Size) error {
-	return r.client.call(ctx, "resize", resizeParams{
+	return r.call(ctx, rpcMethodResize, resizeParams{
 		Name: r.name, Cols: size.Columns, Rows: size.Rows,
 	}, nil)
 }
 
 func (r *remoteSession) Snapshot(ctx context.Context) ([]byte, error) {
-	var result struct {
-		Data []byte `json:"data"`
-	}
-	if err := r.client.call(ctx, "snapshot", nameParams{Name: r.name}, &result); err != nil {
+	var result dataResult
+	if err := r.callRetryable(ctx, rpcMethodSnapshot, nameParams{Name: r.name}, &result); err != nil {
 		return nil, err
 	}
 	return result.Data, nil
 }
 
 func (r *remoteSession) Checkpoint(ctx context.Context) (Checkpoint, error) {
-	var result struct {
-		Replay []byte `json:"replay"`
-		Offset int64  `json:"offset"`
-	}
-	if err := r.client.call(ctx, "checkpoint", nameParams{Name: r.name}, &result); err != nil {
+	var result checkpointResult
+	if err := r.callRetryable(ctx, rpcMethodCheckpoint, nameParams{Name: r.name}, &result); err != nil {
 		return Checkpoint{}, err
 	}
-	return Checkpoint{Replay: result.Replay, Offset: result.Offset}, nil
+	return Checkpoint(result), nil
 }
 
 func (r *remoteSession) Recover(ctx context.Context, offset, end int64) ([]byte, error) {
-	var result struct {
-		Data []byte `json:"data"`
-	}
-	if err := r.client.call(ctx, "recover", recoverParams{
+	var result dataResult
+	if err := r.callRetryable(ctx, rpcMethodRecover, recoverParams{
 		Name: r.name, Offset: offset, End: end,
 	}, &result); err != nil {
 		return nil, err
@@ -275,20 +485,16 @@ func (r *remoteSession) Recover(ctx context.Context, offset, end int64) ([]byte,
 }
 
 func (r *remoteSession) SpoolPath() string {
-	var result struct {
-		Path string `json:"path"`
-	}
-	if err := r.client.call(context.Background(), "spoolPath", nameParams{Name: r.name}, &result); err != nil {
+	var result spoolPathResult
+	if err := r.callRetryable(context.Background(), rpcMethodSpoolPath, nameParams{Name: r.name}, &result); err != nil {
 		return ""
 	}
 	return result.Path
 }
 
 func (r *remoteSession) SpoolSize(ctx context.Context) (int64, error) {
-	var result struct {
-		Size int64 `json:"size"`
-	}
-	if err := r.client.call(ctx, "spoolSize", nameParams{Name: r.name}, &result); err != nil {
+	var result spoolSizeResult
+	if err := r.callRetryable(ctx, rpcMethodSpoolSize, nameParams{Name: r.name}, &result); err != nil {
 		return 0, err
 	}
 	return result.Size, nil
@@ -314,17 +520,15 @@ func (r *remoteSession) Close() error {
 	if r.closed.Load() {
 		return nil
 	}
-	return r.client.call(context.Background(), "close", nameParams{Name: r.name}, nil)
+	return r.call(context.Background(), rpcMethodClose, nameParams{Name: r.name}, nil)
 }
 
 func (r *remoteSession) Remove() error {
 	if r.closed.Load() {
 		return nil
 	}
-	var result struct {
-		Exit *ExitError `json:"exit"`
-	}
-	if err := r.client.call(context.Background(), "remove", nameParams{Name: r.name}, &result); err != nil {
+	var result removeResult
+	if err := r.call(context.Background(), rpcMethodRemove, nameParams{Name: r.name}, &result); err != nil {
 		return err
 	}
 	if result.Exit != nil {
@@ -347,13 +551,13 @@ func (r *remoteSession) closeDone() {
 }
 
 func (r *remoteSession) TruncateSpool(ctx context.Context) error {
-	return r.client.call(ctx, "truncateSpool", nameParams{Name: r.name}, nil)
+	return r.call(ctx, rpcMethodTruncateSpool, nameParams{Name: r.name}, nil)
 }
 
 func (r *remoteSession) ArchiveSpool(ctx context.Context) error {
-	return r.client.call(ctx, "archiveSpool", nameParams{Name: r.name}, nil)
+	return r.call(ctx, rpcMethodArchiveSpool, nameParams{Name: r.name}, nil)
 }
 
 func (r *remoteSession) RemoveSpool() {
-	_ = r.client.call(context.Background(), "removeSpool", nameParams{Name: r.name}, nil)
+	_ = r.call(context.Background(), rpcMethodRemoveSpool, nameParams{Name: r.name}, nil)
 }

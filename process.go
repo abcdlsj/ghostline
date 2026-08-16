@@ -52,7 +52,7 @@ func startSession(ctx context.Context, options SessionOptions, size Size, path s
 	command := ptyCommand(options.Directory, options.Command, options.Environment)
 	master, err := pty.StartWithSize(command, &pty.Winsize{Cols: uint16(size.Columns), Rows: uint16(size.Rows)})
 	if err != nil {
-		_ = spool.Close()
+		closeQuietly(spool)
 		vt.Close()
 		return nil, fmt.Errorf("start pty: %w", err)
 	}
@@ -71,8 +71,8 @@ func startSession(ctx context.Context, options SessionOptions, size Size, path s
 
 func copyOutput(state *sessionState) {
 	defer close(state.done)
-	defer state.master.Close()
-	defer state.spool.Close()
+	defer closeQuietly(state.master)
+	defer closeQuietly(state.spool)
 	buffer := make([]byte, 32*1024)
 	for {
 		read, err := state.master.Read(buffer)
@@ -105,15 +105,11 @@ func terminate(state *sessionState) error {
 	if state.command.Process != nil {
 		_ = syscall.Kill(-state.command.Process.Pid, syscall.SIGHUP)
 	}
-	select {
-	case <-state.reaped:
-	case <-time.After(terminateGrace):
+	if !waitFor(state.reaped, terminateGrace) {
 		if state.command.Process != nil {
 			_ = syscall.Kill(-state.command.Process.Pid, syscall.SIGKILL)
 		}
-		select {
-		case <-state.reaped:
-		case <-time.After(terminateWait):
+		if !waitFor(state.reaped, terminateWait) {
 			state.close()
 			return fmt.Errorf("session %s did not reap", state.name)
 		}
@@ -128,10 +124,21 @@ const (
 	terminateWait  = 2 * time.Second
 )
 
+func waitFor(done <-chan struct{}, timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
 func (s *sessionState) close() {
 	s.closeOnce.Do(func() {
-		_ = s.master.Close()
-		_ = s.spool.Close()
+		closeQuietly(s.master)
+		closeQuietly(s.spool)
 		s.vt.Close()
 	})
 }

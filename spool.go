@@ -47,18 +47,18 @@ func NewSpoolWatcher(path string, offset int64, onBytes func([]byte), onRotate f
 	}
 	info, err := file.Stat()
 	if err != nil {
-		_ = file.Close()
+		closeQuietly(file)
 		return nil, err
 	}
 	if offset < 0 {
 		offset = 0
 	}
 	if offset > info.Size() {
-		_ = file.Close()
+		closeQuietly(file)
 		return nil, &spoolOffsetError{Path: path, Offset: offset, Size: info.Size()}
 	}
 	if _, err := file.Seek(offset, io.SeekStart); err != nil {
-		_ = file.Close()
+		closeQuietly(file)
 		return nil, err
 	}
 	w := &SpoolWatcher{
@@ -117,7 +117,7 @@ func (w *SpoolWatcher) Start() {
 func (w *SpoolWatcher) Close() {
 	w.closeOnce.Do(func() {
 		close(w.done)
-		_ = w.file.Close()
+		closeQuietly(w.file)
 	})
 }
 

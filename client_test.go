@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,14 +33,13 @@ func startTestServer(t *testing.T) (string, *ghostline.Client) {
 	}()
 	client := ghostline.NewClient(socket)
 	deadline := time.Now().Add(3 * time.Second)
-	for {
-		if client.Check(context.Background()) == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("server did not become ready")
-		}
+	err = client.Check(context.Background())
+	for err != nil && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
+		err = client.Check(context.Background())
+	}
+	if err != nil {
+		t.Fatal("server did not become ready")
 	}
 	t.Cleanup(func() {
 		_ = server.Shutdown(context.Background())
@@ -47,6 +47,23 @@ func startTestServer(t *testing.T) (string, *ghostline.Client) {
 		_ = os.RemoveAll(socketDir)
 	})
 	return socket, client
+}
+
+// TestServerHelperProcess is the subprocess spawned by Connect tests.
+func TestServerHelperProcess(t *testing.T) {
+	if os.Getenv("GHOSTLINE_HELPER") != "1" {
+		return
+	}
+	server, err := ghostline.NewServer(ghostline.Options{
+		OutputDir: os.Getenv("GHOSTLINE_HELPER_DIR"),
+	})
+	if err != nil {
+		os.Exit(1)
+	}
+	if err := server.Serve(context.Background(), os.Getenv("GHOSTLINE_HELPER_SOCKET")); err != nil {
+		os.Exit(1)
+	}
+	os.Exit(0)
 }
 
 func waitRemoteSpool(t *testing.T, session ghostline.Session, needle string) {
@@ -219,7 +236,7 @@ func TestServerRejectsOversizedRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer connection.Close()
+	defer func() { _ = connection.Close() }()
 	_, _ = connection.Write(bytes.Repeat([]byte("a"), 2<<20))
 	_ = connection.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buffer := make([]byte, 1)
@@ -234,7 +251,7 @@ func TestServerRejectsMalformedRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer connection.Close()
+	defer func() { _ = connection.Close() }()
 	if _, err := connection.Write([]byte("not-json\n")); err != nil {
 		t.Fatal(err)
 	}
@@ -246,5 +263,195 @@ func TestServerRejectsMalformedRequest(t *testing.T) {
 	}
 	if !strings.Contains(string(buffer[:count]), "invalid request") {
 		t.Fatalf("response = %q", buffer[:count])
+	}
+}
+
+func connectOptions(t *testing.T, dir string) ghostline.ConnectOptions {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	socketDir, err := os.MkdirTemp("", "ghostline-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+	socket := filepath.Join(socketDir, "ghostline.sock")
+	return ghostline.ConnectOptions{
+		Socket:       socket,
+		Spawn:        []string{executable, "-test.run=TestServerHelperProcess"},
+		ReadyTimeout: 5 * time.Second,
+		Env: []string{
+			"GHOSTLINE_HELPER=1",
+			"GHOSTLINE_HELPER_DIR=" + dir,
+			"GHOSTLINE_HELPER_SOCKET=" + socket,
+		},
+	}
+}
+
+func TestConnectSpawnsServer(t *testing.T) {
+	dir := t.TempDir()
+	client, err := ghostline.Connect(context.Background(), connectOptions(t, dir))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+	session, err := client.Start(context.Background(), ghostline.SessionOptions{
+		Name: "connect", Directory: t.TempDir(), Command: "sh",
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if !session.Alive() {
+		t.Fatal("session not alive after Connect")
+	}
+}
+
+func TestConnectReusesRunningServer(t *testing.T) {
+	socket, _ := startTestServer(t)
+	client, err := ghostline.Connect(context.Background(), ghostline.ConnectOptions{Socket: socket})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := ghostline.NewClient(socket).Check(context.Background()); err != nil {
+		t.Fatal("Close stopped a server it did not spawn")
+	}
+}
+
+func TestEnsureRespawnsServer(t *testing.T) {
+	dir := t.TempDir()
+	client, err := ghostline.Connect(context.Background(), connectOptions(t, dir))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+	_ = client.Close()
+	if err := client.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if _, err := client.Start(context.Background(), ghostline.SessionOptions{
+		Name: "ensure", Directory: t.TempDir(), Command: "sleep 30",
+	}); err != nil {
+		t.Fatalf("Start after Ensure: %v", err)
+	}
+}
+
+func TestLimitedRecoveryRetriesIdempotentCalls(t *testing.T) {
+	dir := t.TempDir()
+	client, err := ghostline.Connect(context.Background(), connectOptions(t, dir))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+	if _, err := client.Start(context.Background(), ghostline.SessionOptions{
+		Name: "recover", Directory: t.TempDir(), Command: "sleep 30",
+	}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	_ = client.Close()
+	names, err := client.List(context.Background())
+	if err != nil {
+		t.Fatalf("List after recovery: %v", err)
+	}
+	if len(names) != 0 {
+		t.Fatalf("recovered server should be empty, got %v", names)
+	}
+}
+
+func TestLimitedRecoveryDoesNotRetryInput(t *testing.T) {
+	dir := t.TempDir()
+	options := connectOptions(t, dir)
+	client, err := ghostline.Connect(context.Background(), options)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+	session, err := client.Start(context.Background(), ghostline.SessionOptions{
+		Name: "no-retry", Directory: t.TempDir(), Command: "sleep 30",
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	_ = client.Close()
+	if err := session.Input(context.Background(), []byte("x")); err == nil {
+		t.Fatal("Input succeeded after server shutdown")
+	}
+	if ghostline.Ping(options.Socket) {
+		t.Fatal("non-idempotent call spawned the server")
+	}
+}
+
+func TestConnectFailsFastWhenSpawnExits(t *testing.T) {
+	socketDir, err := os.MkdirTemp("", "ghostline-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+	socket := filepath.Join(socketDir, "ghostline.sock")
+	started := time.Now()
+	client, err := ghostline.Connect(context.Background(), ghostline.ConnectOptions{
+		Socket:       socket,
+		Spawn:        []string{"sh", "-c", "echo boom >&2; exit 1"},
+		ReadyTimeout: 30 * time.Second,
+	})
+	if err == nil {
+		_ = client.Close()
+		t.Fatal("Connect succeeded with a failing spawn")
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("error should include spawn output, got %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("spawn failure took %v, want a fast failure", elapsed)
+	}
+}
+
+func TestConnectRejectsInvalidEnv(t *testing.T) {
+	_, err := ghostline.Connect(context.Background(), ghostline.ConnectOptions{
+		Socket: filepath.Join(t.TempDir(), "ghostline.sock"),
+		Spawn:  []string{"sh", "-c", "exit 0"},
+		Env:    []string{"NO_EQUALS"},
+	})
+	if err == nil {
+		t.Fatal("Connect succeeded with an invalid environment entry")
+	}
+}
+
+func TestConnectConcurrentSpawnsOneServer(t *testing.T) {
+	dir := t.TempDir()
+	options := connectOptions(t, dir)
+	const callers = 8
+	type result struct {
+		client *ghostline.Client
+		err    error
+	}
+	results := make([]result, callers)
+	var group sync.WaitGroup
+	for index := range results {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			client, err := ghostline.Connect(context.Background(), options)
+			results[index] = result{client: client, err: err}
+		}()
+	}
+	group.Wait()
+	for index, result := range results {
+		if result.err != nil {
+			t.Fatalf("Connect %d: %v", index, result.err)
+		}
+		if err := result.client.Check(context.Background()); err != nil {
+			t.Fatalf("client %d Check: %v", index, err)
+		}
+	}
+	for _, result := range results {
+		_ = result.client.Close()
+	}
+	if ghostline.Ping(options.Socket) {
+		t.Fatal("server still running after every client closed")
 	}
 }

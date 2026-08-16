@@ -1,6 +1,6 @@
 # RFC 0001: Server lifecycle owned by ghostline
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-16
 - Area: Server / Client lifecycle
 
@@ -63,6 +63,8 @@ type ConnectOptions struct {
     // missing. Arguments may contain the placeholder {socket}, replaced by
     // Socket. Empty uses ["ghostline", "serve", "--socket", socket].
     Spawn []string
+    // Env overrides the spawned server's environment.
+    Env []string
     // ReadyTimeout bounds how long Connect waits for the socket after
     // spawning. Zero uses 5s.
     ReadyTimeout time.Duration
@@ -79,20 +81,30 @@ Behavior:
 2. Socket missing → run `Spawn` detached (new session, no terminal), wait up
    to `ReadyTimeout` for the socket, then return the client.
 3. Spawn fails or the socket never appears → return an error that includes
-   the spawn output.
+   the spawn output. A spawn that exits before becoming ready is reported
+   immediately instead of waiting out `ReadyTimeout`.
 
 Concurrent callers are safe: Unix `listen` is exclusive, so only one spawn
-wins; losers simply connect to the winner's socket.
+wins; losers simply connect to the winner's socket and their `Close` is a
+no-op because they do not own the live server.
 
 ### Lazy recovery
 
-`Client.call` maps a connection failure to "server may be down", then:
+`Client.call` maps a connection failure to "server may be down" for
+idempotent operations only, then:
 
 1. `Ping(Socket)`. If it still answers, the failure was transient — return
    the original error.
 2. Otherwise run the same spawn/ready sequence as `Connect` and retry the
    operation once.
 3. If the retry fails, return the retry error.
+
+`Input`, `Resize`, `Close`, `Remove`, and spool maintenance are never
+auto-retried because a retry could duplicate input or affect a new server's
+state.
+
+`Client.Close` stops only the server that `Connect` spawned; clients that
+connected to an existing server are a no-op.
 
 After a server crash the client's remote `Session` handles refer to sessions
 the new server does not know; their operations return `ErrSessionNotFound`.
@@ -120,13 +132,16 @@ Embedders decide whether to rebuild those sessions from their own state.
 - The `ghostline serve` CLI keeps working for manual and service-manager
   deployments.
 
-## Open questions
+## Resolved questions
 
-- Should the default `Spawn` require a `ghostline` binary on `PATH`, or
-  should callers always pass an explicit command? The default is convenient
-  for development but can silently use a stale binary.
-- Should recovery use a short backoff before re-spawning to avoid a crash
-  loop (for example if the server exits immediately because the binary is
-  broken)? A loop guard based on spawn failures is probably enough.
-- Should `Client` expose an explicit `Ensure(ctx)` for embedders that want to
-  pre-warm the server instead of waiting for the first operation?
+- **Default `Spawn`.** The default stays `ghostline serve --socket <path>`
+  for development and CLI installs. Embedders that ship a different binary
+  pass an explicit `Spawn` (as Warren does), so relying on `PATH` is always
+  an embedder choice.
+- **Crash-loop protection.** Recovery is lazy and bounded: each operation
+  respawns at most once, and a spawn that exits before becoming ready is
+  reported immediately with its output. A server that hangs without binding
+  still fails at `ReadyTimeout`. There is no background watchdog and no
+  additional backoff.
+- **Explicit `Ensure`.** Implemented: `Client.Ensure(ctx)` pre-warms the
+  server without an operation and is safe to call at any time.

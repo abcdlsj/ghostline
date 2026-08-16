@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"time"
 )
 
@@ -12,6 +13,25 @@ const (
 	maxRPCLine     = 1 << 20
 	rpcIdleTimeout = time.Minute
 	maxConnections = 64
+)
+
+const (
+	rpcMethodCreate        = "create"
+	rpcMethodStatus        = "status"
+	rpcMethodWait          = "wait"
+	rpcMethodClose         = "close"
+	rpcMethodRemove        = "remove"
+	rpcMethodInput         = "input"
+	rpcMethodResize        = "resize"
+	rpcMethodSnapshot      = "snapshot"
+	rpcMethodCheckpoint    = "checkpoint"
+	rpcMethodRecover       = "recover"
+	rpcMethodSpoolPath     = "spoolPath"
+	rpcMethodSpoolSize     = "spoolSize"
+	rpcMethodTruncateSpool = "truncateSpool"
+	rpcMethodArchiveSpool  = "archiveSpool"
+	rpcMethodRemoveSpool   = "removeSpool"
+	rpcMethodList          = "list"
 )
 
 type nameParams struct {
@@ -42,6 +62,35 @@ type recoverParams struct {
 	Name   string `json:"name"`
 	Offset int64  `json:"offset"`
 	End    int64  `json:"end"`
+}
+
+type createResult struct {
+	Created int64 `json:"created"`
+}
+
+type listResult struct {
+	Sessions []string `json:"sessions"`
+}
+
+type dataResult struct {
+	Data []byte `json:"data"`
+}
+
+type checkpointResult struct {
+	Replay []byte `json:"replay"`
+	Offset int64  `json:"offset"`
+}
+
+type spoolPathResult struct {
+	Path string `json:"path"`
+}
+
+type spoolSizeResult struct {
+	Size int64 `json:"size"`
+}
+
+type removeResult struct {
+	Exit *ExitError `json:"exit"`
 }
 
 type request struct {
@@ -151,4 +200,15 @@ func decode[T any](raw json.RawMessage) (T, error) {
 		return value, err
 	}
 	return value, nil
+}
+
+// Ping reports whether a ghostline server is accepting connections on
+// socketPath.
+func Ping(socketPath string) bool {
+	connection, err := net.DialTimeout("unix", socketPath, 100*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	closeQuietly(connection)
+	return true
 }

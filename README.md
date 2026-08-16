@@ -99,6 +99,32 @@ including `Wait`, `Checkpoint`, and `Recover`. Clients and the server must
 share the same filesystem because output watchers read the spool files
 directly.
 
+### Server bootstrap
+
+`Connect` starts the server when the socket is missing:
+
+```go
+client, err := ghostline.Connect(ctx, ghostline.ConnectOptions{
+	Socket: "/tmp/ghostline.sock",
+})
+if err != nil {
+	return err
+}
+defer client.Close()
+```
+
+The default spawn command is `ghostline serve --socket <path>`. `Spawn` can
+override it, with `{socket}` replaced by the socket path; `Env` and `Log`
+configure the spawned process. `Ensure` pre-warms the server without an
+operation. A spawn that exits before becoming ready is reported immediately,
+including its output. Concurrent `Connect` calls are safe: the first server
+to bind wins, and the other clients attach to it without owning it.
+
+Recovery is lazy and restricted: read-only calls and `Start` may respawn and
+retry once after a dead socket. `Input`, `Resize`, `Close`, `Remove`, and spool
+maintenance are never retried automatically. `Close` stops only the server
+this client spawned; connecting to an existing server is a no-op.
+
 ## Checkpoints
 
 For a lossless reattach or window switch, pause the watcher and use an atomic

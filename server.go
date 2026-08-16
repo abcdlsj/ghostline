@@ -36,24 +36,23 @@ func (s *Server) Serve(ctx context.Context, socketPath string) error {
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
 		return fmt.Errorf("create socket dir: %w", err)
 	}
-	_ = os.Remove(socketPath)
-	listener, err := net.Listen("unix", socketPath)
+	listener, err := listenUnix(socketPath)
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
 	if err := os.Chmod(socketPath, 0o600); err != nil {
-		_ = listener.Close()
-		_ = os.Remove(socketPath)
+		closeQuietly(listener)
+		removeQuietly(socketPath)
 		return fmt.Errorf("chmod socket: %w", err)
 	}
 	s.mu.Lock()
 	s.listener = listener
 	s.mu.Unlock()
-	defer listener.Close()
-	defer os.Remove(socketPath)
+	defer closeQuietly(listener)
+	defer removeQuietly(socketPath)
 	go func() {
 		<-ctx.Done()
-		_ = listener.Close()
+		closeQuietly(listener)
 	}()
 
 	slots := make(chan struct{}, maxConnections)
@@ -72,9 +71,22 @@ func (s *Server) Serve(ctx context.Context, socketPath string) error {
 				s.handle(connection)
 			}()
 		default:
-			_ = connection.Close()
+			closeQuietly(connection)
 		}
 	}
+}
+
+// listenUnix binds socketPath without unlinking a live server's socket.
+func listenUnix(socketPath string) (net.Listener, error) {
+	if _, err := os.Lstat(socketPath); err == nil {
+		if Ping(socketPath) {
+			return nil, fmt.Errorf("socket already in use: %s", socketPath)
+		}
+		removeQuietly(socketPath)
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	return net.Listen("unix", socketPath)
 }
 
 // Close stops accepting connections. Sessions keep running.
@@ -102,7 +114,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 func (s *Server) handle(connection net.Conn) {
-	defer connection.Close()
+	defer closeQuietly(connection)
 	reader := bufio.NewReader(connection)
 	writer := bufio.NewWriter(connection)
 	for {
@@ -118,26 +130,26 @@ func (s *Server) handle(connection net.Conn) {
 			continue
 		}
 
-		ctx := context.Background()
-		if req.Method == "wait" {
-			ctx, cancel := context.WithCancel(ctx)
-			stop := make(chan struct{})
-			go monitorConnection(connection, cancel, stop)
-			result, dispatchErr := s.dispatch(ctx, req.Method, req.Params)
-			close(stop)
-			_ = connection.SetReadDeadline(time.Now())
-			cancel()
-			if err := writeResponse(writer, req.ID, result, dispatchErr); err != nil {
-				return
-			}
-			continue
-		}
-
-		result, dispatchErr := s.dispatch(ctx, req.Method, req.Params)
+		result, dispatchErr := s.dispatchRequest(connection, req)
 		if err := writeResponse(writer, req.ID, result, dispatchErr); err != nil {
 			return
 		}
 	}
+}
+
+func (s *Server) dispatchRequest(connection net.Conn, req request) (any, error) {
+	if req.Method != rpcMethodWait {
+		return s.dispatch(context.Background(), req.Method, req.Params)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stop := make(chan struct{})
+	go monitorConnection(connection, cancel, stop)
+	result, err := s.dispatch(ctx, req.Method, req.Params)
+	close(stop)
+	_ = connection.SetReadDeadline(time.Now())
+	cancel()
+	return result, err
 }
 
 // monitorConnection cancels wait dispatch when the client stops reading.
@@ -163,9 +175,33 @@ func monitorConnection(connection net.Conn, cancel context.CancelFunc, stop <-ch
 	}
 }
 
+func (s *Server) session(name string) (Session, error) {
+	session, ok := s.hub.Session(name)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, name)
+	}
+	return session, nil
+}
+
+func (s *Server) namedSession(raw json.RawMessage) (Session, error) {
+	params, err := decode[nameParams](raw)
+	if err != nil {
+		return nil, err
+	}
+	return s.session(params.Name)
+}
+
+func (s *Server) spoolPath(name string) (string, error) {
+	path := s.hub.spoolPath(name)
+	if path == "" {
+		return "", fmt.Errorf("%w: %s", ErrInvalidSessionName, name)
+	}
+	return path, nil
+}
+
 func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessage) (any, error) {
 	switch method {
-	case "create":
+	case rpcMethodCreate:
 		params, err := decode[createParams](raw)
 		if err != nil {
 			return nil, err
@@ -180,27 +216,19 @@ func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessag
 		if err != nil {
 			return nil, err
 		}
-		return map[string]int64{"created": session.CreatedAt().Unix()}, nil
+		return createResult{Created: session.CreatedAt().Unix()}, nil
 
-	case "status":
-		params, err := decode[nameParams](raw)
+	case rpcMethodStatus:
+		session, err := s.namedSession(raw)
 		if err != nil {
 			return nil, err
-		}
-		session, ok := s.hub.Session(params.Name)
-		if !ok {
-			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, params.Name)
 		}
 		return session.Status(ctx)
 
-	case "wait":
-		params, err := decode[nameParams](raw)
+	case rpcMethodWait:
+		session, err := s.namedSession(raw)
 		if err != nil {
 			return nil, err
-		}
-		session, ok := s.hub.Session(params.Name)
-		if !ok {
-			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, params.Name)
 		}
 		_ = session.Wait(ctx)
 		if ctx.Err() != nil {
@@ -208,25 +236,17 @@ func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessag
 		}
 		return session.Status(ctx)
 
-	case "close":
-		params, err := decode[nameParams](raw)
+	case rpcMethodClose:
+		session, err := s.namedSession(raw)
 		if err != nil {
 			return nil, err
-		}
-		session, ok := s.hub.Session(params.Name)
-		if !ok {
-			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, params.Name)
 		}
 		return nil, session.Close()
 
-	case "remove":
-		params, err := decode[nameParams](raw)
+	case rpcMethodRemove:
+		session, err := s.namedSession(raw)
 		if err != nil {
 			return nil, err
-		}
-		session, ok := s.hub.Session(params.Name)
-		if !ok {
-			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, params.Name)
 		}
 		status, err := session.Status(ctx)
 		if err != nil {
@@ -235,125 +255,134 @@ func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessag
 		if err := session.Remove(); err != nil {
 			return nil, err
 		}
-		return map[string]any{"exit": status.Exit}, nil
+		return removeResult{Exit: status.Exit}, nil
 
-	case "input":
+	case rpcMethodInput:
 		params, err := decode[inputParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		session, ok := s.hub.Session(params.Name)
-		if !ok {
-			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, params.Name)
+		session, err := s.session(params.Name)
+		if err != nil {
+			return nil, err
 		}
 		return nil, session.Input(ctx, params.Data)
 
-	case "resize":
+	case rpcMethodResize:
 		params, err := decode[resizeParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		session, ok := s.hub.Session(params.Name)
-		if !ok {
-			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, params.Name)
-		}
-		return nil, session.Resize(ctx, Size{Columns: params.Cols, Rows: params.Rows})
-
-	case "snapshot":
-		params, err := decode[nameParams](raw)
+		session, err := s.session(params.Name)
 		if err != nil {
 			return nil, err
 		}
-		session, ok := s.hub.Session(params.Name)
-		if !ok {
-			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, params.Name)
+		return nil, session.Resize(ctx, Size{Columns: params.Cols, Rows: params.Rows})
+
+	case rpcMethodSnapshot:
+		session, err := s.namedSession(raw)
+		if err != nil {
+			return nil, err
 		}
 		data, err := session.Snapshot(ctx)
 		if err != nil {
 			return nil, err
 		}
-		return map[string][]byte{"data": data}, nil
+		return dataResult{Data: data}, nil
 
-	case "checkpoint":
-		params, err := decode[nameParams](raw)
+	case rpcMethodCheckpoint:
+		session, err := s.namedSession(raw)
 		if err != nil {
 			return nil, err
-		}
-		session, ok := s.hub.Session(params.Name)
-		if !ok {
-			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, params.Name)
 		}
 		checkpoint, err := session.Checkpoint(ctx)
 		if err != nil {
 			return nil, err
 		}
-		return map[string]any{
-			"replay": checkpoint.Replay,
-			"offset": checkpoint.Offset,
-		}, nil
+		return checkpointResult(checkpoint), nil
 
-	case "recover":
+	case rpcMethodRecover:
 		params, err := decode[recoverParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		path := s.hub.spoolPath(params.Name)
-		if path == "" {
-			return nil, fmt.Errorf("%w: %s", ErrInvalidSessionName, params.Name)
+		path, err := s.spoolPath(params.Name)
+		if err != nil {
+			return nil, err
 		}
 		data, err := readSpool(path, params.Offset, params.End)
 		if err != nil {
 			return nil, err
 		}
-		return map[string][]byte{"data": data}, nil
+		return dataResult{Data: data}, nil
 
-	case "spoolPath":
+	case rpcMethodSpoolPath:
 		params, err := decode[nameParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		return map[string]string{"path": s.hub.spoolPath(params.Name)}, nil
+		path, err := s.spoolPath(params.Name)
+		if err != nil {
+			return nil, err
+		}
+		return spoolPathResult{Path: path}, nil
 
-	case "spoolSize":
+	case rpcMethodSpoolSize:
 		params, err := decode[nameParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		size, err := spoolSize(s.hub.spoolPath(params.Name))
+		path, err := s.spoolPath(params.Name)
 		if err != nil {
 			return nil, err
 		}
-		return map[string]int64{"size": size}, nil
+		size, err := spoolSize(path)
+		if err != nil {
+			return nil, err
+		}
+		return spoolSizeResult{Size: size}, nil
 
-	case "truncateSpool":
+	case rpcMethodTruncateSpool:
 		params, err := decode[nameParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		return nil, truncateSpool(s.hub.spoolPath(params.Name))
+		path, err := s.spoolPath(params.Name)
+		if err != nil {
+			return nil, err
+		}
+		return nil, truncateSpool(path)
 
-	case "archiveSpool":
+	case rpcMethodArchiveSpool:
 		params, err := decode[nameParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		return nil, archiveSpool(s.hub.spoolPath(params.Name))
+		path, err := s.spoolPath(params.Name)
+		if err != nil {
+			return nil, err
+		}
+		return nil, archiveSpool(path)
 
-	case "removeSpool":
+	case rpcMethodRemoveSpool:
 		params, err := decode[nameParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		removeSpool(s.hub.spoolPath(params.Name))
+		path, err := s.spoolPath(params.Name)
+		if err != nil {
+			return nil, err
+		}
+		removeSpool(path)
 		return nil, nil
 
-	case "list":
+	case rpcMethodList:
 		sessions := s.hub.Sessions()
 		names := make([]string, 0, len(sessions))
 		for _, session := range sessions {
 			names = append(names, session.Name())
 		}
-		return map[string][]string{"sessions": names}, nil
+		return listResult{Sessions: names}, nil
 
 	default:
 		return nil, fmt.Errorf("unknown method: %s", method)
