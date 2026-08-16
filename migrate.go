@@ -3,7 +3,6 @@ package ghostline
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -383,19 +382,6 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 		return 0, fmt.Errorf("create output dir: %w", err)
 	}
 
-	// Servers older than the current protocol may fail to encode their native
-	// emulator state (libghostty-vt returns GHOSTTY_INVALID_VALUE). Worse, a
-	// v0.3.4 server removes the session from its pending batch the moment that
-	// encode fails, so there is no way to commit after the fact. Detect the
-	// old protocol up front and rebuild every session from its raw spool
-	// instead, while the old server is still paused and the spool is stable.
-	replayFromSpool := false
-	if versionClient := NewClient(strings.TrimSuffix(adminSocket, ".admin")); versionClient != nil {
-		if version, versionErr := versionClient.Version(ctx); versionErr == nil && version != ProtocolVersion {
-			replayFromSpool = true
-		}
-	}
-
 	connection, err := dialAdmin(ctx, adminSocket)
 	if err != nil {
 		return 0, err
@@ -447,37 +433,17 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 			}
 			master = os.NewFile(uintptr(masterFD), "adopted-master")
 		}
-		if replayFromSpool {
-			state, err := adoptStateFromSpool(
-				adopted.Name,
-				master,
-				Size{Columns: adopted.Cols, Rows: adopted.Rows},
-				h.spoolPath(adopted.Name),
-				time.Unix(adopted.CreatedAt, 0),
-				adopted.PID,
-				adopted.Exit.error(),
-			)
-			if err != nil {
-				closeFileQuietly(master)
-				return 0, fmt.Errorf("replay spool for %s: %w", meta.Name, err)
-			}
-			prepared = append(prepared, state)
-			continue
-		}
-		var snapshotResult adminSnapshotResult
-		if err := client.call(ctx, adminMethodSnapshot, adoptParams{Name: meta.Name}, &snapshotResult); err != nil {
-			closeFileQuietly(master)
-			return 0, fmt.Errorf("encode snapshot for %s: %w", meta.Name, err)
-		}
-		snapshot, err := base64.StdEncoding.DecodeString(snapshotResult.Snapshot)
-		if err != nil {
-			closeFileQuietly(master)
-			return 0, fmt.Errorf("decode snapshot for %s: %w", meta.Name, err)
-		}
-		state, err := adoptState(
+		// Rolling upgrades rebuild the emulator from the append-only spool
+		// instead of the old server's native snapshot. Native state encoding
+		// can fail on older servers (continuation tracking was disabled) and,
+		// worse, the old server drops the session from its pending batch at
+		// that point, leaving nothing to commit. The spool is stable while the
+		// old server is paused, and it contains every byte the old emulator
+		// parsed, so this path works across protocol versions and stays the
+		// migration contract going forward.
+		state, err := adoptStateFromSpool(
 			adopted.Name,
 			master,
-			snapshot,
 			Size{Columns: adopted.Cols, Rows: adopted.Rows},
 			h.spoolPath(adopted.Name),
 			time.Unix(adopted.CreatedAt, 0),
@@ -485,7 +451,8 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 			adopted.Exit.error(),
 		)
 		if err != nil {
-			return 0, err
+			closeFileQuietly(master)
+			return 0, fmt.Errorf("replay spool for %s: %w", meta.Name, err)
 		}
 		prepared = append(prepared, state)
 	}
