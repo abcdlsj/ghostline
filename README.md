@@ -242,7 +242,9 @@ users.
 - `Close` terminates a session but keeps its record and spool for inspection.
 - `Remove` deletes the in-memory record; spool files stay on disk.
 - `Hub.Close` terminates every session.
-- `Session.Wait` returns an `ExitError` with the exit code or signal. Context
+- `Session.Wait` returns an `ExitError` with the exit code or signal. A child
+  that exits after a rolling upgrade may report `ExitError.Unknown`, because
+  its new owner cannot recover the old process's wait status. Context
   cancellation stops waiting but does not terminate the child.
 - `Status` distinguishes a stopped session from a remote network failure;
   `Alive` is a best-effort convenience.

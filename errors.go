@@ -26,9 +26,17 @@ type ExitError struct {
 	Code int
 	// Signal names the terminating signal when the process was signaled.
 	Signal string
+	// Unknown is true when a migrated child exited after its original parent
+	// had already gone away. In that case the new server can observe the PTY
+	// closing, but the operating system cannot provide the original wait
+	// status to a different parent process.
+	Unknown bool
 }
 
 func (e *ExitError) Error() string {
+	if e.Unknown {
+		return "exit status unknown"
+	}
 	if e.Signal != "" {
 		return "signal: " + e.Signal
 	}

@@ -58,9 +58,10 @@ version advertised on the socket against its own expected version.
 The server listens on a second Unix socket next to the main one
 (`<socket>.admin`) with a minimal protocol:
 
-- `list` — return session names and metadata (size, created, pid).
-- `adopt <name>` — pause the session and return its metadata plus the
-  `SCM_RIGHTS` master fd.
+- `list` — return session names and metadata (size, created, pid, and whether
+  the child has already exited).
+- `adopt <name>` — pause the session and return its metadata; a live child
+  also carries its `SCM_RIGHTS` master fd.
 - `snapshot <name>` — return the encoded libghostty snapshot for a prepared
   session.
 - `commit <names>` / `abort <names>` — commit or abort a prepared batch.

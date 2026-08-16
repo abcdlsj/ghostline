@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -59,6 +58,11 @@ func (s *Server) Serve(ctx context.Context, socketPath string) error {
 	adminListener, err := listenUnix(adminPath)
 	if err != nil {
 		return fmt.Errorf("listen admin: %w", err)
+	}
+	if err := os.Chmod(adminPath, 0o600); err != nil {
+		closeQuietly(adminListener)
+		removeQuietly(adminPath)
+		return fmt.Errorf("chmod admin socket: %w", err)
 	}
 	s.mu.Lock()
 	s.admin = adminListener
@@ -115,125 +119,238 @@ func (s *Server) handleAdmin(connection net.Conn) {
 		return
 	}
 	defer closeQuietly(unixConn)
-	pending := make(map[string]*sessionState)
+	transport := newAdminTransport(unixConn)
+	defer transport.closeReceived()
+	pending := make(map[string]pendingAdoption)
+	batchFrozen := false
 	defer func() {
-		for _, state := range pending {
-			state.abortMigration()
+		for _, adoption := range pending {
+			_ = s.resolveAdoption(adoption, false)
+		}
+		if batchFrozen {
+			s.hub.endMigrationBatch()
 		}
 	}()
-	reader := bufio.NewReader(unixConn)
-	writer := bufio.NewWriter(unixConn)
 	for {
+		_ = unixConn.SetReadDeadline(time.Now().Add(adminTimeout))
 		var request adminRequest
-		if err := json.NewDecoder(reader).Decode(&request); err != nil {
+		if err := transport.read(&request); err != nil {
 			return
 		}
 		switch request.Method {
 		case adminMethodList:
+			if batchFrozen || !s.hub.beginMigrationBatch() {
+				_ = transport.write(adminResponse{ID: request.ID, Error: "migration batch already active"}, -1)
+				continue
+			}
+			batchFrozen = true
 			states := s.hub.sessionStates()
 			result := adminListResult{Sessions: make([]sessionMeta, 0, len(states))}
 			for _, state := range states {
-				result.Sessions = append(result.Sessions, sessionMeta{
-					Name:      state.name,
-					Cols:      state.size.Columns,
-					Rows:      state.size.Rows,
-					CreatedAt: state.createdAt.Unix(),
-					PID:       state.pid,
-				})
+				result.Sessions = append(result.Sessions, sessionMetaOf(state))
 			}
-			writeAdminResult(writer, request.ID, result)
+			if err := writeAdminResult(transport, request.ID, result, -1); err != nil {
+				return
+			}
 		case adminMethodAdopt:
 			var params adoptParams
 			if err := json.Unmarshal(request.Params, &params); err != nil {
-				writeAdminError(writer, request.ID, err)
+				_ = transport.write(adminResponse{ID: request.ID, Error: err.Error()}, -1)
+				continue
+			}
+			if !batchFrozen {
+				_ = transport.write(adminResponse{ID: request.ID, Error: "send list before adopt"}, -1)
+				continue
+			}
+			if _, exists := pending[params.Name]; exists {
+				_ = transport.write(adminResponse{ID: request.ID, Error: "session already prepared"}, -1)
 				continue
 			}
 			state := s.hub.session(params.Name)
 			if state == nil {
-				writeAdminError(writer, request.ID, ErrSessionNotFound)
+				_ = transport.write(adminResponse{ID: request.ID, Error: ErrSessionNotFound.Error()}, -1)
 				continue
 			}
-			state.beginMigration()
+			ticket, err := state.beginMigration()
+			if err != nil {
+				_ = transport.write(adminResponse{ID: request.ID, Error: err.Error()}, -1)
+				continue
+			}
+			adoption := pendingAdoption{state: state, ticket: ticket}
+			pending[params.Name] = adoption
 			select {
-			case <-state.migrationStable():
-			case <-time.After(adoptTimeout):
-				state.abortMigration()
-				writeAdminError(writer, request.ID, errors.New("migration timed out"))
+			case <-ticket.stable:
+			case <-time.After(adminTimeout):
+				_ = s.resolveAdoption(adoption, false)
+				delete(pending, params.Name)
+				_ = transport.write(adminResponse{ID: request.ID, Error: "migration timed out"}, -1)
 				continue
 			}
-			pending[params.Name] = state
-			meta := sessionMeta{
-				Name:      state.name,
-				Cols:      state.size.Columns,
-				Rows:      state.size.Rows,
-				CreatedAt: state.createdAt.Unix(),
-				PID:       state.pid,
+			if err := ticket.error(); err != nil {
+				_ = s.resolveAdoption(adoption, false)
+				delete(pending, params.Name)
+				_ = transport.write(adminResponse{ID: request.ID, Error: err.Error()}, -1)
+				continue
 			}
-			writeAdminResult(writer, request.ID, meta)
-			if err := sendFD(unixConn, int(state.master.Fd())); err != nil {
+			meta := sessionMetaLocked(state)
+			fd := -1
+			if ticket.alive {
+				fd = int(state.master.Fd())
+			}
+			if err := writeAdminResult(transport, request.ID, meta, fd); err != nil {
 				return
 			}
 		case adminMethodSnapshot:
 			var params adoptParams
 			if err := json.Unmarshal(request.Params, &params); err != nil {
-				writeAdminError(writer, request.ID, err)
+				_ = transport.write(adminResponse{ID: request.ID, Error: err.Error()}, -1)
 				continue
 			}
-			state := pending[params.Name]
-			if state == nil {
-				writeAdminError(writer, request.ID, errors.New("session not prepared for adoption"))
+			adoption, ok := pending[params.Name]
+			if !ok {
+				_ = transport.write(adminResponse{ID: request.ID, Error: "session not prepared for adoption"}, -1)
 				continue
 			}
-			state.outputMu.Lock()
-			snapshot, err := state.vt.EncodeState()
-			state.outputMu.Unlock()
+			adoption.state.outputMu.Lock()
+			snapshot, err := adoption.state.vt.EncodeState()
+			adoption.state.outputMu.Unlock()
 			if err != nil {
+				_ = s.resolveAdoption(adoption, false)
 				delete(pending, params.Name)
-				state.abortMigration()
-				writeAdminError(writer, request.ID, err)
+				_ = transport.write(adminResponse{ID: request.ID, Error: err.Error()}, -1)
 				continue
 			}
-			writeAdminResult(writer, request.ID, adminSnapshotResult{
+			if err := writeAdminResult(transport, request.ID, adminSnapshotResult{
 				Snapshot: base64.StdEncoding.EncodeToString(snapshot),
-			})
+			}, -1); err != nil {
+				return
+			}
 		case adminMethodCommit, adminMethodAbort:
 			var params adminBatchParams
 			if err := json.Unmarshal(request.Params, &params); err != nil {
-				writeAdminError(writer, request.ID, err)
+				_ = transport.write(adminResponse{ID: request.ID, Error: err.Error()}, -1)
 				continue
 			}
-			states := make([]*sessionState, 0, len(params.Names))
+			adoptions := make([]pendingAdoption, 0, len(params.Names))
+			seen := make(map[string]struct{}, len(params.Names))
 			missing := false
 			for _, name := range params.Names {
-				state := pending[name]
-				if state == nil {
+				if _, duplicate := seen[name]; duplicate {
 					missing = true
 					continue
 				}
-				states = append(states, state)
+				seen[name] = struct{}{}
+				adoption, exists := pending[name]
+				if !exists {
+					missing = true
+					continue
+				}
+				adoptions = append(adoptions, adoption)
 			}
 			if missing {
-				writeAdminError(writer, request.ID, errors.New("one or more sessions not prepared"))
+				_ = transport.write(adminResponse{ID: request.ID, Error: "one or more sessions not prepared"}, -1)
 				continue
 			}
-			for _, name := range params.Names {
-				delete(pending, name)
-			}
-			for _, state := range states {
-				if request.Method == adminMethodCommit {
-					state.commitMigration()
-				} else {
-					state.abortMigration()
+			commit := request.Method == adminMethodCommit
+			if commit {
+				// A ticket can become unstable if the child exits while the
+				// batch is being prepared. Preflight every ticket before
+				// resolving any of them so ownership cannot split halfway
+				// through a commit.
+				var unstable error
+				for _, adoption := range adoptions {
+					if err := adoption.ticket.error(); err != nil {
+						unstable = err
+						break
+					}
+					if adoption.state.currentMigration() != adoption.ticket {
+						unstable = errMigrationStale
+						break
+					}
+				}
+				if unstable != nil {
+					for _, adoption := range adoptions {
+						if adoption.state.currentMigration() == adoption.ticket {
+							_ = s.resolveAdoption(adoption, false)
+						}
+						delete(pending, adoption.state.name)
+					}
+					if batchFrozen {
+						s.hub.endMigrationBatch()
+						batchFrozen = false
+					}
+					_ = transport.write(adminResponse{ID: request.ID, Error: unstable.Error()}, -1)
+					continue
 				}
 			}
-			writeAdminResult(writer, request.ID, adminBatchResult{Committed: len(states)})
+			var resolveErr error
+			for _, adoption := range adoptions {
+				if err := s.resolveAdoption(adoption, commit); err != nil && resolveErr == nil {
+					resolveErr = err
+				}
+			}
+			if resolveErr != nil && commit {
+				// This should be unreachable after preflight, but leave the old
+				// hub internally consistent if a ticket changes unexpectedly.
+				for _, adoption := range adoptions {
+					if adoption.state.currentMigration() == adoption.ticket {
+						_ = s.resolveAdoption(adoption, false)
+					}
+					delete(pending, adoption.state.name)
+					if adoption.state.migrated.Load() {
+						s.hub.remove(adoption.state.name)
+					}
+				}
+				if batchFrozen {
+					s.hub.endMigrationBatch()
+					batchFrozen = false
+				}
+				_ = transport.write(adminResponse{ID: request.ID, Error: resolveErr.Error()}, -1)
+				return
+			}
+			for _, adoption := range adoptions {
+				delete(pending, adoption.state.name)
+				if commit {
+					s.hub.remove(adoption.state.name)
+				}
+			}
+			if err := writeAdminResult(transport, request.ID, adminBatchResult{Committed: len(adoptions)}, -1); err != nil {
+				return
+			}
+			if batchFrozen {
+				s.hub.endMigrationBatch()
+				batchFrozen = false
+			}
 		case adminMethodExit:
+			if len(pending) != 0 {
+				_ = transport.write(adminResponse{ID: request.ID, Error: "migration batch is not committed"}, -1)
+				continue
+			}
+			if err := writeAdminResult(transport, request.ID, struct{}{}, -1); err != nil {
+				return
+			}
 			s.requestExit()
 			return
 		default:
-			writeAdminError(writer, request.ID, fmt.Errorf("unknown admin method: %s", request.Method))
+			_ = transport.write(adminResponse{ID: request.ID, Error: fmt.Sprintf("unknown admin method: %s", request.Method)}, -1)
 		}
 	}
+}
+
+func writeAdminResult(transport *adminTransport, id int64, result any, fd int) error {
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return transport.write(adminResponse{ID: id, Error: err.Error()}, -1)
+	}
+	return transport.write(adminResponse{ID: id, Result: encoded}, fd)
+}
+
+func (s *Server) resolveAdoption(adoption pendingAdoption, commit bool) error {
+	err := adoption.state.finishMigration(adoption.ticket, commit)
+	if err != nil && commit {
+		return err
+	}
+	return nil
 }
 
 // requestExit stops both listeners so Serve returns and the process exits
@@ -245,17 +362,6 @@ func (s *Server) requestExit() {
 	admin := s.admin
 	s.mu.Unlock()
 	closeQuietly(admin)
-}
-
-func writeAdminResult(writer *bufio.Writer, id int64, result any) {
-	encoded, _ := json.Marshal(result)
-	_ = json.NewEncoder(writer).Encode(adminResponse{ID: id, Result: encoded})
-	_ = writer.Flush()
-}
-
-func writeAdminError(writer *bufio.Writer, id int64, err error) {
-	_ = json.NewEncoder(writer).Encode(adminResponse{ID: id, Error: err.Error()})
-	_ = writer.Flush()
 }
 
 // listenUnix binds socketPath without unlinking a live server's socket.
@@ -371,14 +477,6 @@ func (s *Server) namedSession(raw json.RawMessage) (Session, error) {
 		return nil, err
 	}
 	return s.session(params.Name)
-}
-
-func (s *Server) spoolPath(name string) (string, error) {
-	path := s.hub.spoolPath(name)
-	if path == "" {
-		return "", fmt.Errorf("%w: %s", ErrInvalidSessionName, name)
-	}
-	return path, nil
 }
 
 func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessage) (any, error) {
@@ -498,11 +596,11 @@ func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessag
 		if err != nil {
 			return nil, err
 		}
-		path, err := s.spoolPath(params.Name)
+		session, err := s.session(params.Name)
 		if err != nil {
 			return nil, err
 		}
-		data, err := readSpool(path, params.Offset, params.End)
+		data, err := session.Recover(ctx, params.Offset, params.End)
 		if err != nil {
 			return nil, err
 		}
@@ -513,22 +611,22 @@ func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessag
 		if err != nil {
 			return nil, err
 		}
-		path, err := s.spoolPath(params.Name)
+		session, err := s.session(params.Name)
 		if err != nil {
 			return nil, err
 		}
-		return spoolPathResult{Path: path}, nil
+		return spoolPathResult{Path: session.SpoolPath()}, nil
 
 	case rpcMethodSpoolSize:
 		params, err := decode[nameParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		path, err := s.spoolPath(params.Name)
+		session, err := s.session(params.Name)
 		if err != nil {
 			return nil, err
 		}
-		size, err := spoolSize(path)
+		size, err := session.SpoolSize(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -539,33 +637,33 @@ func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessag
 		if err != nil {
 			return nil, err
 		}
-		path, err := s.spoolPath(params.Name)
+		session, err := s.session(params.Name)
 		if err != nil {
 			return nil, err
 		}
-		return nil, truncateSpool(path)
+		return nil, session.TruncateSpool(ctx)
 
 	case rpcMethodArchiveSpool:
 		params, err := decode[nameParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		path, err := s.spoolPath(params.Name)
+		session, err := s.session(params.Name)
 		if err != nil {
 			return nil, err
 		}
-		return nil, archiveSpool(path)
+		return nil, session.ArchiveSpool(ctx)
 
 	case rpcMethodRemoveSpool:
 		params, err := decode[nameParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		path, err := s.spoolPath(params.Name)
+		session, err := s.session(params.Name)
 		if err != nil {
 			return nil, err
 		}
-		removeSpool(path)
+		session.RemoveSpool()
 		return nil, nil
 
 	case rpcMethodList:

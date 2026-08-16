@@ -46,10 +46,15 @@ type Hub struct {
 	defaultSize Size
 	defaultTerm string
 
-	mu       sync.Mutex
-	sessions map[string]*sessionState
-	pending  map[string]struct{}
-	closed   bool
+	// lifecycleMu is a reader/writer gate around hub-wide mutations. Normal
+	// session operations take a read lock; a rolling-upgrade batch takes the
+	// write lock so no session can appear or disappear halfway through the
+	// handoff.
+	lifecycleMu sync.RWMutex
+	mu          sync.Mutex
+	sessions    map[string]*sessionState
+	pending     map[string]struct{}
+	closed      bool
 }
 
 // New constructs a session hub.
@@ -73,6 +78,9 @@ func New(options Options) (*Hub, error) {
 
 // Start creates and starts a session.
 func (h *Hub) Start(ctx context.Context, options SessionOptions) (Session, error) {
+	h.lifecycleMu.RLock()
+	defer h.lifecycleMu.RUnlock()
+
 	if err := validateName(options.Name); err != nil {
 		return nil, err
 	}
@@ -135,6 +143,8 @@ func (h *Hub) Start(ctx context.Context, options SessionOptions) (Session, error
 
 // Session returns a handle for a known session name.
 func (h *Hub) Session(name string) (Session, bool) {
+	h.lifecycleMu.RLock()
+	defer h.lifecycleMu.RUnlock()
 	state := h.session(name)
 	if state == nil {
 		return nil, false
@@ -144,6 +154,8 @@ func (h *Hub) Session(name string) (Session, bool) {
 
 // Sessions returns all known sessions ordered by creation time and name.
 func (h *Hub) Sessions() []Session {
+	h.lifecycleMu.RLock()
+	defer h.lifecycleMu.RUnlock()
 	states := h.sessionStates()
 	sessions := make([]Session, 0, len(states))
 	for _, state := range states {
@@ -187,6 +199,9 @@ func (h *Hub) Check(ctx context.Context) error {
 
 // Close terminates every session and prevents further Start calls.
 func (h *Hub) Close() error {
+	h.lifecycleMu.Lock()
+	defer h.lifecycleMu.Unlock()
+
 	h.mu.Lock()
 	if h.closed {
 		h.mu.Unlock()
@@ -219,6 +234,25 @@ func (h *Hub) remove(name string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.sessions, name)
+}
+
+// beginMigrationBatch freezes hub-wide mutations until endMigrationBatch.
+// The admin protocol holds this write lock from list through commit/abort, so
+// its session inventory remains closed under the entire transaction.
+func (h *Hub) beginMigrationBatch() bool {
+	h.lifecycleMu.Lock()
+	h.mu.Lock()
+	closed := h.closed
+	h.mu.Unlock()
+	if closed {
+		h.lifecycleMu.Unlock()
+		return false
+	}
+	return true
+}
+
+func (h *Hub) endMigrationBatch() {
+	h.lifecycleMu.Unlock()
 }
 
 func (h *Hub) spoolPath(name string) string {

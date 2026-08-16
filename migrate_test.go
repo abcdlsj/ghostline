@@ -3,6 +3,7 @@ package ghostline
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -34,12 +35,12 @@ func startMigrateServer(t *testing.T, outputDir, tag string) (*Server, string) {
 	})
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if Ping(socket) {
+		if Ping(socket) && Ping(socket+".admin") {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if !Ping(socket) {
+	if !Ping(socket) || !Ping(socket+".admin") {
 		t.Fatalf("server %s not ready", tag)
 	}
 	return server, socket
@@ -113,6 +114,117 @@ func TestRollingAdoptKeepsChildRunning(t *testing.T) {
 	}
 }
 
+func TestRollingAdoptPreservesStoppedExit(t *testing.T) {
+	ctx := context.Background()
+	outputDir := t.TempDir()
+	oldServer, oldSocket := startMigrateServer(t, outputDir, "stopped")
+	stopped, err := oldServer.hub.Start(ctx, SessionOptions{Name: "stopped", Command: "exit 7"})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	var original *ExitError
+	if err := stopped.Wait(ctx); !errors.As(err, &original) || original.Code != 7 {
+		t.Fatalf("original Wait = %v, want exit code 7", err)
+	}
+
+	newServer, _ := startMigrateServer(t, outputDir, "stopped-new")
+	if adopted, err := Adopt(ctx, oldSocket+".admin", newServer.hub); err != nil || adopted != 1 {
+		t.Fatalf("Adopt = (%d, %v), want (1, nil)", adopted, err)
+	}
+	adoptedSession, ok := newServer.hub.Session("stopped")
+	if !ok {
+		t.Fatal("stopped session missing after adoption")
+	}
+	var transferred *ExitError
+	if err := adoptedSession.Wait(ctx); !errors.As(err, &transferred) || transferred.Code != 7 {
+		t.Fatalf("adopted Wait = %v, want exit code 7", err)
+	}
+}
+
+func TestMigratedChildReportsUnknownExit(t *testing.T) {
+	ctx := context.Background()
+	outputDir := t.TempDir()
+	oldServer, oldSocket := startMigrateServer(t, outputDir, "unknown")
+	if _, err := oldServer.hub.Start(ctx, SessionOptions{Name: "unknown", Command: "sh"}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	newServer, _ := startMigrateServer(t, outputDir, "unknown-new")
+	if adopted, err := Adopt(ctx, oldSocket+".admin", newServer.hub); err != nil || adopted != 1 {
+		t.Fatalf("Adopt = (%d, %v), want (1, nil)", adopted, err)
+	}
+	adoptedSession, ok := newServer.hub.Session("unknown")
+	if !ok {
+		t.Fatal("session missing after adoption")
+	}
+	if err := adoptedSession.Input(ctx, []byte("exit 9\r")); err != nil {
+		t.Fatalf("Input: %v", err)
+	}
+	var exit *ExitError
+	if err := adoptedSession.Wait(ctx); !errors.As(err, &exit) || !exit.Unknown {
+		t.Fatalf("adopted Wait = %v, want unknown exit", err)
+	}
+}
+
+func TestAdminSocketIsPrivate(t *testing.T) {
+	_, socket := startMigrateServer(t, t.TempDir(), "permissions")
+	info, err := os.Stat(socket + ".admin")
+	if err != nil {
+		t.Fatalf("Stat admin socket: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("admin socket mode = %o, want 600", got)
+	}
+}
+
+func TestAdoptRollsBackPreparedSessions(t *testing.T) {
+	ctx := context.Background()
+	outputDir := t.TempDir()
+	oldServer, oldSocket := startMigrateServer(t, outputDir, "rollback")
+	for _, name := range []string{"first", "second"} {
+		if _, err := oldServer.hub.Start(ctx, SessionOptions{Name: name, Command: "sh"}); err != nil {
+			t.Fatalf("Start %s: %v", name, err)
+		}
+	}
+	// Keep the old process's open descriptor alive but make the destination
+	// unable to rebuild one spool. The first state is prepared before the
+	// second one fails, so this exercises the whole abort path.
+	if err := os.Remove(filepath.Join(outputDir, "second.out")); err != nil {
+		t.Fatalf("remove second spool: %v", err)
+	}
+	target, _ := startMigrateServer(t, t.TempDir(), "rollback-new")
+	if _, err := Adopt(ctx, oldSocket+".admin", target.hub); err == nil {
+		t.Fatal("Adopt succeeded despite missing spool")
+	}
+	if !Ping(oldSocket) {
+		t.Fatal("old server stopped after failed adoption")
+	}
+	first, ok := oldServer.hub.Session("first")
+	if !ok {
+		t.Fatal("first session disappeared after rollback")
+	}
+	if err := first.Input(ctx, []byte("echo rollback-ok\r")); err != nil {
+		t.Fatalf("Input after rollback: %v", err)
+	}
+	waitSessionOutput(t, first, "rollback-ok")
+}
+
+func TestAdoptHonorsCanceledContext(t *testing.T) {
+	_, oldSocket := startMigrateServer(t, t.TempDir(), "canceled")
+	target, _ := startMigrateServer(t, t.TempDir(), "canceled-new")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	started := time.Now()
+	if _, err := Adopt(ctx, oldSocket+".admin", target.hub); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Adopt error = %v, want context canceled", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("canceled Adopt took %s", elapsed)
+	}
+	if !Ping(oldSocket) {
+		t.Fatal("old server stopped after canceled adoption")
+	}
+}
+
 // TestMigrationAbortKeepsServing verifies that a failed adoption resumes the
 // old server's copy loop instead of leaving the session paused forever.
 func TestMigrationAbortKeepsServing(t *testing.T) {
@@ -124,13 +236,18 @@ func TestMigrationAbortKeepsServing(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	state := oldServer.hub.session("keep")
-	state.beginMigration()
+	ticket, err := state.beginMigration()
+	if err != nil {
+		t.Fatal(err)
+	}
 	select {
-	case <-state.migrationStable():
+	case <-ticket.stable:
 	case <-time.After(2 * time.Second):
 		t.Fatal("migration did not reach stable point")
 	}
-	state.abortMigration()
+	if err := state.finishMigration(ticket, false); err != nil {
+		t.Fatal(err)
+	}
 	if err := session.Input(ctx, []byte("echo still-alive\r")); err != nil {
 		t.Fatalf("Input after abort: %v", err)
 	}

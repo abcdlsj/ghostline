@@ -9,7 +9,16 @@ import (
 )
 
 func closeQuietly(closer io.Closer) {
+	if closer == nil {
+		return
+	}
 	_ = closer.Close()
+}
+
+func closeFileQuietly(file *os.File) {
+	if file != nil {
+		_ = file.Close()
+	}
 }
 
 func removeQuietly(path string) {

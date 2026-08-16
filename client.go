@@ -55,6 +55,27 @@ type clientLifecycle struct {
 	wait         chan error
 }
 
+// lockedBuffer is the small bridge between os/exec's output copier and the
+// readiness loop. A process can write its first diagnostic at the same time
+// that waitReady formats it, so the buffer needs the same quiet discipline as
+// the socket it is describing.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(data []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(data)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // Connect returns a client, spawning the server when the socket is missing.
 // The returned client owns the spawned process; Close stops it.
 func Connect(ctx context.Context, options ConnectOptions) (*Client, error) {
@@ -231,7 +252,7 @@ func (c *Client) spawnAndWait(ctx context.Context) error {
 	command := exec.Command(args[0], args[1:]...)
 	command.Env = mergeEnvironment(os.Environ(), lifecycle.env)
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	var output bytes.Buffer
+	var output lockedBuffer
 	if lifecycle.log != nil {
 		command.Stdout = io.MultiWriter(lifecycle.log, &output)
 		command.Stderr = io.MultiWriter(lifecycle.log, &output)
@@ -265,7 +286,7 @@ func (c *Client) spawnAndWait(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) waitReady(ctx context.Context, output *bytes.Buffer, wait <-chan error) (error, bool) {
+func (c *Client) waitReady(ctx context.Context, output *lockedBuffer, wait <-chan error) (error, bool) {
 	timeout := c.lifecycle.readyTimeout
 	if timeout <= 0 {
 		timeout = 5 * time.Second
@@ -299,7 +320,7 @@ func (c *Client) waitReady(ctx context.Context, output *bytes.Buffer, wait <-cha
 	}
 }
 
-func (c *Client) readyAfterExit(waitErr error, output *bytes.Buffer) (error, bool) {
+func (c *Client) readyAfterExit(waitErr error, output *lockedBuffer) (error, bool) {
 	if Ping(c.socket) {
 		return nil, true
 	}

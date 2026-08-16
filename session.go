@@ -130,6 +130,8 @@ func (l *localSession) Status(context.Context) (Status, error) {
 }
 
 func (l *localSession) Input(ctx context.Context, data []byte) error {
+	l.hub.lifecycleMu.RLock()
+	defer l.hub.lifecycleMu.RUnlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -140,6 +142,8 @@ func (l *localSession) Input(ctx context.Context, data []byte) error {
 		return nil
 	}
 	l.state.inputMu.Lock()
+	l.state.operationMu.RLock()
+	defer l.state.operationMu.RUnlock()
 	defer l.state.inputMu.Unlock()
 	if _, err := l.state.master.Write(data); err != nil {
 		return fmt.Errorf("write pty input: %w", err)
@@ -148,6 +152,8 @@ func (l *localSession) Input(ctx context.Context, data []byte) error {
 }
 
 func (l *localSession) Resize(ctx context.Context, size Size) error {
+	l.hub.lifecycleMu.RLock()
+	defer l.hub.lifecycleMu.RUnlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -158,7 +164,11 @@ func (l *localSession) Resize(ctx context.Context, size Size) error {
 		return ErrSessionClosed
 	}
 	l.state.inputMu.Lock()
+	l.state.operationMu.RLock()
+	defer l.state.operationMu.RUnlock()
 	defer l.state.inputMu.Unlock()
+	l.state.outputMu.Lock()
+	defer l.state.outputMu.Unlock()
 	// Resize the server-side emulator before the real PTY. The child sees
 	// SIGWINCH only after ptySetSize and redraws immediately; the emulator
 	// must already be at the new size or that redraw is parsed against the
@@ -172,24 +182,32 @@ func (l *localSession) Resize(ctx context.Context, size Size) error {
 }
 
 func (l *localSession) Snapshot(ctx context.Context) ([]byte, error) {
+	l.hub.lifecycleMu.RLock()
+	defer l.hub.lifecycleMu.RUnlock()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if !l.current() {
 		return nil, ErrSessionClosed
 	}
+	l.state.operationMu.RLock()
+	defer l.state.operationMu.RUnlock()
 	l.state.outputMu.Lock()
 	defer l.state.outputMu.Unlock()
 	return captureLocked(l.state)
 }
 
 func (l *localSession) Checkpoint(ctx context.Context) (Checkpoint, error) {
+	l.hub.lifecycleMu.RLock()
+	defer l.hub.lifecycleMu.RUnlock()
 	if err := ctx.Err(); err != nil {
 		return Checkpoint{}, err
 	}
 	if !l.current() {
 		return Checkpoint{}, ErrSessionClosed
 	}
+	l.state.operationMu.RLock()
+	defer l.state.operationMu.RUnlock()
 	l.state.outputMu.Lock()
 	defer l.state.outputMu.Unlock()
 	replay, err := captureLocked(l.state)
@@ -204,6 +222,8 @@ func (l *localSession) Checkpoint(ctx context.Context) (Checkpoint, error) {
 }
 
 func (l *localSession) Recover(ctx context.Context, offset, end int64) ([]byte, error) {
+	l.hub.lifecycleMu.RLock()
+	defer l.hub.lifecycleMu.RUnlock()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -213,6 +233,8 @@ func (l *localSession) Recover(ctx context.Context, offset, end int64) ([]byte, 
 func (l *localSession) SpoolPath() string { return l.state.path }
 
 func (l *localSession) SpoolSize(ctx context.Context) (int64, error) {
+	l.hub.lifecycleMu.RLock()
+	defer l.hub.lifecycleMu.RUnlock()
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -220,6 +242,8 @@ func (l *localSession) SpoolSize(ctx context.Context) (int64, error) {
 }
 
 func (l *localSession) WatchOutput(options WatchOptions) (*SpoolWatcher, error) {
+	l.hub.lifecycleMu.RLock()
+	defer l.hub.lifecycleMu.RUnlock()
 	if !l.current() {
 		return nil, ErrSessionClosed
 	}
@@ -242,6 +266,8 @@ func (l *localSession) WatchOutput(options WatchOptions) (*SpoolWatcher, error) 
 }
 
 func (l *localSession) Close() error {
+	l.hub.lifecycleMu.RLock()
+	defer l.hub.lifecycleMu.RUnlock()
 	if !l.current() {
 		return nil
 	}
@@ -249,6 +275,8 @@ func (l *localSession) Close() error {
 }
 
 func (l *localSession) Remove() error {
+	l.hub.lifecycleMu.RLock()
+	defer l.hub.lifecycleMu.RUnlock()
 	if !l.current() {
 		return nil
 	}
@@ -257,20 +285,40 @@ func (l *localSession) Remove() error {
 }
 
 func (l *localSession) TruncateSpool(ctx context.Context) error {
+	l.hub.lifecycleMu.RLock()
+	defer l.hub.lifecycleMu.RUnlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	l.state.operationMu.RLock()
+	defer l.state.operationMu.RUnlock()
+	l.state.outputMu.Lock()
+	defer l.state.outputMu.Unlock()
 	return truncateSpool(l.state.path)
 }
 
 func (l *localSession) ArchiveSpool(ctx context.Context) error {
+	l.hub.lifecycleMu.RLock()
+	defer l.hub.lifecycleMu.RUnlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	l.state.operationMu.RLock()
+	defer l.state.operationMu.RUnlock()
+	l.state.outputMu.Lock()
+	defer l.state.outputMu.Unlock()
 	return archiveSpool(l.state.path)
 }
 
-func (l *localSession) RemoveSpool() { removeSpool(l.state.path) }
+func (l *localSession) RemoveSpool() {
+	l.hub.lifecycleMu.RLock()
+	defer l.hub.lifecycleMu.RUnlock()
+	l.state.operationMu.RLock()
+	defer l.state.operationMu.RUnlock()
+	l.state.outputMu.Lock()
+	defer l.state.outputMu.Unlock()
+	removeSpool(l.state.path)
+}
 
 func (l *localSession) current() bool {
 	l.hub.mu.Lock()
