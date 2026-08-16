@@ -14,7 +14,10 @@ import (
 	"github.com/creack/pty"
 )
 
-const spoolSuffix = ".out"
+const (
+	spoolSuffix = ".out"
+	builtinTerm = "xterm-256color"
+)
 
 type sessionState struct {
 	name      string
@@ -36,7 +39,7 @@ type sessionState struct {
 	reaped    chan struct{}
 }
 
-func startSession(ctx context.Context, options SessionOptions, size Size, path string) (*sessionState, error) {
+func startSession(ctx context.Context, options SessionOptions, size Size, path string, defaultTerm string) (*sessionState, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -49,7 +52,7 @@ func startSession(ctx context.Context, options SessionOptions, size Size, path s
 		vt.Close()
 		return nil, fmt.Errorf("open spool: %w", err)
 	}
-	command := ptyCommand(options.Directory, options.Command, options.Environment)
+	command := ptyCommand(options.Directory, options.Command, options.Environment, defaultTerm)
 	master, err := pty.StartWithSize(command, &pty.Winsize{Cols: uint16(size.Columns), Rows: uint16(size.Rows)})
 	if err != nil {
 		closeQuietly(spool)
@@ -153,7 +156,7 @@ func (s *sessionState) closeWatchers() {
 	}
 }
 
-func ptyCommand(directory, command string, environment []string) *exec.Cmd {
+func ptyCommand(directory, command string, environment []string, defaultTerm string) *exec.Cmd {
 	var cmd *exec.Cmd
 	if strings.TrimSpace(command) == "" {
 		shell := os.Getenv("SHELL")
@@ -165,12 +168,35 @@ func ptyCommand(directory, command string, environment []string) *exec.Cmd {
 		cmd = exec.Command("sh", "-lc", command)
 	}
 	cmd.Dir = directory
-	cmd.Env = ptyEnvironment(environment)
+	cmd.Env = ptyEnvironment(environment, defaultTerm)
 	return cmd
 }
 
-func ptyEnvironment(overrides []string) []string {
-	return mergeEnvironment(os.Environ(), overrides)
+func ptyEnvironment(overrides []string, defaultTerm string) []string {
+	return mergeTermDefault(mergeEnvironment(os.Environ(), overrides), defaultTerm)
+}
+
+// mergeTermDefault returns env with TERM set to defaultTerm when env has no
+// non-empty TERM. Overrides are merged before this runs, so an explicit
+// caller-supplied TERM wins over both inherited values and the default.
+func mergeTermDefault(env []string, defaultTerm string) []string {
+	if nonEmptyEnv(env, "TERM") {
+		return env
+	}
+	if defaultTerm == "" {
+		defaultTerm = builtinTerm
+	}
+	return mergeEnvironment(env, []string{"TERM=" + defaultTerm})
+}
+
+func nonEmptyEnv(env []string, key string) bool {
+	prefix := key + "="
+	for _, entry := range env {
+		if len(entry) > len(prefix) && strings.HasPrefix(entry, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func mergeEnvironment(base, overrides []string) []string {

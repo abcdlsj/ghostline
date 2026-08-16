@@ -66,7 +66,10 @@ slice that is valid only until the callback returns; copy it if it must be
 retained.
 
 Child processes inherit the embedding process's environment;
-`SessionOptions.Environment` overrides individual `KEY=value` entries.
+`SessionOptions.Environment` overrides individual `KEY=value` entries. When
+the resulting environment has no non-empty `TERM`, ghostline sets one from
+`Options.DefaultTerm`, defaulting to `xterm-256color`, so detached daemons
+start shells without a terminal type warning.
 
 ## Quick start: server and client
 

@@ -30,7 +30,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: ghostline serve --socket <path> [--output-dir <dir>]")
+	fmt.Fprintln(os.Stderr, "usage: ghostline serve --socket <path> [--output-dir <dir>] [--default-term <term>]")
 }
 
 // serveCommand runs the standalone session server. The server owns PTY
@@ -40,6 +40,7 @@ func serveCommand(args []string) {
 	flags := flag.NewFlagSet("serve", flag.ExitOnError)
 	socket := flags.String("socket", "", "unix socket path (required)")
 	outputDir := flags.String("output-dir", "", "output spool directory (default ~/.ghostline/output)")
+	defaultTerm := flags.String("default-term", "", "TERM for sessions without one (default xterm-256color)")
 	_ = flags.Parse(args)
 	if *socket == "" {
 		fmt.Fprintln(os.Stderr, "ghostline serve: --socket is required")
@@ -50,7 +51,7 @@ func serveCommand(args []string) {
 		home, _ := os.UserHomeDir()
 		dir = filepath.Join(home, ".ghostline", "output")
 	}
-	server, err := ghostline.NewServer(ghostline.Options{OutputDir: dir})
+	server, err := ghostline.NewServer(ghostline.Options{OutputDir: dir, DefaultTerm: *defaultTerm})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ghostline serve: %v\n", err)
 		os.Exit(1)

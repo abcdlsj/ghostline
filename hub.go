@@ -18,6 +18,9 @@ type Options struct {
 	// DefaultSize is used when SessionOptions.Size is zero. The default is
 	// 120 columns by 36 rows.
 	DefaultSize Size
+	// DefaultTerm is used for pty children whose environment has no
+	// non-empty TERM. An empty value defaults to xterm-256color.
+	DefaultTerm string
 }
 
 // SessionOptions configures one session.
@@ -41,6 +44,7 @@ type SessionOptions struct {
 type Hub struct {
 	outputDir   string
 	defaultSize Size
+	defaultTerm string
 
 	mu       sync.Mutex
 	sessions map[string]*sessionState
@@ -61,6 +65,7 @@ func New(options Options) (*Hub, error) {
 	return &Hub{
 		outputDir:   dir,
 		defaultSize: size,
+		defaultTerm: options.DefaultTerm,
 		sessions:    make(map[string]*sessionState),
 		pending:     make(map[string]struct{}),
 	}, nil
@@ -104,7 +109,7 @@ func (h *Hub) Start(ctx context.Context, options SessionOptions) (Session, error
 		return nil, fmt.Errorf("create output dir: %w", err)
 	}
 	path := filepath.Join(h.outputDir, options.Name+spoolSuffix)
-	state, err := startSession(ctx, options, size, path)
+	state, err := startSession(ctx, options, size, path, h.defaultTerm)
 	if err != nil {
 		release()
 		return nil, err
