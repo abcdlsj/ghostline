@@ -203,7 +203,7 @@ type adminClient struct {
 	nextID    int64
 }
 
-func (c *adminClient) call(ctx context.Context, method string, params any, result any, fd *int) error {
+func (c *adminClient) call(ctx context.Context, method string, params any, result any) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -234,13 +234,6 @@ func (c *adminClient) call(ctx context.Context, method string, params any, resul
 		if err := json.Unmarshal(response.Result, result); err != nil {
 			return err
 		}
-	}
-	if fd != nil {
-		received, err := c.transport.takeFD()
-		if err != nil {
-			return err
-		}
-		*fd = received
 	}
 	return nil
 }
@@ -357,7 +350,7 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 	client := &adminClient{transport: transport, nextID: 1}
 
 	var listed adminListResult
-	if err := client.call(ctx, adminMethodList, nil, &listed, nil); err != nil {
+	if err := client.call(ctx, adminMethodList, nil, &listed); err != nil {
 		return 0, err
 	}
 
@@ -369,7 +362,7 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 			return
 		}
 		abortCtx, cancel := context.WithTimeout(context.Background(), adminTimeout)
-		_ = client.call(abortCtx, adminMethodAbort, adminBatchParams{Names: preparedNames}, nil, nil)
+		_ = client.call(abortCtx, adminMethodAbort, adminBatchParams{Names: preparedNames}, nil)
 		cancel()
 		for _, state := range prepared {
 			state.close()
@@ -382,7 +375,7 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 		// The process may exit between list and adopt. Ask for the response
 		// first, then decide whether that response should carry an fd from its
 		// own Alive bit rather than trusting the older list snapshot.
-		if err := client.call(ctx, adminMethodAdopt, adoptParams{Name: meta.Name}, &adopted, nil); err != nil {
+		if err := client.call(ctx, adminMethodAdopt, adoptParams{Name: meta.Name}, &adopted); err != nil {
 			return 0, err
 		}
 		preparedNames = append(preparedNames, meta.Name)
@@ -396,7 +389,7 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 			master = os.NewFile(uintptr(masterFD), "adopted-master")
 		}
 		var snapshotResult adminSnapshotResult
-		if err := client.call(ctx, adminMethodSnapshot, adoptParams{Name: meta.Name}, &snapshotResult, nil); err != nil {
+		if err := client.call(ctx, adminMethodSnapshot, adoptParams{Name: meta.Name}, &snapshotResult); err != nil {
 			closeFileQuietly(master)
 			return 0, err
 		}
@@ -422,7 +415,7 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 	}
 
 	var batchResult adminBatchResult
-	if err := client.call(ctx, adminMethodCommit, adminBatchParams{Names: preparedNames}, &batchResult, nil); err != nil {
+	if err := client.call(ctx, adminMethodCommit, adminBatchParams{Names: preparedNames}, &batchResult); err != nil {
 		return 0, err
 	}
 	if batchResult.Committed != len(prepared) {
@@ -445,7 +438,7 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 	// second, observable step, so return an error if it cannot be confirmed.
 	retireCtx, cancel := context.WithTimeout(context.Background(), adminTimeout)
 	var ignored struct{}
-	retireErr := client.call(retireCtx, adminMethodExit, nil, &ignored, nil)
+	retireErr := client.call(retireCtx, adminMethodExit, nil, &ignored)
 	if retireErr == nil {
 		retireErr = waitOldServerGone(retireCtx, adminSocket)
 	}

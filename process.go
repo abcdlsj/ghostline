@@ -156,13 +156,19 @@ func copyOutput(state *sessionState) {
 			closeQuietly(state.master)
 		}
 	}()
+	// A child can exit and start reaping at the same time a migration ticket
+	// is created. If the copy loop has already stopped reading, nothing will
+	// ever observe the ticket, and a waiting admin handler would hang. Settle
+	// any undecided ticket here, just before done is closed.
+	defer func() {
+		if ticket := state.currentMigration(); ticket != nil && !ticket.decided.Load() {
+			ticket.markStable(errSessionStopped)
+			ticket.choose(false)
+			ticket.markStopped()
+		}
+	}()
 	buffer := make([]byte, 32*1024)
 	for copyOutputLoop(state, buffer) {
-	}
-	if ticket := state.currentMigration(); ticket != nil && !ticket.decided.Load() {
-		ticket.markStable(errSessionStopped)
-		ticket.choose(false)
-		ticket.markStopped()
 	}
 	if state.migrated.Load() {
 		// Ownership moved with the master fd. Do not keep old waiters blocked
@@ -349,10 +355,17 @@ func (s *sessionState) finishMigration(ticket *migrationTicket, commit bool) err
 		s.migrated.Store(true)
 	}
 	ticket.choose(commit)
-	<-ticket.stopped
+	select {
+	case <-ticket.stopped:
+	case <-s.done:
+		// The copy loop has already exited, so it can never observe the
+		// decision. done is closed only after the loop and its finalizers are
+		// gone, so there is nothing left to wait for.
+	}
 	s.migrationMu.Lock()
 	if s.migration != ticket {
 		s.migrationMu.Unlock()
+		s.operationMu.Unlock()
 		return errMigrationStale
 	}
 	s.migration = nil

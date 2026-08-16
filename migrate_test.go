@@ -256,3 +256,38 @@ func TestMigrationAbortKeepsServing(t *testing.T) {
 		t.Fatal("old server stopped after aborted migration")
 	}
 }
+
+// TestFinishMigrationDoesNotHangWhenCopyLoopIsGone covers the race where a
+// child exits and starts reaping at the same moment a migration ticket is
+// created: the copy loop has already stopped reading, so it can never mark
+// the ticket stopped, and finishMigration must settle for done closing
+// instead of waiting forever.
+func TestFinishMigrationDoesNotHangWhenCopyLoopIsGone(t *testing.T) {
+	state := &sessionState{
+		done:   make(chan struct{}),
+		reaped: make(chan struct{}),
+	}
+	state.operationMu.Lock()
+	ticket := newMigrationTicket(true)
+	state.migration = ticket
+
+	finished := make(chan error, 1)
+	go func() {
+		finished <- state.finishMigration(ticket, false)
+	}()
+
+	close(state.done)
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatalf("finishMigration = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("finishMigration blocked forever after copy loop exited")
+	}
+	state.migrationMu.Lock()
+	defer state.migrationMu.Unlock()
+	if state.migration != nil {
+		t.Fatal("migration ticket not cleared")
+	}
+}
