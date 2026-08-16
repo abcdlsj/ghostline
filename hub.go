@@ -144,6 +144,18 @@ func (h *Hub) Session(name string) (Session, bool) {
 
 // Sessions returns all known sessions ordered by creation time and name.
 func (h *Hub) Sessions() []Session {
+	states := h.sessionStates()
+	sessions := make([]Session, 0, len(states))
+	for _, state := range states {
+		sessions = append(sessions, &localSession{hub: h, state: state})
+	}
+	return sessions
+}
+
+// sessionStates returns all internal session states ordered by creation time
+// and name. It is used by the admin protocol, which needs fields that are not
+// part of the public Session interface.
+func (h *Hub) sessionStates() []*sessionState {
 	h.mu.Lock()
 	states := make([]*sessionState, 0, len(h.sessions))
 	for _, state := range h.sessions {
@@ -157,11 +169,7 @@ func (h *Hub) Sessions() []Session {
 		}
 		return left.createdAt.Before(right.createdAt)
 	})
-	sessions := make([]Session, 0, len(states))
-	for _, state := range states {
-		sessions = append(sessions, &localSession{hub: h, state: state})
-	}
-	return sessions
+	return states
 }
 
 // Check verifies that libghostty-vt can create a terminal.

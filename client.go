@@ -82,6 +82,15 @@ func Connect(ctx context.Context, options ConnectOptions) (*Client, error) {
 // Socket returns the server socket path.
 func (c *Client) Socket() string { return c.socket }
 
+// PID returns the process ID of the server spawned by this client, or zero
+// when the client attached to an existing server.
+func (c *Client) PID() int {
+	if c.lifecycle == nil || c.lifecycle.cmd == nil || c.lifecycle.cmd.Process == nil {
+		return 0
+	}
+	return c.lifecycle.cmd.Process.Pid
+}
+
 // Ensure starts the server if it is missing and waits until it is ready.
 func (c *Client) Ensure(ctx context.Context) error {
 	if Ping(c.socket) {

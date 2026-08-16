@@ -167,6 +167,7 @@ func (l *localSession) Resize(ctx context.Context, size Size) error {
 	if err := ptySetSize(l.state.master, size); err != nil {
 		return err
 	}
+	l.state.size = size
 	return nil
 }
 

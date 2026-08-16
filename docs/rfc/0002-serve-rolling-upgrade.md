@@ -1,6 +1,6 @@
 # RFC 0002: Rolling upgrade for the ghostline server
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-16
 - Area: Server lifecycle / upgrades
 
@@ -102,6 +102,16 @@ spool offsets remain valid because the spool is never rewound.
 - A small client-side `Adopt` helper used by a freshly started server.
 - Warren daemon coordination: start new server, trigger adoption, switch
   socket, retire old server.
+
+## Implementation notes
+
+- The management protocol is all-or-nothing: the new server prepares every
+  session (fd + snapshot) before committing any of them. A failure aborts the
+  whole batch and the old server keeps serving.
+- PTY masters do not support Go's `SetReadDeadline`, so output draining polls
+  with `poll(2)` and stops only after the child's pending bytes are flushed.
+- `ghostline serve --adopt-from <admin-socket>` performs the adoption before
+  binding its public socket, so clients never observe a half-upgraded server.
 
 ## Alternatives considered
 

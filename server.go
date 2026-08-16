@@ -3,12 +3,15 @@ package ghostline
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,6 +22,8 @@ type Server struct {
 	hub      *Hub
 	mu       sync.Mutex
 	listener net.Listener
+	admin    net.Listener
+	stopping atomic.Bool
 }
 
 // NewServer constructs a server with its own hub.
@@ -50,16 +55,31 @@ func (s *Server) Serve(ctx context.Context, socketPath string) error {
 	s.mu.Unlock()
 	defer closeQuietly(listener)
 	defer removeQuietly(socketPath)
+	adminPath := socketPath + ".admin"
+	adminListener, err := listenUnix(adminPath)
+	if err != nil {
+		return fmt.Errorf("listen admin: %w", err)
+	}
+	s.mu.Lock()
+	s.admin = adminListener
+	s.mu.Unlock()
+	defer closeQuietly(adminListener)
+	defer removeQuietly(adminPath)
 	go func() {
 		<-ctx.Done()
 		closeQuietly(listener)
+		closeQuietly(adminListener)
 	}()
+	go s.adminLoop(adminListener)
 
 	slots := make(chan struct{}, maxConnections)
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
+				return nil
+			}
+			if s.stopping.Load() {
 				return nil
 			}
 			return err
@@ -74,6 +94,168 @@ func (s *Server) Serve(ctx context.Context, socketPath string) error {
 			closeQuietly(connection)
 		}
 	}
+}
+
+func (s *Server) adminLoop(listener net.Listener) {
+	for {
+		connection, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		go s.handleAdmin(connection)
+	}
+}
+
+// handleAdmin serves the rolling-upgrade protocol (RFC 0002): list/adopt/
+// snapshot/exit over JSON lines, with PTY masters transferred via SCM_RIGHTS.
+func (s *Server) handleAdmin(connection net.Conn) {
+	unixConn, ok := connection.(*net.UnixConn)
+	if !ok {
+		closeQuietly(connection)
+		return
+	}
+	defer closeQuietly(unixConn)
+	pending := make(map[string]*sessionState)
+	defer func() {
+		for _, state := range pending {
+			state.abortMigration()
+		}
+	}()
+	reader := bufio.NewReader(unixConn)
+	writer := bufio.NewWriter(unixConn)
+	for {
+		var request adminRequest
+		if err := json.NewDecoder(reader).Decode(&request); err != nil {
+			return
+		}
+		switch request.Method {
+		case adminMethodList:
+			states := s.hub.sessionStates()
+			result := adminListResult{Sessions: make([]sessionMeta, 0, len(states))}
+			for _, state := range states {
+				result.Sessions = append(result.Sessions, sessionMeta{
+					Name:      state.name,
+					Cols:      state.size.Columns,
+					Rows:      state.size.Rows,
+					CreatedAt: state.createdAt.Unix(),
+					PID:       state.pid,
+				})
+			}
+			writeAdminResult(writer, request.ID, result)
+		case adminMethodAdopt:
+			var params adoptParams
+			if err := json.Unmarshal(request.Params, &params); err != nil {
+				writeAdminError(writer, request.ID, err)
+				continue
+			}
+			state := s.hub.session(params.Name)
+			if state == nil {
+				writeAdminError(writer, request.ID, ErrSessionNotFound)
+				continue
+			}
+			state.beginMigration()
+			select {
+			case <-state.migrationStable():
+			case <-time.After(adoptTimeout):
+				state.abortMigration()
+				writeAdminError(writer, request.ID, errors.New("migration timed out"))
+				continue
+			}
+			pending[params.Name] = state
+			meta := sessionMeta{
+				Name:      state.name,
+				Cols:      state.size.Columns,
+				Rows:      state.size.Rows,
+				CreatedAt: state.createdAt.Unix(),
+				PID:       state.pid,
+			}
+			writeAdminResult(writer, request.ID, meta)
+			if err := sendFD(unixConn, int(state.master.Fd())); err != nil {
+				return
+			}
+		case adminMethodSnapshot:
+			var params adoptParams
+			if err := json.Unmarshal(request.Params, &params); err != nil {
+				writeAdminError(writer, request.ID, err)
+				continue
+			}
+			state := pending[params.Name]
+			if state == nil {
+				writeAdminError(writer, request.ID, errors.New("session not prepared for adoption"))
+				continue
+			}
+			state.outputMu.Lock()
+			snapshot, err := state.vt.EncodeState()
+			state.outputMu.Unlock()
+			if err != nil {
+				delete(pending, params.Name)
+				state.abortMigration()
+				writeAdminError(writer, request.ID, err)
+				continue
+			}
+			writeAdminResult(writer, request.ID, adminSnapshotResult{
+				Snapshot: base64.StdEncoding.EncodeToString(snapshot),
+			})
+		case adminMethodCommit, adminMethodAbort:
+			var params adminBatchParams
+			if err := json.Unmarshal(request.Params, &params); err != nil {
+				writeAdminError(writer, request.ID, err)
+				continue
+			}
+			states := make([]*sessionState, 0, len(params.Names))
+			missing := false
+			for _, name := range params.Names {
+				state := pending[name]
+				if state == nil {
+					missing = true
+					continue
+				}
+				states = append(states, state)
+			}
+			if missing {
+				writeAdminError(writer, request.ID, errors.New("one or more sessions not prepared"))
+				continue
+			}
+			for _, name := range params.Names {
+				delete(pending, name)
+			}
+			for _, state := range states {
+				if request.Method == adminMethodCommit {
+					state.commitMigration()
+				} else {
+					state.abortMigration()
+				}
+			}
+			writeAdminResult(writer, request.ID, adminBatchResult{Committed: len(states)})
+		case adminMethodExit:
+			s.requestExit()
+			return
+		default:
+			writeAdminError(writer, request.ID, fmt.Errorf("unknown admin method: %s", request.Method))
+		}
+	}
+}
+
+// requestExit stops both listeners so Serve returns and the process exits
+// after a rolling upgrade.
+func (s *Server) requestExit() {
+	s.stopping.Store(true)
+	_ = s.Close()
+	s.mu.Lock()
+	admin := s.admin
+	s.mu.Unlock()
+	closeQuietly(admin)
+}
+
+func writeAdminResult(writer *bufio.Writer, id int64, result any) {
+	encoded, _ := json.Marshal(result)
+	_ = json.NewEncoder(writer).Encode(adminResponse{ID: id, Result: encoded})
+	_ = writer.Flush()
+}
+
+func writeAdminError(writer *bufio.Writer, id int64, err error) {
+	_ = json.NewEncoder(writer).Encode(adminResponse{ID: id, Error: err.Error()})
+	_ = writer.Flush()
 }
 
 // listenUnix binds socketPath without unlinking a live server's socket.

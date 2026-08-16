@@ -102,6 +102,21 @@ including `Wait`, `Checkpoint`, and `Recover`. Clients and the server must
 share the same filesystem because output watchers read the spool files
 directly.
 
+## Rolling server upgrades
+
+The server can be upgraded without ending sessions. A fresh server adopts
+every session from the old one over its management socket, then serves in
+place of it:
+
+```sh
+ghostline serve --socket /tmp/ghostline-new.sock --adopt-from /tmp/ghostline.sock.admin
+```
+
+The old server serializes each emulator state, moves the PTY master over
+`SCM_RIGHTS`, and exits only after the new server has adopted everything.
+Children never see a disconnect. The embedding daemon coordinates the switch
+and retires the old process; see `docs/rfc/0002-serve-rolling-upgrade.md`.
+
 ### Server bootstrap
 
 `Connect` starts the server when the socket is missing:
