@@ -159,10 +159,14 @@ func (l *localSession) Resize(ctx context.Context, size Size) error {
 	}
 	l.state.inputMu.Lock()
 	defer l.state.inputMu.Unlock()
+	// Resize the server-side emulator before the real PTY. The child sees
+	// SIGWINCH only after ptySetSize and redraws immediately; the emulator
+	// must already be at the new size or that redraw is parsed against the
+	// old grid, leaving cursor and input-box positions wrong.
+	l.state.vt.Resize(size.Columns, size.Rows)
 	if err := ptySetSize(l.state.master, size); err != nil {
 		return err
 	}
-	l.state.vt.Resize(size.Columns, size.Rows)
 	return nil
 }
 
