@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -145,8 +146,29 @@ func (l *localSession) Input(ctx context.Context, data []byte) error {
 	l.state.operationMu.RLock()
 	defer l.state.operationMu.RUnlock()
 	defer l.state.inputMu.Unlock()
-	if _, err := l.state.master.Write(data); err != nil {
+	if err := writeFull(l.state.master, data); err != nil {
 		return fmt.Errorf("write pty input: %w", err)
+	}
+	return nil
+}
+
+// writeFull writes data to w, retrying short writes so the PTY never
+// silently drops the tail of an input frame (for example the closing bytes
+// of a bracketed-paste sequence). A zero-progress write is treated as
+// io.ErrShortWrite instead of spinning forever.
+func writeFull(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		if n < len(data) {
+			log.Printf("ghostline: short pty write %d/%d, retrying", n, len(data))
+		}
+		data = data[n:]
 	}
 	return nil
 }
