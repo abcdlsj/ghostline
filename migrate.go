@@ -436,8 +436,25 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 		}
 		var snapshotResult adminSnapshotResult
 		if err := client.call(ctx, adminMethodSnapshot, adoptParams{Name: meta.Name}, &snapshotResult); err != nil {
+			// Some older libghostty-vt builds cannot encode their native
+			// state for long-running TUIs. The append-only spool still has
+			// every byte the old emulator parsed, so rebuild the new
+			// emulator from that instead of failing the whole upgrade.
+			state, fallbackErr := adoptStateFromSpool(
+				adopted.Name,
+				master,
+				Size{Columns: adopted.Cols, Rows: adopted.Rows},
+				h.spoolPath(adopted.Name),
+				time.Unix(adopted.CreatedAt, 0),
+				adopted.PID,
+				adopted.Exit.error(),
+			)
+			if fallbackErr == nil {
+				prepared = append(prepared, state)
+				continue
+			}
 			closeFileQuietly(master)
-			return 0, err
+			return 0, fmt.Errorf("encode snapshot for %s: %v (spool replay fallback: %w)", meta.Name, err, fallbackErr)
 		}
 		snapshot, err := base64.StdEncoding.DecodeString(snapshotResult.Snapshot)
 		if err != nil {

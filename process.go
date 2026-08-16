@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -394,6 +395,70 @@ func adoptState(name string, master *os.File, snapshot []byte, size Size, path s
 		closeFileQuietly(master)
 		return nil, fmt.Errorf("restore vt state: %w", err)
 	}
+	spool, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		vt.Close()
+		closeFileQuietly(master)
+		return nil, fmt.Errorf("open spool: %w", err)
+	}
+	state := &sessionState{
+		name:      name,
+		path:      path,
+		pid:       pid,
+		size:      size,
+		master:    master,
+		spool:     spool,
+		vt:        vt,
+		createdAt: createdAt,
+		done:      make(chan struct{}),
+		reaped:    make(chan struct{}),
+	}
+	if master == nil {
+		if exit == nil {
+			exit = &ExitError{Code: -1, Unknown: true}
+		}
+		state.waitErr = exit
+		close(state.done)
+		close(state.reaped)
+	}
+	return state, nil
+}
+
+// adoptStateFromSpool rebuilds a session's emulator state by replaying its
+// raw PTY spool from the beginning. It is the fallback when an old server
+// cannot encode its native snapshot (for example libghostty-vt returning
+// GHOSTTY_INVALID_VALUE), while the append-only spool still contains every
+// byte the old emulator parsed, including the final cursor position.
+func adoptStateFromSpool(name string, master *os.File, size Size, path string, createdAt time.Time, pid int, exit *ExitError) (*sessionState, error) {
+	vt, err := NewVTTerminal(size.Columns, size.Rows)
+	if err != nil {
+		closeFileQuietly(master)
+		return nil, fmt.Errorf("create vt: %w", err)
+	}
+	replay, err := os.Open(path)
+	if err != nil {
+		vt.Close()
+		closeFileQuietly(master)
+		return nil, fmt.Errorf("open spool for replay: %w", err)
+	}
+	buffer := make([]byte, 256*1024)
+	for {
+		read, readErr := replay.Read(buffer)
+		if read > 0 {
+			vt.Feed(buffer[:read])
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			_ = replay.Close()
+			vt.Close()
+			closeFileQuietly(master)
+			return nil, fmt.Errorf("replay spool: %w", readErr)
+		}
+	}
+	_ = replay.Close()
+
 	spool, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		vt.Close()

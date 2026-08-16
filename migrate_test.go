@@ -168,6 +168,135 @@ func TestAdminTransportReadsCoalescedLegacyFdHandshake(t *testing.T) {
 	}
 }
 
+func TestAdoptStateFromSpoolPreservesCursor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "spool.out")
+	if err := os.WriteFile(path, []byte("\x1b[5;10Hhello"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	state, err := adoptStateFromSpool(
+		"spool",
+		nil,
+		Size{Columns: 80, Rows: 24},
+		path,
+		time.Now(),
+		0,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("adoptStateFromSpool: %v", err)
+	}
+	defer state.close()
+
+	snapshot, err := state.vt.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if !bytes.Contains(snapshot, []byte("hello")) {
+		t.Fatalf("spool replay lost content: %q", snapshot)
+	}
+	if !bytes.HasSuffix(snapshot, []byte("\x1b[5;15H")) {
+		t.Fatalf("spool replay did not preserve cursor: %q", snapshot[len(snapshot)-min(len(snapshot), 40):])
+	}
+}
+
+func startFailingEncodeAdminServer(t *testing.T, socket string, meta sessionMeta, fd *os.File) {
+	t.Helper()
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatalf("ListenUnix: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		connection, err := listener.AcceptUnix()
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		transport := newAdminTransport(connection)
+		for {
+			var request adminRequest
+			if err := transport.read(&request); err != nil {
+				return
+			}
+			switch request.Method {
+			case adminMethodList:
+				raw, _ := json.Marshal(adminListResult{Sessions: []sessionMeta{meta}})
+				_ = transport.write(adminResponse{ID: request.ID, Result: raw}, -1)
+			case adminMethodAdopt:
+				raw, _ := json.Marshal(meta)
+				_ = transport.write(adminResponse{ID: request.ID, Result: raw}, int(fd.Fd()))
+				_ = fd.Close()
+			case adminMethodSnapshot:
+				_ = transport.write(adminResponse{ID: request.ID, Error: "ghostty snapshot encode failed: -2"}, -1)
+			case adminMethodCommit:
+				raw, _ := json.Marshal(adminBatchResult{Committed: 1})
+				_ = transport.write(adminResponse{ID: request.ID, Result: raw}, -1)
+			case adminMethodExit:
+				_ = transport.write(adminResponse{ID: request.ID, Result: json.RawMessage("{}")}, -1)
+				return
+			default:
+				_ = transport.write(adminResponse{ID: request.ID, Error: "unknown admin method"}, -1)
+			}
+		}
+	}()
+}
+
+func TestRollingAdoptFallsBackToSpoolReplay(t *testing.T) {
+	ctx := context.Background()
+	outputDir := t.TempDir()
+	socketDir, err := os.MkdirTemp("/tmp", "ghostline-fallback-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	defer os.RemoveAll(socketDir)
+
+	spoolPath := filepath.Join(outputDir, "warren_fallback.out")
+	if err := os.WriteFile(spoolPath, []byte("\x1b[5;10Hhello"), 0o600); err != nil {
+		t.Fatalf("WriteFile spool: %v", err)
+	}
+	readFD, writeFD, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Pipe: %v", err)
+	}
+	_ = writeFD.Close()
+	meta := sessionMeta{
+		Name:      "warren_fallback",
+		Cols:      80,
+		Rows:      24,
+		CreatedAt: time.Now().Unix(),
+		PID:       4242,
+		Alive:     true,
+	}
+	startFailingEncodeAdminServer(t, filepath.Join(socketDir, "old.admin"), meta, readFD)
+
+	hub, err := New(Options{OutputDir: outputDir})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer hub.Close()
+	adopted, err := Adopt(ctx, filepath.Join(socketDir, "old.admin"), hub)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	if adopted != 1 {
+		t.Fatalf("adopted = %d, want 1", adopted)
+	}
+	session, ok := hub.Session("warren_fallback")
+	if !ok {
+		t.Fatal("adopted session missing")
+	}
+	snapshot, err := session.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if !bytes.Contains(snapshot, []byte("hello")) {
+		t.Fatalf("fallback lost spool content: %q", snapshot)
+	}
+	if !bytes.HasSuffix(snapshot, []byte("\x1b[5;15H")) {
+		t.Fatalf("fallback did not preserve cursor: %q", snapshot[len(snapshot)-min(len(snapshot), 40):])
+	}
+}
+
 func startMigrateServer(t *testing.T, outputDir, tag string) (*Server, string) {
 	t.Helper()
 	socketDir, err := os.MkdirTemp("", "ghostline-migrate-")
