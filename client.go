@@ -532,6 +532,14 @@ func (r *remoteSession) Status(ctx context.Context) (Status, error) {
 	return status, nil
 }
 
+func (r *remoteSession) Metadata(ctx context.Context) (SessionMetadata, error) {
+	var result metadataResult
+	if err := r.callRetryable(ctx, rpcMethodMetadata, nameParams{Name: r.name}, &result); err != nil {
+		return SessionMetadata{}, err
+	}
+	return SessionMetadata{Process: result.Process, Directory: result.Directory}, nil
+}
+
 func (r *remoteSession) Input(ctx context.Context, data []byte) error {
 	return r.call(ctx, rpcMethodInput, inputParams{Name: r.name, Data: data}, nil)
 }

@@ -56,12 +56,32 @@ type Session interface {
 	RemoveSpool()
 }
 
+// MetadataProvider is implemented by sessions that can report OS-level
+// foreground process metadata. It is kept separate from Session so existing
+// Session implementations and test doubles continue to compile.
+type MetadataProvider interface {
+	// Metadata reports OS-level foreground process metadata when the hub was
+	// created with ProbeForeground enabled. When probing is disabled it
+	// returns zero values; otherwise it may return an error when the
+	// foreground process cannot be resolved.
+	Metadata(ctx context.Context) (SessionMetadata, error)
+}
+
 // Status describes whether a session is running and, when stopped, why.
 type Status struct {
 	// Alive is true while the child process is running.
 	Alive bool `json:"alive"`
 	// Exit describes the termination when Alive is false.
 	Exit *ExitError `json:"exit,omitempty"`
+}
+
+// SessionMetadata is the OS-level foreground process snapshot for one
+// session. It is presentation metadata, not lifecycle state.
+type SessionMetadata struct {
+	// Process is the foreground process name.
+	Process string `json:"process"`
+	// Directory is the foreground process working directory.
+	Directory string `json:"directory"`
 }
 
 // Checkpoint is an atomic screen replay and raw output position.
@@ -128,6 +148,30 @@ func (l *localSession) Status(context.Context) (Status, error) {
 	defer l.state.waitMu.Unlock()
 	exit, _ := convertExit(l.state.waitErr).(*ExitError)
 	return Status{Exit: exit}, nil
+}
+
+func (l *localSession) Metadata(ctx context.Context) (SessionMetadata, error) {
+	if !l.hub.probeForeground {
+		return SessionMetadata{}, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return SessionMetadata{}, err
+	}
+	l.hub.lifecycleMu.RLock()
+	l.state.operationMu.RLock()
+	if l.state.masterFD < 0 {
+		l.state.operationMu.RUnlock()
+		l.hub.lifecycleMu.RUnlock()
+		return SessionMetadata{}, nil
+	}
+	fd, err := duplicateMasterFD(l.state.masterFD)
+	l.state.operationMu.RUnlock()
+	l.hub.lifecycleMu.RUnlock()
+	if err != nil {
+		return SessionMetadata{}, nil
+	}
+	defer func() { _ = closeMasterFD(fd) }()
+	return probeForegroundFD(ctx, fd)
 }
 
 func (l *localSession) Input(ctx context.Context, data []byte) error {

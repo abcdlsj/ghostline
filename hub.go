@@ -21,6 +21,10 @@ type Options struct {
 	// DefaultTerm is used for pty children whose environment has no
 	// non-empty TERM. An empty value defaults to xterm-256color.
 	DefaultTerm string
+	// ProbeForeground enables OS-level foreground process/cwd metadata.
+	// Disabled by default; Session.Metadata returns empty values without
+	// spawning any OS probes.
+	ProbeForeground bool
 }
 
 // SessionOptions configures one session.
@@ -42,9 +46,10 @@ type SessionOptions struct {
 
 // Hub owns local pseudo-terminal sessions.
 type Hub struct {
-	outputDir   string
-	defaultSize Size
-	defaultTerm string
+	outputDir       string
+	defaultSize     Size
+	defaultTerm     string
+	probeForeground bool
 
 	// lifecycleMu is a reader/writer gate around hub-wide mutations. Normal
 	// session operations take a read lock; a rolling-upgrade batch takes the
@@ -68,11 +73,12 @@ func New(options Options) (*Hub, error) {
 		dir = defaultOutputDirectory()
 	}
 	return &Hub{
-		outputDir:   dir,
-		defaultSize: size,
-		defaultTerm: options.DefaultTerm,
-		sessions:    make(map[string]*sessionState),
-		pending:     make(map[string]struct{}),
+		outputDir:       dir,
+		defaultSize:     size,
+		defaultTerm:     options.DefaultTerm,
+		probeForeground: options.ProbeForeground,
+		sessions:        make(map[string]*sessionState),
+		pending:         make(map[string]struct{}),
 	}, nil
 }
 

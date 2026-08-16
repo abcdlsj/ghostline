@@ -31,7 +31,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: ghostline serve --socket <path> [--output-dir <dir>] [--default-term <term>] [--adopt-from <admin-socket>]")
+	fmt.Fprintln(os.Stderr, "usage: ghostline serve --socket <path> [--output-dir <dir>] [--default-term <term>] [--adopt-from <admin-socket>] [--probe-foreground]")
 }
 
 // serveCommand runs the standalone session server. The server owns PTY
@@ -43,6 +43,7 @@ func serveCommand(args []string) {
 	outputDir := flags.String("output-dir", "", "output spool directory (default ~/.ghostline/output)")
 	defaultTerm := flags.String("default-term", "", "TERM for sessions without one (default xterm-256color)")
 	adoptFrom := flags.String("adopt-from", "", "old server admin socket to adopt sessions from before serving")
+	probeForeground := flags.Bool("probe-foreground", false, "probe OS-level foreground process/cwd metadata (off by default)")
 	_ = flags.Parse(args)
 	if *socket == "" {
 		fmt.Fprintln(os.Stderr, "ghostline serve: --socket is required")
@@ -53,7 +54,11 @@ func serveCommand(args []string) {
 		home, _ := os.UserHomeDir()
 		dir = filepath.Join(home, ".ghostline", "output")
 	}
-	server, err := ghostline.NewServer(ghostline.Options{OutputDir: dir, DefaultTerm: *defaultTerm})
+	server, err := ghostline.NewServer(ghostline.Options{
+		OutputDir:       dir,
+		DefaultTerm:     *defaultTerm,
+		ProbeForeground: *probeForeground,
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ghostline serve: %v\n", err)
 		os.Exit(1)

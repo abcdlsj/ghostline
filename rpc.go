@@ -18,11 +18,12 @@ const (
 // ProtocolVersion identifies the RPC protocol spoken by the server. Clients
 // use it to detect an outdated server process during upgrades instead of
 // failing on unknown methods.
-const ProtocolVersion = "0.4.0"
+const ProtocolVersion = "0.5.0"
 
 const (
 	rpcMethodCreate        = "create"
 	rpcMethodStatus        = "status"
+	rpcMethodMetadata      = "metadata"
 	rpcMethodCreated       = "created"
 	rpcMethodVersion       = "version"
 	rpcMethodWait          = "wait"
@@ -98,6 +99,11 @@ type spoolPathResult struct {
 
 type spoolSizeResult struct {
 	Size int64 `json:"size"`
+}
+
+type metadataResult struct {
+	Process   string `json:"process"`
+	Directory string `json:"directory"`
 }
 
 type removeResult struct {

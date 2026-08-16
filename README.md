@@ -251,6 +251,13 @@ users.
   cancellation stops waiting but does not terminate the child.
 - `Status` distinguishes a stopped session from a remote network failure;
   `Alive` is a best-effort convenience.
+- Sessions implement `MetadataProvider.Metadata`, reporting the OS-level
+  foreground process and working directory. It is opt-in: construct the
+  Hub/Server with `ProbeForeground: true` (or pass `--probe-foreground` to
+  `ghostline serve`). The probe resolves the PTY's foreground process group
+  with `TIOCGPGRP` and reads the process from `/proc` on Linux or `ps`/`lsof`
+  on macOS. Disabled by default; `Metadata` returns empty values without
+  probing.
 - Spool maintenance lives on `Session`: `Recover`, `TruncateSpool`,
   `ArchiveSpool`, and `RemoveSpool`.
 - Use `errors.Is` with `ErrUnavailable`, `ErrClosed`, `ErrSessionExists`,

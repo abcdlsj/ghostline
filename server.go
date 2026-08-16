@@ -515,6 +515,21 @@ func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessag
 		}
 		return session.Status(ctx)
 
+	case rpcMethodMetadata:
+		session, err := s.namedSession(raw)
+		if err != nil {
+			return nil, err
+		}
+		provider, ok := session.(MetadataProvider)
+		if !ok {
+			return metadataResult{}, nil
+		}
+		metadata, err := provider.Metadata(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return metadataResult{Process: metadata.Process, Directory: metadata.Directory}, nil
+
 	case rpcMethodWait:
 		session, err := s.namedSession(raw)
 		if err != nil {

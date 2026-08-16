@@ -28,6 +28,7 @@ type sessionState struct {
 	path      string
 	command   *exec.Cmd
 	pid       int
+	masterFD  int
 	size      Size
 	master    *os.File
 	spool     *os.File
@@ -136,6 +137,7 @@ func startSession(ctx context.Context, options SessionOptions, size Size, path s
 		path:      path,
 		command:   command,
 		pid:       command.Process.Pid,
+		masterFD:  int(master.Fd()),
 		size:      size,
 		master:    master,
 		spool:     spool,
@@ -404,6 +406,7 @@ func adoptState(name string, master *os.File, snapshot []byte, size Size, path s
 		name:      name,
 		path:      path,
 		pid:       pid,
+		masterFD:  -1,
 		size:      size,
 		master:    master,
 		spool:     spool,
@@ -419,6 +422,8 @@ func adoptState(name string, master *os.File, snapshot []byte, size Size, path s
 		state.waitErr = exit
 		close(state.done)
 		close(state.reaped)
+	} else {
+		state.masterFD = int(master.Fd())
 	}
 	return state, nil
 }

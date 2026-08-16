@@ -16,13 +16,17 @@ import (
 )
 
 func startTestServer(t *testing.T) (string, *ghostline.Client) {
+	return startTestServerWithOptions(t, ghostline.Options{OutputDir: t.TempDir()})
+}
+
+func startTestServerWithOptions(t *testing.T, options ghostline.Options) (string, *ghostline.Client) {
 	t.Helper()
 	socketDir, err := os.MkdirTemp("", "ghostline-")
 	if err != nil {
 		t.Fatalf("socket dir: %v", err)
 	}
 	socket := filepath.Join(socketDir, "ghostline.sock")
-	server, err := ghostline.NewServer(ghostline.Options{OutputDir: t.TempDir()})
+	server, err := ghostline.NewServer(options)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
