@@ -63,8 +63,8 @@ implemented and verified.
 
 ## Beauty pass
 
-- [x] `session.go`: drop the 19-method forwarding layer; embed small composed
-  interfaces; make `Status` a public struct with exit information
+- [x] `session.go`: drop the forwarding wrapper; make `Session` the public
+  interface itself; make `Status` a public struct with exit information
 - [x] `hub.go`: keep the name reservation lock short; start the child outside
   the lock with a pending reservation
 - [x] `process.go`: make termination bounded and event-driven; stop overriding
@@ -97,3 +97,10 @@ implemented and verified.
 - [x] `cmd/ghostline/main.go`
 - [x] `examples/minimux/main.go`
 - [x] tests
+- [x] `README.md`
+- [x] `LICENSE`
+- [x] `docs/rfc/0001-server-lifecycle.md`
+- [x] `go.mod` / `go.sum`
+- [x] `go.work` / `go.work.sum`
+- [x] `examples/minimux/go.mod` / `go.sum`
+- [x] `.github/workflows/ci.yml`
