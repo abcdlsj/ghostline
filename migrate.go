@@ -3,6 +3,7 @@ package ghostline
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -133,10 +134,10 @@ func (t *adminTransport) write(value any, fd int) error {
 
 func (t *adminTransport) read(value any) error {
 	for {
-		// The legacy v0.3.4 server sent the adopt fd as a separate one-byte
-		// NUL message. When the kernel coalesces that message with the JSON
-		// response, the NUL remains buffered after the newline; strip it so
-		// the next frame still starts at valid JSON.
+		// An fd handshake may arrive as a separate one-byte NUL message. When
+		// the kernel coalesces that message with the JSON response, the NUL
+		// remains buffered after the newline; strip it so the next frame still
+		// starts at valid JSON.
 		t.readBuf = bytes.TrimLeft(t.readBuf, "\x00")
 		if index := bytes.IndexByte(t.readBuf, '\n'); index >= 0 {
 			if index > adminMaxFrame {
@@ -188,10 +189,9 @@ func (t *adminTransport) read(value any) error {
 
 func (t *adminTransport) takeFD() (int, error) {
 	if len(t.received) == 0 {
-		// Legacy v0.3.4 servers sent the fd handshake after the JSON response
-		// instead of in the same message. Read until the descriptor arrives,
-		// discarding the NUL padding without losing any JSON that shares the
-		// read.
+		// The fd handshake may arrive after the JSON response instead of in the
+		// same message. Read until the descriptor arrives, discarding the NUL
+		// padding without losing any JSON that shares the read.
 		for {
 			if err := t.conn.SetReadDeadline(time.Now().Add(adminTimeout)); err != nil {
 				return -1, err
@@ -419,7 +419,7 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 		var adopted sessionMeta
 		// The process may exit between list and adopt. Ask for the response
 		// first, then decide whether that response should carry an fd from its
-		// own Alive bit rather than trusting the older list snapshot.
+		// own Alive bit rather than trusting the initial list snapshot.
 		if err := client.call(ctx, adminMethodAdopt, adoptParams{Name: meta.Name}, &adopted); err != nil {
 			return 0, err
 		}
@@ -433,17 +433,20 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 			}
 			master = os.NewFile(uintptr(masterFD), "adopted-master")
 		}
-		// Rolling upgrades rebuild the emulator from the append-only spool
-		// instead of the old server's native snapshot. Native state encoding
-		// can fail on older servers (continuation tracking was disabled) and,
-		// worse, the old server drops the session from its pending batch at
-		// that point, leaving nothing to commit. The spool is stable while the
-		// old server is paused, and it contains every byte the old emulator
-		// parsed, so this path works across protocol versions and stays the
-		// migration contract going forward.
-		state, err := adoptStateFromSpool(
+		var snapshotResult adminSnapshotResult
+		if err := client.call(ctx, adminMethodSnapshot, adoptParams{Name: adopted.Name}, &snapshotResult); err != nil {
+			closeFileQuietly(master)
+			return 0, fmt.Errorf("encode snapshot for %s: %w", meta.Name, err)
+		}
+		snapshot, err := base64.StdEncoding.DecodeString(snapshotResult.Snapshot)
+		if err != nil {
+			closeFileQuietly(master)
+			return 0, fmt.Errorf("decode snapshot for %s: %w", meta.Name, err)
+		}
+		state, err := adoptState(
 			adopted.Name,
 			master,
+			snapshot,
 			Size{Columns: adopted.Cols, Rows: adopted.Rows},
 			h.spoolPath(adopted.Name),
 			time.Unix(adopted.CreatedAt, 0),
@@ -451,8 +454,7 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 			adopted.Exit.error(),
 		)
 		if err != nil {
-			closeFileQuietly(master)
-			return 0, fmt.Errorf("replay spool for %s: %w", meta.Name, err)
+			return 0, fmt.Errorf("restore snapshot for %s: %w", meta.Name, err)
 		}
 		prepared = append(prepared, state)
 	}
@@ -478,17 +480,16 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 	}
 
 	// A successful commit transfers ownership. Retiring the old listener is a
-	// second, observable step, so return an error if it cannot be confirmed.
+	// second, best-effort step: the old endpoint may close without replying to
+	// the admin request, so an EOF here is expected. More generally, once
+	// ownership has moved, a retirement failure must never make the new server
+	// abandon the sessions it now owns. Callers can still independently
+	// check/stop the old process if it remains alive.
 	retireCtx, cancel := context.WithTimeout(context.Background(), adminTimeout)
 	var ignored struct{}
-	retireErr := client.call(retireCtx, adminMethodExit, nil, &ignored)
-	if retireErr == nil {
-		retireErr = waitOldServerGone(retireCtx, adminSocket)
-	}
+	_ = client.call(retireCtx, adminMethodExit, nil, &ignored)
+	_ = waitOldServerGone(retireCtx, adminSocket)
 	cancel()
-	if retireErr != nil {
-		return len(prepared), fmt.Errorf("sessions committed but old server was not retired: %w", retireErr)
-	}
 	return len(prepared), nil
 }
 

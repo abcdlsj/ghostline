@@ -9,9 +9,8 @@
 Allow a ghostline server process to be upgraded without ending its sessions.
 A freshly started server adopts every session from the old server: the PTY
 master file descriptor is moved over a Unix socket (`SCM_RIGHTS`), the
-server-side libghostty-vt state is serialized with the snapshot API and
-restored, and only then does the old server exit. Child processes never see a
-disconnect.
+server-side terminal snapshot is transferred and restored, and only then does
+the old server retire. Child processes never see a disconnect.
 
 ## Problem
 
@@ -62,11 +61,11 @@ The server listens on a second Unix socket next to the main one
   the child has already exited).
 - `adopt <name>` — pause the session and return its metadata; a live child
   also carries its `SCM_RIGHTS` master fd.
-- `snapshot <name>` — return the encoded libghostty snapshot for a prepared
+- `snapshot <name>` — return the encoded terminal snapshot for a prepared
   session.
 - `commit <names>` / `abort <names>` — commit or abort a prepared batch.
 - `exit` — stop accepting, wait for pending adoptions to finish, then
-  terminate.
+  terminate. Retirement is best-effort after a successful commit.
 
 Only the new server connects to the management socket; the daemon never talks
 to it directly.
@@ -80,15 +79,16 @@ The new server prepares every session before committing any of them:
    everything the child produced so far, then stops reading. Bytes produced
    during the pause stay buffered in the PTY. The master is not closed.
 2. The old server sends the master fd and metadata. The new server requests
-   `snapshot`, restores the emulator state, and opens the same spool with
-   `O_APPEND`. No spool offset is transferred: the new server simply continues
-   appending at the current end.
+   `snapshot`, restores the terminal state, and opens the same spool with
+   `O_APPEND`. No spool offset is transferred: the new server simply
+   continues appending at the current end.
 3. When every session is prepared, the new server sends `commit`. The old
    server releases each paused session and the new server starts draining the
    transferred masters. Bytes buffered during the pause are read by the new
    server, keeping the spool contiguous and the emulated state consistent.
 4. The new server binds its public socket only after adoption returns, the
-   daemon switches clients to it, and the old server exits via `exit`.
+   daemon switches clients to it, and the old server is asked to exit via
+   `exit`. Failure to confirm retirement never invalidates a committed batch.
 
 Attached clients see only a sub-second output pause; recovery anchors and
 spool offsets remain valid because the spool is never rewound or truncated.
@@ -117,7 +117,7 @@ spool offsets remain valid because the spool is never rewound or truncated.
 
 - The management protocol is all-or-nothing: the new server prepares every
   session (fd + snapshot) before committing any of them. A failure aborts the
-  whole batch and the old server keeps serving.
+  whole batch and the source server keeps serving.
 - PTY masters do not support Go's `SetReadDeadline`, so output draining polls
   with `poll(2)` and stops only after the child's pending bytes are flushed.
 - `ghostline serve --adopt-from <admin-socket>` performs the adoption before
@@ -135,11 +135,10 @@ spool offsets remain valid because the spool is never rewound or truncated.
 
 ## Compatibility and known limitations
 
-- Both servers must speak the admin-socket protocol (ghostline v0.3.4 or
-  newer). An older old server cannot be adopted; the daemon keeps serving from
-  it until it is restarted for another reason.
-- The snapshot covers the emulator's core state (grid, scrollback, cursor,
-  terminal modes). Exotic features such as kitty graphics or OSC state are
+- Both servers must speak the admin-socket protocol. If the source endpoint
+  cannot be adopted, the daemon keeps serving from it until a later restart.
+- The snapshot reconstructs the emulator's grid, scrollback, cursor, and
+  terminal modes. Exotic features such as kitty graphics or OSC state are
   expected to travel with the snapshot but are not separately verified.
 - The pause window is bounded by the drain step plus snapshot transfer. A
   high-throughput child can block briefly while the PTY buffer fills; the

@@ -106,9 +106,9 @@ directly.
 ## Rolling server upgrades
 
 The server can be upgraded without ending sessions. Both processes must speak
-the admin-socket protocol (v0.3.4 or newer), and the new server must use the
-same output directory as the old one. A fresh server adopts every session
-from the old one over its management socket, then serves in place of it:
+the admin-socket protocol, and the new server must use the same output
+directory as the old one. A fresh server adopts every session from the old one
+over its management socket, then serves in place of it:
 
 ```sh
 ghostline serve --socket /tmp/ghostline-new.sock --adopt-from /tmp/ghostline.sock.admin
@@ -116,15 +116,18 @@ ghostline serve --socket /tmp/ghostline-new.sock --adopt-from /tmp/ghostline.soc
 
 Adoption is all-or-nothing:
 
-- The old server pauses each session at a stable point: pending PTY output is
-  drained into the spool and emulator state, then the master fd is sent over
-  `SCM_RIGHTS` and the encoded libghostty snapshot is transferred separately.
+- The old server pauses each session at a stable point, drains pending PTY
+  output into the spool and emulator, and transfers the master fd over
+  `SCM_RIGHTS` together with the encoded terminal snapshot.
 - The new server prepares every session before committing any of them. If any
-  session fails to prepare, the whole batch is aborted and the old server
-  keeps serving unchanged.
+  session fails to prepare, the whole batch is aborted and the source server
+  keeps serving unchanged. The new emulator restores each session's snapshot,
+  including its grid, scrollback, cursor, and terminal modes.
 - After the batch commits, the new server binds its public socket and the old
-  server exits. Children never see a disconnect, and spool offsets stay valid
-  because the spool is never rewound.
+  server is asked to retire. Retirement confirmation is best-effort; once the
+  batch commits, the new server keeps serving the adopted sessions even if the
+  source endpoint closes without a response. Children never see a disconnect,
+  and spool offsets stay valid because the spool is never rewound.
 
 The embedding daemon coordinates the switch and retires the old process; see
 `docs/rfc/0002-serve-rolling-upgrade.md`.

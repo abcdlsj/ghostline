@@ -3,6 +3,7 @@ package ghostline
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net"
@@ -58,7 +59,7 @@ func unixAdminPair(t *testing.T) (*net.UnixConn, *net.UnixConn) {
 	return client, server
 }
 
-func TestAdminTransportReadsLegacyFdHandshake(t *testing.T) {
+func TestAdminTransportReadsSplitFDHandshake(t *testing.T) {
 	client, server := unixAdminPair(t)
 	transport := newAdminTransport(client)
 	readFD, writeFD, err := os.Pipe()
@@ -73,7 +74,7 @@ func TestAdminTransportReadsLegacyFdHandshake(t *testing.T) {
 			t.Errorf("write adopt response: %v", err)
 			return
 		}
-		// v0.3.4 sent the descriptor as a separate one-byte NUL message.
+		// The descriptor can arrive as a separate one-byte NUL message.
 		if _, _, err := server.WriteMsgUnix([]byte{0}, unix.UnixRights(int(readFD.Fd())), nil); err != nil {
 			t.Errorf("write fd handshake: %v", err)
 			return
@@ -114,7 +115,7 @@ func TestAdminTransportReadsLegacyFdHandshake(t *testing.T) {
 	}
 }
 
-func TestAdminTransportReadsCoalescedLegacyFdHandshake(t *testing.T) {
+func TestAdminTransportReadsCoalescedFDHandshake(t *testing.T) {
 	client, server := unixAdminPair(t)
 	transport := newAdminTransport(client)
 	readFD, writeFD, err := os.Pipe()
@@ -168,38 +169,7 @@ func TestAdminTransportReadsCoalescedLegacyFdHandshake(t *testing.T) {
 	}
 }
 
-func TestAdoptStateFromSpoolPreservesCursor(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "spool.out")
-	if err := os.WriteFile(path, []byte("\x1b[5;10Hhello"), 0o600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	state, err := adoptStateFromSpool(
-		"spool",
-		nil,
-		Size{Columns: 80, Rows: 24},
-		path,
-		time.Now(),
-		0,
-		nil,
-	)
-	if err != nil {
-		t.Fatalf("adoptStateFromSpool: %v", err)
-	}
-	defer state.close()
-
-	snapshot, err := state.vt.Snapshot()
-	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
-	if !bytes.Contains(snapshot, []byte("hello")) {
-		t.Fatalf("spool replay lost content: %q", snapshot)
-	}
-	if !bytes.HasSuffix(snapshot, []byte("\x1b[5;15H")) {
-		t.Fatalf("spool replay did not preserve cursor: %q", snapshot[len(snapshot)-min(len(snapshot), 40):])
-	}
-}
-
-func startLegacyAdminServerWithBrokenSnapshot(t *testing.T, socket string, meta sessionMeta, fd *os.File) {
+func startAdminServerWithSnapshot(t *testing.T, socket string, meta sessionMeta, fd *os.File, snapshot []byte, replyToExit bool) {
 	t.Helper()
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
 	if err != nil {
@@ -224,15 +194,24 @@ func startLegacyAdminServerWithBrokenSnapshot(t *testing.T, socket string, meta 
 				_ = transport.write(adminResponse{ID: request.ID, Result: raw}, -1)
 			case adminMethodAdopt:
 				raw, _ := json.Marshal(meta)
-				_ = transport.write(adminResponse{ID: request.ID, Result: raw}, int(fd.Fd()))
-				_ = fd.Close()
+				fdToSend := -1
+				if meta.Alive && fd != nil {
+					fdToSend = int(fd.Fd())
+				}
+				_ = transport.write(adminResponse{ID: request.ID, Result: raw}, fdToSend)
+				if fd != nil {
+					_ = fd.Close()
+				}
 			case adminMethodSnapshot:
-				_ = transport.write(adminResponse{ID: request.ID, Error: "ghostty snapshot encode failed: -2"}, -1)
+				raw, _ := json.Marshal(adminSnapshotResult{Snapshot: base64.StdEncoding.EncodeToString(snapshot)})
+				_ = transport.write(adminResponse{ID: request.ID, Result: raw}, -1)
 			case adminMethodCommit:
 				raw, _ := json.Marshal(adminBatchResult{Committed: 1})
 				_ = transport.write(adminResponse{ID: request.ID, Result: raw}, -1)
 			case adminMethodExit:
-				_ = transport.write(adminResponse{ID: request.ID, Result: json.RawMessage("{}")}, -1)
+				if replyToExit {
+					_ = transport.write(adminResponse{ID: request.ID, Result: json.RawMessage("{}")}, -1)
+				}
 				return
 			default:
 				_ = transport.write(adminResponse{ID: request.ID, Error: "unknown admin method"}, -1)
@@ -241,34 +220,40 @@ func startLegacyAdminServerWithBrokenSnapshot(t *testing.T, socket string, meta 
 	}()
 }
 
-func TestRollingAdoptReplaysSpool(t *testing.T) {
+func TestRollingAdoptRestoresSnapshot(t *testing.T) {
 	ctx := context.Background()
 	outputDir := t.TempDir()
-	socketDir, err := os.MkdirTemp("/tmp", "ghostline-fallback-")
+	socketDir, err := os.MkdirTemp("/tmp", "ghostline-snapshot-")
 	if err != nil {
 		t.Fatalf("MkdirTemp: %v", err)
 	}
 	defer os.RemoveAll(socketDir)
 
-	spoolPath := filepath.Join(outputDir, "warren_fallback.out")
-	if err := os.WriteFile(spoolPath, []byte("\x1b[5;10Hhello"), 0o600); err != nil {
+	spoolPath := filepath.Join(outputDir, "warren_snapshot.out")
+	if err := os.WriteFile(spoolPath, []byte("truncated spool"), 0o600); err != nil {
 		t.Fatalf("WriteFile spool: %v", err)
 	}
-	readFD, writeFD, err := os.Pipe()
+	vt, err := NewVTTerminal(80, 24)
 	if err != nil {
-		t.Fatalf("Pipe: %v", err)
+		t.Fatalf("NewVTTerminal: %v", err)
 	}
-	_ = writeFD.Close()
+	vt.Feed([]byte("\x1b[5;10Hhello"))
+	nativeSnapshot, err := vt.EncodeState()
+	vt.Close()
+	if err != nil {
+		t.Fatalf("EncodeState: %v", err)
+	}
 	meta := sessionMeta{
-		Name:      "warren_fallback",
+		Name:      "warren_snapshot",
 		Cols:      80,
 		Rows:      24,
 		CreatedAt: time.Now().Unix(),
 		PID:       4242,
-		Alive:     true,
+		Alive:     false,
+		Exit:      &exitMeta{Code: 0},
 	}
 	adminSocket := filepath.Join(socketDir, "old.admin")
-	startLegacyAdminServerWithBrokenSnapshot(t, adminSocket, meta, readFD)
+	startAdminServerWithSnapshot(t, adminSocket, meta, nil, nativeSnapshot, true)
 
 	hub, err := New(Options{OutputDir: outputDir})
 	if err != nil {
@@ -282,7 +267,7 @@ func TestRollingAdoptReplaysSpool(t *testing.T) {
 	if adopted != 1 {
 		t.Fatalf("adopted = %d, want 1", adopted)
 	}
-	session, ok := hub.Session("warren_fallback")
+	session, ok := hub.Session("warren_snapshot")
 	if !ok {
 		t.Fatal("adopted session missing")
 	}
@@ -291,10 +276,65 @@ func TestRollingAdoptReplaysSpool(t *testing.T) {
 		t.Fatalf("Snapshot: %v", err)
 	}
 	if !bytes.Contains(snapshot, []byte("hello")) {
-		t.Fatalf("fallback lost spool content: %q", snapshot)
+		t.Fatalf("snapshot restore lost content: %q", snapshot)
 	}
 	if !bytes.HasSuffix(snapshot, []byte("\x1b[5;15H")) {
-		t.Fatalf("fallback did not preserve cursor: %q", snapshot[len(snapshot)-min(len(snapshot), 40):])
+		t.Fatalf("snapshot restore did not preserve cursor: %q", snapshot[len(snapshot)-min(len(snapshot), 40):])
+	}
+}
+
+func TestAdoptIgnoresRetirementErrorAfterCommit(t *testing.T) {
+	ctx := context.Background()
+	outputDir := t.TempDir()
+	socketDir, err := os.MkdirTemp("/tmp", "ghostline-retirement-error-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	defer os.RemoveAll(socketDir)
+
+	name := "retirement_error"
+	spoolPath := filepath.Join(outputDir, name+".out")
+	if err := os.WriteFile(spoolPath, []byte("retirement output"), 0o600); err != nil {
+		t.Fatalf("WriteFile spool: %v", err)
+	}
+	meta := sessionMeta{
+		Name:      name,
+		Cols:      80,
+		Rows:      24,
+		CreatedAt: time.Now().Unix(),
+		PID:       4242,
+		Alive:     false,
+		Exit:      &exitMeta{Code: 0},
+	}
+	adminSocket := filepath.Join(socketDir, "old.admin")
+	// The source confirms commit, then closes the admin connection without a
+	// retirement response. The adopted state itself still comes from the
+	// snapshot, not from the output spool.
+	vt, err := NewVTTerminal(80, 24)
+	if err != nil {
+		t.Fatalf("NewVTTerminal: %v", err)
+	}
+	nativeSnapshot, err := vt.EncodeState()
+	vt.Close()
+	if err != nil {
+		t.Fatalf("EncodeState: %v", err)
+	}
+	startAdminServerWithSnapshot(t, adminSocket, meta, nil, nativeSnapshot, false)
+
+	hub, err := New(Options{OutputDir: outputDir})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer hub.Close()
+	adopted, err := Adopt(ctx, adminSocket, hub)
+	if err != nil {
+		t.Fatalf("Adopt returned an error after commit: %v", err)
+	}
+	if adopted != 1 {
+		t.Fatalf("adopted = %d, want 1", adopted)
+	}
+	if _, ok := hub.Session(name); !ok {
+		t.Fatalf("adopted session %q missing after retirement error", name)
 	}
 }
 
