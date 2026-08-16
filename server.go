@@ -201,6 +201,9 @@ func (s *Server) spoolPath(name string) (string, error) {
 
 func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessage) (any, error) {
 	switch method {
+	case rpcMethodVersion:
+		return versionResult{Version: ProtocolVersion}, nil
+
 	case rpcMethodCreate:
 		params, err := decode[createParams](raw)
 		if err != nil {

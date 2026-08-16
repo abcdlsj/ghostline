@@ -119,6 +119,17 @@ func (c *Client) Check(ctx context.Context) error {
 	return nil
 }
 
+// Version returns the server's RPC protocol version. An error or an empty
+// value means the server predates protocol versioning and must be restarted
+// before this client can use it.
+func (c *Client) Version(ctx context.Context) (string, error) {
+	var result versionResult
+	if err := c.call(ctx, rpcMethodVersion, nil, &result); err != nil {
+		return "", err
+	}
+	return result.Version, nil
+}
+
 func dial(ctx context.Context, socket string) (net.Conn, error) {
 	dialer := net.Dialer{}
 	connection, err := dialer.DialContext(ctx, "unix", socket)

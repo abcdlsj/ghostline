@@ -15,10 +15,16 @@ const (
 	maxConnections = 64
 )
 
+// ProtocolVersion identifies the RPC protocol spoken by the server. Clients
+// use it to detect an outdated server process during upgrades instead of
+// failing on unknown methods.
+const ProtocolVersion = "0.3.3"
+
 const (
 	rpcMethodCreate        = "create"
 	rpcMethodStatus        = "status"
 	rpcMethodCreated       = "created"
+	rpcMethodVersion       = "version"
 	rpcMethodWait          = "wait"
 	rpcMethodClose         = "close"
 	rpcMethodRemove        = "remove"
@@ -67,6 +73,10 @@ type recoverParams struct {
 
 type createResult struct {
 	Created int64 `json:"created"`
+}
+
+type versionResult struct {
+	Version string `json:"version"`
 }
 
 type listResult struct {

@@ -172,6 +172,17 @@ func TestClientSessionByNameAndSessions(t *testing.T) {
 	}
 }
 
+func TestClientVersionReportsProtocol(t *testing.T) {
+	_, client := startTestServer(t)
+	version, err := client.Version(context.Background())
+	if err != nil {
+		t.Fatalf("Version: %v", err)
+	}
+	if version != ghostline.ProtocolVersion {
+		t.Fatalf("Version = %q, want %q", version, ghostline.ProtocolVersion)
+	}
+}
+
 func TestClientWaitReturnsExitError(t *testing.T) {
 	_, client := startTestServer(t)
 	session, err := client.Start(context.Background(), ghostline.SessionOptions{
