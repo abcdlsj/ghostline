@@ -17,6 +17,7 @@ terminal, or their own session protocol on top.
 - Raw append-only output subscriptions with resumable byte offsets
 - Atomic checkpoints pairing a full VT replay with its exact spool boundary
 - Detached-mode terminal query responses for TUIs
+- Rolling server upgrades that keep PTY children and emulator state alive
 - Local `Hub` and Unix-socket `Server`/`Client` with one `Session` API
 
 ## Requirements
@@ -104,18 +105,29 @@ directly.
 
 ## Rolling server upgrades
 
-The server can be upgraded without ending sessions. A fresh server adopts
-every session from the old one over its management socket, then serves in
-place of it:
+The server can be upgraded without ending sessions. Both processes must speak
+the admin-socket protocol (v0.3.4 or newer), and the new server must use the
+same output directory as the old one. A fresh server adopts every session
+from the old one over its management socket, then serves in place of it:
 
 ```sh
 ghostline serve --socket /tmp/ghostline-new.sock --adopt-from /tmp/ghostline.sock.admin
 ```
 
-The old server serializes each emulator state, moves the PTY master over
-`SCM_RIGHTS`, and exits only after the new server has adopted everything.
-Children never see a disconnect. The embedding daemon coordinates the switch
-and retires the old process; see `docs/rfc/0002-serve-rolling-upgrade.md`.
+Adoption is all-or-nothing:
+
+- The old server pauses each session at a stable point: pending PTY output is
+  drained into the spool and emulator state, then the master fd is sent over
+  `SCM_RIGHTS` and the encoded libghostty snapshot is transferred separately.
+- The new server prepares every session before committing any of them. If any
+  session fails to prepare, the whole batch is aborted and the old server
+  keeps serving unchanged.
+- After the batch commits, the new server binds its public socket and the old
+  server exits. Children never see a disconnect, and spool offsets stay valid
+  because the spool is never rewound.
+
+The embedding daemon coordinates the switch and retires the old process; see
+`docs/rfc/0002-serve-rolling-upgrade.md`.
 
 ### Server bootstrap
 
@@ -189,14 +201,14 @@ switches.
 ## libghostty-vt
 
 The repository includes the Ghostty C headers and a prebuilt macOS arm64
-library. Other platforms must build libghostty-vt from Ghostty source with Zig
-0.15.2:
+library. Other platforms must build libghostty-vt from Ghostty source with
+Zig 0.16.0 or newer:
 
 ```sh
-brew install zig@0.15
+brew install zig@0.16
 git clone https://github.com/ghostty-org/ghostty
 cd ghostty
-/opt/homebrew/opt/zig@0.15/bin/zig build \
+/opt/homebrew/opt/zig@0.16/bin/zig build \
   -Doptimize=ReleaseFast -Demit-lib-vt=true
 ```
 
@@ -216,9 +228,12 @@ Builds with `CGO_ENABLED=0` compile, but `Hub.Check` and `Start` return
 ## Protocol and security
 
 The server speaks JSON-lines over a Unix socket and creates the socket with
-mode `0600`. It enforces an idle deadline, a message size limit, and a
-concurrent connection cap. It is designed for same-machine, trusted callers;
-there is no authentication. Do not expose the socket to untrusted users.
+mode `0600`. The rolling-upgrade management socket (`<socket>.admin`) uses the
+same mode and is only ever connected to by a fresh server process, never by
+clients. The RPC enforces an idle deadline, a message size limit, and a
+concurrent connection cap. Both sockets are designed for same-machine,
+trusted callers; there is no authentication. Do not expose them to untrusted
+users.
 
 ## Lifecycle
 
@@ -242,6 +257,7 @@ there is no authentication. Do not expose the socket to untrusted users.
 - `hub.go` - session hub and start options
 - `session.go` - local and remote session API
 - `process.go` - PTY child lifecycle
+- `migrate.go` - rolling-upgrade admin protocol and session adoption
 - `spool.go` - append-only output watcher
 - `query.go` - detached-mode terminal query responder
 - `terminal.go` - libghostty-vt CGo wrapper

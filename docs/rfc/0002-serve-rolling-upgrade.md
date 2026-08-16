@@ -58,33 +58,39 @@ version advertised on the socket against its own expected version.
 The server listens on a second Unix socket next to the main one
 (`<socket>.admin`) with a minimal protocol:
 
-- `list` — return session names and metadata (size, spool path, created).
-- `adopt <name>` — return the session's `SCM_RIGHTS` master fd, the encoded
-  libghostty snapshot, and the current spool offset.
-- `exit` — stop accepting, wait for adoptions to finish, then terminate.
+- `list` — return session names and metadata (size, created, pid).
+- `adopt <name>` — pause the session and return its metadata plus the
+  `SCM_RIGHTS` master fd.
+- `snapshot <name>` — return the encoded libghostty snapshot for a prepared
+  session.
+- `commit <names>` / `abort <names>` — commit or abort a prepared batch.
+- `exit` — stop accepting, wait for pending adoptions to finish, then
+  terminate.
 
 Only the new server connects to the management socket; the daemon never talks
 to it directly.
 
 ### Adoption sequence
 
-For each session, in order:
+The new server prepares every session before committing any of them:
 
-1. The old server stops draining its master (it does not close it) and stops
-   appending to the spool, recording the byte offset. Children may block
-   briefly while the PTY buffer fills; the window is milliseconds.
-2. The old server encodes the emulator state (`ghostty_snapshot`), then sends
-   the master fd and metadata over the management socket.
-3. The new server creates the session with the transferred fd and restores
-   the snapshot, then starts draining and appending to the same spool from
-   the recorded offset. Bytes produced during the window stay buffered in the
-   PTY and are drained by the new server, keeping the spool contiguous and
-   the emulated state consistent.
-4. After all sessions are adopted, the new server signals readiness, the
-   daemon switches clients, and the old server exits.
+1. For each session, the new server sends `adopt`. The old server drains
+   output that is already readable, so the spool and emulator state include
+   everything the child produced so far, then stops reading. Bytes produced
+   during the pause stay buffered in the PTY. The master is not closed.
+2. The old server sends the master fd and metadata. The new server requests
+   `snapshot`, restores the emulator state, and opens the same spool with
+   `O_APPEND`. No spool offset is transferred: the new server simply continues
+   appending at the current end.
+3. When every session is prepared, the new server sends `commit`. The old
+   server releases each paused session and the new server starts draining the
+   transferred masters. Bytes buffered during the pause are read by the new
+   server, keeping the spool contiguous and the emulated state consistent.
+4. The new server binds its public socket only after adoption returns, the
+   daemon switches clients to it, and the old server exits via `exit`.
 
 Attached clients see only a sub-second output pause; recovery anchors and
-spool offsets remain valid because the spool is never rewound.
+spool offsets remain valid because the spool is never rewound or truncated.
 
 ### Failure safety
 
@@ -93,13 +99,16 @@ spool offsets remain valid because the spool is never rewound.
 - The daemon only switches to the new socket after every session is adopted.
 - The new server refuses to start serving new sessions until adoption is
   complete, so no split-brain state exists.
+- If adoption is impossible (for example the old server predates the admin
+  socket), an embedding daemon should keep the old server running and retry
+  on a later start rather than ending sessions.
 
 ## Components
 
-- `VTTerminal.Snapshot` / `Restore` — CGo wrappers around the libghostty
-  snapshot API.
+- `VTTerminal.EncodeState` / `RestoreState` — CGo wrappers around the
+  libghostty snapshot API.
 - `Server` management socket and adoption protocol.
-- A small client-side `Adopt` helper used by a freshly started server.
+- `Adopt` and `Server.Adopt` helpers used by a freshly started server.
 - Warren daemon coordination: start new server, trigger adoption, switch
   socket, retire old server.
 
@@ -112,6 +121,8 @@ spool offsets remain valid because the spool is never rewound.
   with `poll(2)` and stops only after the child's pending bytes are flushed.
 - `ghostline serve --adopt-from <admin-socket>` performs the adoption before
   binding its public socket, so clients never observe a half-upgraded server.
+- No spool offset is transferred; the new server opens the existing spool with
+  `O_APPEND`, so all previously published spool offsets stay valid.
 
 ## Alternatives considered
 
@@ -121,12 +132,14 @@ spool offsets remain valid because the spool is never rewound.
 - **Keep the server on the old binary forever.** Delays fixes (the resize
   ordering bug is a recent example). Rejected as a dead end.
 
-## Open questions
+## Compatibility and known limitations
 
-- Does `ghostty_snapshot` cover every state the emulator tracks (terminal
-  modes, kitty graphics, OSC state)? A spike with Codex should verify exact
-  screen equality before and after adoption.
-- How long can a child block while the PTY buffer fills during the window?
-  High-throughput output could need a larger migration buffer.
-- Version compatibility: only "new server adopts from old server" is
-  supported; the protocol should document a minimum old-server version.
+- Both servers must speak the admin-socket protocol (ghostline v0.3.4 or
+  newer). An older old server cannot be adopted; the daemon keeps serving from
+  it until it is restarted for another reason.
+- The snapshot covers the emulator's core state (grid, scrollback, cursor,
+  terminal modes). Exotic features such as kitty graphics or OSC state are
+  expected to travel with the snapshot but are not separately verified.
+- The pause window is bounded by the drain step plus snapshot transfer. A
+  high-throughput child can block briefly while the PTY buffer fills; the
+  design does not add a separate migration buffer.
