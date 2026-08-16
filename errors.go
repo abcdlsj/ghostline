@@ -28,7 +28,6 @@ type ExitError struct {
 	Signal string
 }
 
-// Error implements error.
 func (e *ExitError) Error() string {
 	if e.Signal != "" {
 		return "signal: " + e.Signal

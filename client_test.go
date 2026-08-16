@@ -49,7 +49,7 @@ func startTestServer(t *testing.T) (string, *ghostline.Client) {
 	return socket, client
 }
 
-func waitRemoteSpool(t *testing.T, session *ghostline.Session, needle string) {
+func waitRemoteSpool(t *testing.T, session ghostline.Session, needle string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {

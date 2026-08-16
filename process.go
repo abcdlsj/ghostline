@@ -107,15 +107,26 @@ func terminate(state *sessionState) error {
 	}
 	select {
 	case <-state.reaped:
-	case <-time.After(time.Second):
+	case <-time.After(terminateGrace):
 		if state.command.Process != nil {
 			_ = syscall.Kill(-state.command.Process.Pid, syscall.SIGKILL)
 		}
-		<-state.reaped
+		select {
+		case <-state.reaped:
+		case <-time.After(terminateWait):
+			state.close()
+			return fmt.Errorf("session %s did not reap", state.name)
+		}
 	}
+	<-state.done
 	state.close()
 	return nil
 }
+
+const (
+	terminateGrace = time.Second
+	terminateWait  = 2 * time.Second
+)
 
 func (s *sessionState) close() {
 	s.closeOnce.Do(func() {
@@ -152,17 +163,7 @@ func ptyCommand(directory, command string, environment []string) *exec.Cmd {
 }
 
 func ptyEnvironment(overrides []string) []string {
-	env := make([]string, 0, len(os.Environ())+2)
-	for _, item := range os.Environ() {
-		if strings.HasPrefix(item, "TERM=") ||
-			strings.HasPrefix(item, "COLORTERM=") ||
-			strings.HasPrefix(item, "NO_COLOR=") {
-			continue
-		}
-		env = append(env, item)
-	}
-	env = append(env, "TERM=xterm-256color", "COLORTERM=truecolor")
-	return mergeEnvironment(env, overrides)
+	return mergeEnvironment(os.Environ(), overrides)
 }
 
 func mergeEnvironment(base, overrides []string) []string {

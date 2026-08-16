@@ -43,7 +43,9 @@ func dial(ctx context.Context, socket string) (net.Conn, error) {
 		return nil, err
 	}
 	if deadline, ok := ctx.Deadline(); ok {
-		_ = connection.SetDeadline(deadline)
+		// Give ctx cancellation a chance to close the connection first so a
+		// blocking call returns ctx.Err instead of a raw deadline error.
+		_ = connection.SetDeadline(deadline.Add(100 * time.Millisecond))
 	}
 	return connection, nil
 }
@@ -99,21 +101,12 @@ func contextErr(ctx context.Context, err error) error {
 	return err
 }
 
-type createParams struct {
-	Name    string   `json:"name"`
-	Dir     string   `json:"dir"`
-	Command string   `json:"command"`
-	Cols    int      `json:"cols"`
-	Rows    int      `json:"rows"`
-	Env     []string `json:"env"`
-}
-
 type createResult struct {
 	Created int64 `json:"created"`
 }
 
 // Start creates a session on the server and returns its remote handle.
-func (c *Client) Start(ctx context.Context, options SessionOptions) (*Session, error) {
+func (c *Client) Start(ctx context.Context, options SessionOptions) (Session, error) {
 	var result createResult
 	err := c.call(ctx, "create", createParams{
 		Name:    options.Name,
@@ -126,11 +119,11 @@ func (c *Client) Start(ctx context.Context, options SessionOptions) (*Session, e
 	if err != nil {
 		return nil, err
 	}
-	return &Session{backend: &remoteSession{
+	return &remoteSession{
 		client:    c,
 		name:      options.Name,
 		createdAt: time.Unix(result.Created, 0),
-	}}, nil
+	}, nil
 }
 
 // List returns the names of all sessions known to the server.
@@ -145,10 +138,18 @@ func (c *Client) List(ctx context.Context) ([]string, error) {
 	return result.Sessions, nil
 }
 
-func (c *Client) status(ctx context.Context, name string) (sessionStatus, error) {
-	var result sessionStatus
-	if err := c.call(ctx, "status", map[string]string{"name": name}, &result); err != nil {
-		return sessionStatus{}, err
+func (c *Client) status(ctx context.Context, name string) (Status, error) {
+	var result Status
+	if err := c.call(ctx, "status", nameParams{Name: name}, &result); err != nil {
+		return Status{}, err
+	}
+	return result, nil
+}
+
+func (c *Client) wait(ctx context.Context, name string) (Status, error) {
+	var result Status
+	if err := c.call(ctx, "wait", nameParams{Name: name}, &result); err != nil {
+		return Status{}, err
 	}
 	return result, nil
 }
@@ -174,14 +175,19 @@ func (r *remoteSession) Done() <-chan struct{} {
 		r.done = make(chan struct{})
 		go func() {
 			for {
-				alive, err := r.Status(context.Background())
+				status, err := r.client.wait(context.Background(), r.name)
 				if err == nil {
-					if !alive {
-						r.closeDone()
-						return
+					if status.Exit != nil {
+						r.exit.Store(status.Exit)
 					}
+					r.closeDone()
+					return
 				}
-				time.Sleep(50 * time.Millisecond)
+				if errors.Is(err, ErrSessionNotFound) {
+					r.closeDone()
+					return
+				}
+				time.Sleep(100 * time.Millisecond)
 			}
 		}()
 	})
@@ -189,65 +195,49 @@ func (r *remoteSession) Done() <-chan struct{} {
 }
 
 func (r *remoteSession) Wait(ctx context.Context) error {
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		status, err := r.client.status(ctx, r.name)
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			if errors.Is(err, ErrSessionNotFound) {
-				if exit := r.exit.Load(); exit != nil {
-					return exit
-				}
-				return ErrSessionClosed
-			}
-		} else if status.Exit != nil {
-			r.exit.Store(status.Exit)
-			return status.Exit
-		} else if !status.Alive {
+	status, err := r.client.wait(ctx, r.name)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if errors.Is(err, ErrSessionNotFound) {
 			if exit := r.exit.Load(); exit != nil {
 				return exit
 			}
-			return nil
+			return ErrSessionClosed
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
+		return err
 	}
+	if status.Exit != nil {
+		r.exit.Store(status.Exit)
+		return status.Exit
+	}
+	return nil
 }
 
 func (r *remoteSession) Alive() bool {
-	alive, err := r.Status(context.Background())
-	return err == nil && alive
+	status, err := r.Status(context.Background())
+	return err == nil && status.Alive
 }
 
-func (r *remoteSession) Status(ctx context.Context) (bool, error) {
+func (r *remoteSession) Status(ctx context.Context) (Status, error) {
 	status, err := r.client.status(ctx, r.name)
 	if err != nil {
-		return false, err
+		return Status{}, err
 	}
 	if status.Exit != nil {
 		r.exit.Store(status.Exit)
 	}
-	return status.Alive, nil
+	return status, nil
 }
 
 func (r *remoteSession) Input(ctx context.Context, data []byte) error {
-	return r.client.call(ctx, "input", map[string]any{
-		"name": r.name,
-		"data": data,
-	}, nil)
+	return r.client.call(ctx, "input", inputParams{Name: r.name, Data: data}, nil)
 }
 
 func (r *remoteSession) Resize(ctx context.Context, size Size) error {
-	return r.client.call(ctx, "resize", map[string]any{
-		"name": r.name,
-		"cols": size.Columns,
-		"rows": size.Rows,
+	return r.client.call(ctx, "resize", resizeParams{
+		Name: r.name, Cols: size.Columns, Rows: size.Rows,
 	}, nil)
 }
 
@@ -255,7 +245,7 @@ func (r *remoteSession) Snapshot(ctx context.Context) ([]byte, error) {
 	var result struct {
 		Data []byte `json:"data"`
 	}
-	if err := r.client.call(ctx, "snapshot", map[string]string{"name": r.name}, &result); err != nil {
+	if err := r.client.call(ctx, "snapshot", nameParams{Name: r.name}, &result); err != nil {
 		return nil, err
 	}
 	return result.Data, nil
@@ -266,7 +256,7 @@ func (r *remoteSession) Checkpoint(ctx context.Context) (Checkpoint, error) {
 		Replay []byte `json:"replay"`
 		Offset int64  `json:"offset"`
 	}
-	if err := r.client.call(ctx, "checkpoint", map[string]string{"name": r.name}, &result); err != nil {
+	if err := r.client.call(ctx, "checkpoint", nameParams{Name: r.name}, &result); err != nil {
 		return Checkpoint{}, err
 	}
 	return Checkpoint{Replay: result.Replay, Offset: result.Offset}, nil
@@ -276,8 +266,8 @@ func (r *remoteSession) Recover(ctx context.Context, offset, end int64) ([]byte,
 	var result struct {
 		Data []byte `json:"data"`
 	}
-	if err := r.client.call(ctx, "recover", map[string]any{
-		"name": r.name, "offset": offset, "end": end,
+	if err := r.client.call(ctx, "recover", recoverParams{
+		Name: r.name, Offset: offset, End: end,
 	}, &result); err != nil {
 		return nil, err
 	}
@@ -288,7 +278,7 @@ func (r *remoteSession) SpoolPath() string {
 	var result struct {
 		Path string `json:"path"`
 	}
-	if err := r.client.call(context.Background(), "spoolPath", map[string]string{"name": r.name}, &result); err != nil {
+	if err := r.client.call(context.Background(), "spoolPath", nameParams{Name: r.name}, &result); err != nil {
 		return ""
 	}
 	return result.Path
@@ -298,7 +288,7 @@ func (r *remoteSession) SpoolSize(ctx context.Context) (int64, error) {
 	var result struct {
 		Size int64 `json:"size"`
 	}
-	if err := r.client.call(ctx, "spoolSize", map[string]string{"name": r.name}, &result); err != nil {
+	if err := r.client.call(ctx, "spoolSize", nameParams{Name: r.name}, &result); err != nil {
 		return 0, err
 	}
 	return result.Size, nil
@@ -324,7 +314,7 @@ func (r *remoteSession) Close() error {
 	if r.closed.Load() {
 		return nil
 	}
-	return r.client.call(context.Background(), "close", map[string]string{"name": r.name}, nil)
+	return r.client.call(context.Background(), "close", nameParams{Name: r.name}, nil)
 }
 
 func (r *remoteSession) Remove() error {
@@ -334,7 +324,7 @@ func (r *remoteSession) Remove() error {
 	var result struct {
 		Exit *ExitError `json:"exit"`
 	}
-	if err := r.client.call(context.Background(), "remove", map[string]string{"name": r.name}, &result); err != nil {
+	if err := r.client.call(context.Background(), "remove", nameParams{Name: r.name}, &result); err != nil {
 		return err
 	}
 	if result.Exit != nil {
@@ -357,13 +347,13 @@ func (r *remoteSession) closeDone() {
 }
 
 func (r *remoteSession) TruncateSpool(ctx context.Context) error {
-	return r.client.call(ctx, "truncateSpool", map[string]string{"name": r.name}, nil)
+	return r.client.call(ctx, "truncateSpool", nameParams{Name: r.name}, nil)
 }
 
 func (r *remoteSession) ArchiveSpool(ctx context.Context) error {
-	return r.client.call(ctx, "archiveSpool", map[string]string{"name": r.name}, nil)
+	return r.client.call(ctx, "archiveSpool", nameParams{Name: r.name}, nil)
 }
 
 func (r *remoteSession) RemoveSpool() {
-	_ = r.client.call(context.Background(), "removeSpool", map[string]string{"name": r.name}, nil)
+	_ = r.client.call(context.Background(), "removeSpool", nameParams{Name: r.name}, nil)
 }

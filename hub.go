@@ -34,7 +34,6 @@ type SessionOptions struct {
 	// Size is the initial grid size. A zero value uses the hub's default.
 	Size Size
 	// Environment entries use KEY=value form and override inherited values.
-	// TERM and COLORTERM default to xterm-256color and truecolor.
 	Environment []string
 }
 
@@ -45,6 +44,7 @@ type Hub struct {
 
 	mu       sync.Mutex
 	sessions map[string]*sessionState
+	pending  map[string]struct{}
 	closed   bool
 }
 
@@ -62,11 +62,12 @@ func New(options Options) (*Hub, error) {
 		outputDir:   dir,
 		defaultSize: size,
 		sessions:    make(map[string]*sessionState),
+		pending:     make(map[string]struct{}),
 	}, nil
 }
 
 // Start creates and starts a session.
-func (h *Hub) Start(ctx context.Context, options SessionOptions) (*Session, error) {
+func (h *Hub) Start(ctx context.Context, options SessionOptions) (Session, error) {
 	if err := validateName(options.Name); err != nil {
 		return nil, err
 	}
@@ -82,37 +83,62 @@ func (h *Hub) Start(ctx context.Context, options SessionOptions) (*Session, erro
 	}
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.closed {
+		h.mu.Unlock()
 		return nil, ErrClosed
 	}
-	if h.sessions[options.Name] != nil {
+	if _, exists := h.pending[options.Name]; exists || h.sessions[options.Name] != nil {
+		h.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrSessionExists, options.Name)
 	}
+	h.pending[options.Name] = struct{}{}
+	h.mu.Unlock()
+
+	release := func() {
+		h.mu.Lock()
+		delete(h.pending, options.Name)
+		h.mu.Unlock()
+	}
 	if err := os.MkdirAll(h.outputDir, 0o700); err != nil {
+		release()
 		return nil, fmt.Errorf("create output dir: %w", err)
 	}
 	path := filepath.Join(h.outputDir, options.Name+spoolSuffix)
 	state, err := startSession(ctx, options, size, path)
 	if err != nil {
+		release()
 		return nil, err
 	}
+
+	h.mu.Lock()
+	delete(h.pending, options.Name)
+	if h.closed {
+		h.mu.Unlock()
+		_ = terminate(state)
+		return nil, ErrClosed
+	}
+	if h.sessions[options.Name] != nil {
+		h.mu.Unlock()
+		_ = terminate(state)
+		return nil, fmt.Errorf("%w: %s", ErrSessionExists, options.Name)
+	}
 	h.sessions[options.Name] = state
+	h.mu.Unlock()
 	go copyOutput(state)
-	return &Session{backend: &localSession{hub: h, state: state}}, nil
+	return &localSession{hub: h, state: state}, nil
 }
 
 // Session returns a handle for a known session name.
-func (h *Hub) Session(name string) (*Session, bool) {
+func (h *Hub) Session(name string) (Session, bool) {
 	state := h.session(name)
 	if state == nil {
 		return nil, false
 	}
-	return &Session{backend: &localSession{hub: h, state: state}}, true
+	return &localSession{hub: h, state: state}, true
 }
 
 // Sessions returns all known sessions ordered by creation time and name.
-func (h *Hub) Sessions() []*Session {
+func (h *Hub) Sessions() []Session {
 	h.mu.Lock()
 	states := make([]*sessionState, 0, len(h.sessions))
 	for _, state := range h.sessions {
@@ -126,9 +152,9 @@ func (h *Hub) Sessions() []*Session {
 		}
 		return left.createdAt.Before(right.createdAt)
 	})
-	sessions := make([]*Session, 0, len(states))
+	sessions := make([]Session, 0, len(states))
 	for _, state := range states {
-		sessions = append(sessions, &Session{backend: &localSession{hub: h, state: state}})
+		sessions = append(sessions, &localSession{hub: h, state: state})
 	}
 	return sessions
 }

@@ -21,7 +21,7 @@ import (
 const commandPrefix = byte(0x02) // Ctrl-B
 
 type window struct {
-	session   *ghostline.Session
+	session   ghostline.Session
 	watcher   *ghostline.SpoolWatcher
 	responder *ghostline.QueryResponder
 }

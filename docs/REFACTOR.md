@@ -60,3 +60,40 @@ implemented and verified.
 - [x] Malformed and oversized request tests
 - [x] Fuzz coverage for the RPC line parser and `QueryResponder`
 - [x] CI workflow (macOS full tests, Linux no-cgo build, gofmt/vet)
+
+## Beauty pass
+
+- [x] `session.go`: drop the 19-method forwarding layer; embed small composed
+  interfaces; make `Status` a public struct with exit information
+- [x] `hub.go`: keep the name reservation lock short; start the child outside
+  the lock with a pending reservation
+- [x] `process.go`: make termination bounded and event-driven; stop overriding
+  `TERM`/`COLORTERM`/`NO_COLOR` for the child
+- [x] `client.go`/`server.go`: replace remote wait polling with a blocking
+  `wait` RPC and cancellation on disconnect
+- [x] `server.go`: replace repeated inline params with shared param types and
+  a small decode helper
+- [x] `rpc.go`: add the decode helper and shared request types
+- [x] `errors.go`/`size.go`/`spool.go`/`query.go`/`terminal.go`/`util.go`:
+  remove noise comments, keep only why-comments
+- [x] Tests: update environment semantics, remote wait, and status assertions
+- [x] README: document inherited environment and event-driven remote waits
+
+## File review
+
+- [x] `doc.go`
+- [x] `errors.go`
+- [x] `size.go`
+- [x] `hub.go`
+- [x] `session.go`
+- [x] `process.go`
+- [x] `spool.go`
+- [x] `query.go`
+- [x] `terminal.go` / `terminal_nocgo.go`
+- [x] `rpc.go`
+- [x] `client.go`
+- [x] `server.go`
+- [x] `util.go`
+- [x] `cmd/ghostline/main.go`
+- [x] `examples/minimux/main.go`
+- [x] tests

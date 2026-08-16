@@ -117,26 +117,57 @@ func (s *Server) handle(connection net.Conn) {
 			_ = writeResponse(writer, -1, nil, fmt.Errorf("invalid request: %w", err))
 			continue
 		}
-		result, dispatchErr := s.dispatch(req.Method, req.Params)
+
+		ctx := context.Background()
+		if req.Method == "wait" {
+			ctx, cancel := context.WithCancel(ctx)
+			stop := make(chan struct{})
+			go monitorConnection(connection, cancel, stop)
+			result, dispatchErr := s.dispatch(ctx, req.Method, req.Params)
+			close(stop)
+			_ = connection.SetReadDeadline(time.Now())
+			cancel()
+			if err := writeResponse(writer, req.ID, result, dispatchErr); err != nil {
+				return
+			}
+			continue
+		}
+
+		result, dispatchErr := s.dispatch(ctx, req.Method, req.Params)
 		if err := writeResponse(writer, req.ID, result, dispatchErr); err != nil {
 			return
 		}
 	}
 }
 
-func (s *Server) dispatch(method string, raw json.RawMessage) (any, error) {
-	ctx := context.Background()
+// monitorConnection cancels wait dispatch when the client stops reading.
+func monitorConnection(connection net.Conn, cancel context.CancelFunc, stop <-chan struct{}) {
+	buffer := make([]byte, 1)
+	for {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		_ = connection.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		_, err := connection.Read(buffer)
+		if err == nil {
+			cancel()
+			return
+		}
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			continue
+		}
+		cancel()
+		return
+	}
+}
+
+func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessage) (any, error) {
 	switch method {
 	case "create":
-		var params struct {
-			Name    string   `json:"name"`
-			Dir     string   `json:"dir"`
-			Command string   `json:"command"`
-			Cols    int      `json:"cols"`
-			Rows    int      `json:"rows"`
-			Env     []string `json:"env"`
-		}
-		if err := json.Unmarshal(raw, &params); err != nil {
+		params, err := decode[createParams](raw)
+		if err != nil {
 			return nil, err
 		}
 		session, err := s.hub.Start(ctx, SessionOptions{
@@ -152,48 +183,63 @@ func (s *Server) dispatch(method string, raw json.RawMessage) (any, error) {
 		return map[string]int64{"created": session.CreatedAt().Unix()}, nil
 
 	case "status":
-		name, err := nameParam(raw)
+		params, err := decode[nameParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		session, ok := s.hub.Session(name)
+		session, ok := s.hub.Session(params.Name)
 		if !ok {
-			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, name)
+			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, params.Name)
 		}
-		return session.status(), nil
+		return session.Status(ctx)
+
+	case "wait":
+		params, err := decode[nameParams](raw)
+		if err != nil {
+			return nil, err
+		}
+		session, ok := s.hub.Session(params.Name)
+		if !ok {
+			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, params.Name)
+		}
+		_ = session.Wait(ctx)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return session.Status(ctx)
 
 	case "close":
-		name, err := nameParam(raw)
+		params, err := decode[nameParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		session, ok := s.hub.Session(name)
+		session, ok := s.hub.Session(params.Name)
 		if !ok {
-			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, name)
+			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, params.Name)
 		}
 		return nil, session.Close()
 
 	case "remove":
-		name, err := nameParam(raw)
+		params, err := decode[nameParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		session, ok := s.hub.Session(name)
+		session, ok := s.hub.Session(params.Name)
 		if !ok {
-			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, name)
+			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, params.Name)
 		}
-		status := session.status()
+		status, err := session.Status(ctx)
+		if err != nil {
+			return nil, err
+		}
 		if err := session.Remove(); err != nil {
 			return nil, err
 		}
 		return map[string]any{"exit": status.Exit}, nil
 
 	case "input":
-		var params struct {
-			Name string `json:"name"`
-			Data []byte `json:"data"`
-		}
-		if err := json.Unmarshal(raw, &params); err != nil {
+		params, err := decode[inputParams](raw)
+		if err != nil {
 			return nil, err
 		}
 		session, ok := s.hub.Session(params.Name)
@@ -203,12 +249,8 @@ func (s *Server) dispatch(method string, raw json.RawMessage) (any, error) {
 		return nil, session.Input(ctx, params.Data)
 
 	case "resize":
-		var params struct {
-			Name string `json:"name"`
-			Cols int    `json:"cols"`
-			Rows int    `json:"rows"`
-		}
-		if err := json.Unmarshal(raw, &params); err != nil {
+		params, err := decode[resizeParams](raw)
+		if err != nil {
 			return nil, err
 		}
 		session, ok := s.hub.Session(params.Name)
@@ -218,13 +260,13 @@ func (s *Server) dispatch(method string, raw json.RawMessage) (any, error) {
 		return nil, session.Resize(ctx, Size{Columns: params.Cols, Rows: params.Rows})
 
 	case "snapshot":
-		name, err := nameParam(raw)
+		params, err := decode[nameParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		session, ok := s.hub.Session(name)
+		session, ok := s.hub.Session(params.Name)
 		if !ok {
-			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, name)
+			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, params.Name)
 		}
 		data, err := session.Snapshot(ctx)
 		if err != nil {
@@ -233,13 +275,13 @@ func (s *Server) dispatch(method string, raw json.RawMessage) (any, error) {
 		return map[string][]byte{"data": data}, nil
 
 	case "checkpoint":
-		name, err := nameParam(raw)
+		params, err := decode[nameParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		session, ok := s.hub.Session(name)
+		session, ok := s.hub.Session(params.Name)
 		if !ok {
-			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, name)
+			return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, params.Name)
 		}
 		checkpoint, err := session.Checkpoint(ctx)
 		if err != nil {
@@ -251,12 +293,8 @@ func (s *Server) dispatch(method string, raw json.RawMessage) (any, error) {
 		}, nil
 
 	case "recover":
-		var params struct {
-			Name   string `json:"name"`
-			Offset int64  `json:"offset"`
-			End    int64  `json:"end"`
-		}
-		if err := json.Unmarshal(raw, &params); err != nil {
+		params, err := decode[recoverParams](raw)
+		if err != nil {
 			return nil, err
 		}
 		path := s.hub.spoolPath(params.Name)
@@ -270,43 +308,43 @@ func (s *Server) dispatch(method string, raw json.RawMessage) (any, error) {
 		return map[string][]byte{"data": data}, nil
 
 	case "spoolPath":
-		name, err := nameParam(raw)
+		params, err := decode[nameParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		return map[string]string{"path": s.hub.spoolPath(name)}, nil
+		return map[string]string{"path": s.hub.spoolPath(params.Name)}, nil
 
 	case "spoolSize":
-		name, err := nameParam(raw)
+		params, err := decode[nameParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		size, err := spoolSize(s.hub.spoolPath(name))
+		size, err := spoolSize(s.hub.spoolPath(params.Name))
 		if err != nil {
 			return nil, err
 		}
 		return map[string]int64{"size": size}, nil
 
 	case "truncateSpool":
-		name, err := nameParam(raw)
+		params, err := decode[nameParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		return nil, truncateSpool(s.hub.spoolPath(name))
+		return nil, truncateSpool(s.hub.spoolPath(params.Name))
 
 	case "archiveSpool":
-		name, err := nameParam(raw)
+		params, err := decode[nameParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		return nil, archiveSpool(s.hub.spoolPath(name))
+		return nil, archiveSpool(s.hub.spoolPath(params.Name))
 
 	case "removeSpool":
-		name, err := nameParam(raw)
+		params, err := decode[nameParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		removeSpool(s.hub.spoolPath(name))
+		removeSpool(s.hub.spoolPath(params.Name))
 		return nil, nil
 
 	case "list":
@@ -320,14 +358,4 @@ func (s *Server) dispatch(method string, raw json.RawMessage) (any, error) {
 	default:
 		return nil, fmt.Errorf("unknown method: %s", method)
 	}
-}
-
-func nameParam(raw json.RawMessage) (string, error) {
-	var params struct {
-		Name string `json:"name"`
-	}
-	if err := json.Unmarshal(raw, &params); err != nil {
-		return "", err
-	}
-	return params.Name, nil
 }

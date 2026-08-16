@@ -32,7 +32,7 @@ func newHub(t *testing.T, options ghostline.Options) *ghostline.Hub {
 	return hub
 }
 
-func waitSpool(t *testing.T, session *ghostline.Session, needle string) {
+func waitSpool(t *testing.T, session ghostline.Session, needle string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -111,22 +111,22 @@ func TestHubInputReachesChild(t *testing.T) {
 	waitSpool(t, session, "hub-input-ok")
 }
 
-func TestHubChildHasStableColorEnvironment(t *testing.T) {
+func TestHubChildInheritsEnvironment(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
 	hub := newHub(t, ghostline.Options{})
 	session, err := hub.Start(context.Background(), ghostline.SessionOptions{
 		Name:        "env",
 		Directory:   t.TempDir(),
 		Command:     "sh",
-		Environment: []string{"GHOSTLINE_TEST=value", "TERM=custom-term"},
+		Environment: []string{"GHOSTLINE_TEST=value", "TERM=custom-term", "NO_COLOR="},
 	})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if err := session.Input(context.Background(), []byte("echo TERM=$TERM COLORTERM=$COLORTERM NO_COLOR=$NO_COLOR TEST=$GHOSTLINE_TEST\r")); err != nil {
+	if err := session.Input(context.Background(), []byte("echo TERM=$TERM NO_COLOR=$NO_COLOR TEST=$GHOSTLINE_TEST\r")); err != nil {
 		t.Fatalf("Input: %v", err)
 	}
-	waitSpool(t, session, "TERM=custom-term COLORTERM=truecolor NO_COLOR= TEST=value")
+	waitSpool(t, session, "TERM=custom-term NO_COLOR= TEST=value")
 }
 
 func TestSessionRecoverReadsSpoolRange(t *testing.T) {
@@ -406,7 +406,7 @@ oldSeen:
 	watcher.Close()
 }
 
-func spoolSizeOf(t *testing.T, session *ghostline.Session) int64 {
+func spoolSizeOf(t *testing.T, session ghostline.Session) int64 {
 	t.Helper()
 	size, err := session.SpoolSize(context.Background())
 	if err != nil {

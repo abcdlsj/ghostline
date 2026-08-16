@@ -14,6 +14,36 @@ const (
 	maxConnections = 64
 )
 
+type nameParams struct {
+	Name string `json:"name"`
+}
+
+type createParams struct {
+	Name    string   `json:"name"`
+	Dir     string   `json:"dir"`
+	Command string   `json:"command"`
+	Cols    int      `json:"cols"`
+	Rows    int      `json:"rows"`
+	Env     []string `json:"env"`
+}
+
+type inputParams struct {
+	Name string `json:"name"`
+	Data []byte `json:"data"`
+}
+
+type resizeParams struct {
+	Name string `json:"name"`
+	Cols int    `json:"cols"`
+	Rows int    `json:"rows"`
+}
+
+type recoverParams struct {
+	Name   string `json:"name"`
+	Offset int64  `json:"offset"`
+	End    int64  `json:"end"`
+}
+
 type request struct {
 	ID     int64           `json:"id"`
 	Method string          `json:"method"`
@@ -113,4 +143,12 @@ func readLine(reader *bufio.Reader, limit int) ([]byte, error) {
 		}
 		return nil, err
 	}
+}
+
+func decode[T any](raw json.RawMessage) (T, error) {
+	var value T
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return value, err
+	}
+	return value, nil
 }

@@ -11,112 +11,57 @@ import (
 	"time"
 )
 
-type sessionBackend interface {
+// Session is a stable handle to one session, local or remote.
+type Session interface {
+	// Name returns the session's unique name.
 	Name() string
+	// CreatedAt returns when the child process started.
 	CreatedAt() time.Time
+	// Done is closed after the child exits and all output is consumed.
 	Done() <-chan struct{}
+	// Wait waits for the child and returns its exit error. Context
+	// cancellation stops waiting but does not terminate the child.
 	Wait(ctx context.Context) error
+	// Alive reports whether the session is currently running.
 	Alive() bool
-	Status(ctx context.Context) (bool, error)
+	// Status distinguishes a running session from a stopped one and reports
+	// the exit reason when stopped.
+	Status(ctx context.Context) (Status, error)
+	// Input writes bytes to the PTY verbatim.
 	Input(ctx context.Context, data []byte) error
+	// Resize updates the real PTY and the emulated grid.
 	Resize(ctx context.Context, size Size) error
+	// Snapshot returns a full VT replay of the visible grid and scrollback.
 	Snapshot(ctx context.Context) ([]byte, error)
+	// Checkpoint captures a replay and its exact spool boundary atomically.
 	Checkpoint(ctx context.Context) (Checkpoint, error)
+	// Recover reads the raw spool range [offset, end).
 	Recover(ctx context.Context, offset, end int64) ([]byte, error)
+	// SpoolPath returns the append-only raw output spool path.
 	SpoolPath() string
+	// SpoolSize returns the current raw output spool size.
 	SpoolSize(ctx context.Context) (int64, error)
+	// WatchOutput subscribes to raw output and starts the watcher.
 	WatchOutput(options WatchOptions) (*SpoolWatcher, error)
+	// Close terminates the session. The record stays visible until Remove.
 	Close() error
+	// Remove deletes the session record. Spool files stay on disk.
 	Remove() error
+	// TruncateSpool compacts the live spool in place.
 	TruncateSpool(ctx context.Context) error
+	// ArchiveSpool compresses the spool and prunes old archives.
 	ArchiveSpool(ctx context.Context) error
+	// RemoveSpool deletes the spool and its archives.
 	RemoveSpool()
 }
 
-// Session is a stable handle to one session, local or remote.
-type Session struct {
-	backend sessionBackend
+// Status describes whether a session is running and, when stopped, why.
+type Status struct {
+	// Alive is true while the child process is running.
+	Alive bool `json:"alive"`
+	// Exit describes the termination when Alive is false.
+	Exit *ExitError `json:"exit,omitempty"`
 }
-
-// Name returns the session's unique name.
-func (s *Session) Name() string { return s.backend.Name() }
-
-// CreatedAt returns when the child process started.
-func (s *Session) CreatedAt() time.Time { return s.backend.CreatedAt() }
-
-// Done is closed after the child exits and all output has been consumed.
-func (s *Session) Done() <-chan struct{} { return s.backend.Done() }
-
-// Wait waits for the child and returns its exit error. Context cancellation
-// stops waiting but does not terminate the child.
-func (s *Session) Wait(ctx context.Context) error { return s.backend.Wait(ctx) }
-
-// Alive reports whether the session is currently running.
-func (s *Session) Alive() bool { return s.backend.Alive() }
-
-// Status reports whether the session is running, distinguishing a remote
-// network failure from a stopped session.
-func (s *Session) Status(ctx context.Context) (bool, error) {
-	return s.backend.Status(ctx)
-}
-
-// Input writes bytes to the PTY verbatim.
-func (s *Session) Input(ctx context.Context, data []byte) error {
-	return s.backend.Input(ctx, data)
-}
-
-// Resize updates the real PTY and the emulated grid.
-func (s *Session) Resize(ctx context.Context, size Size) error {
-	return s.backend.Resize(ctx, size)
-}
-
-// Snapshot returns a full VT replay of the visible grid and scrollback.
-func (s *Session) Snapshot(ctx context.Context) ([]byte, error) {
-	return s.backend.Snapshot(ctx)
-}
-
-// Checkpoint captures a replay and its exact spool boundary atomically.
-func (s *Session) Checkpoint(ctx context.Context) (Checkpoint, error) {
-	return s.backend.Checkpoint(ctx)
-}
-
-// Recover reads the raw spool range [offset, end).
-func (s *Session) Recover(ctx context.Context, offset, end int64) ([]byte, error) {
-	return s.backend.Recover(ctx, offset, end)
-}
-
-// SpoolPath returns the append-only raw output spool path.
-func (s *Session) SpoolPath() string { return s.backend.SpoolPath() }
-
-// SpoolSize returns the current raw output spool size.
-func (s *Session) SpoolSize(ctx context.Context) (int64, error) {
-	return s.backend.SpoolSize(ctx)
-}
-
-// WatchOutput subscribes to raw output and starts the watcher before returning.
-func (s *Session) WatchOutput(options WatchOptions) (*SpoolWatcher, error) {
-	return s.backend.WatchOutput(options)
-}
-
-// Close terminates the session. The record stays visible until Remove.
-func (s *Session) Close() error { return s.backend.Close() }
-
-// Remove deletes the session record. Spool files stay on disk.
-func (s *Session) Remove() error { return s.backend.Remove() }
-
-// TruncateSpool compacts the live spool in place.
-func (s *Session) TruncateSpool(ctx context.Context) error {
-	return s.backend.TruncateSpool(ctx)
-}
-
-// ArchiveSpool compresses the spool to a timestamped .gz file and prunes old
-// archives. Best-effort diagnostics; truncation must not depend on it.
-func (s *Session) ArchiveSpool(ctx context.Context) error {
-	return s.backend.ArchiveSpool(ctx)
-}
-
-// RemoveSpool deletes the spool and its archives.
-func (s *Session) RemoveSpool() { s.backend.RemoveSpool() }
 
 // Checkpoint is an atomic screen replay and raw output position.
 type Checkpoint struct {
@@ -174,8 +119,14 @@ func (l *localSession) Alive() bool {
 	}
 }
 
-func (l *localSession) Status(context.Context) (bool, error) {
-	return l.Alive(), nil
+func (l *localSession) Status(context.Context) (Status, error) {
+	if l.Alive() {
+		return Status{Alive: true}, nil
+	}
+	l.state.waitMu.Lock()
+	defer l.state.waitMu.Unlock()
+	exit, _ := convertExit(l.state.waitErr).(*ExitError)
+	return Status{Exit: exit}, nil
 }
 
 func (l *localSession) Input(ctx context.Context, data []byte) error {
@@ -442,23 +393,4 @@ func removeSpool(path string) {
 	for _, match := range mustGlob(path + ".*.gz") {
 		_ = os.Remove(match)
 	}
-}
-
-type sessionStatus struct {
-	Alive bool       `json:"alive"`
-	Exit  *ExitError `json:"exit,omitempty"`
-}
-
-func (s *Session) status() sessionStatus {
-	local, ok := s.backend.(*localSession)
-	if !ok {
-		return sessionStatus{}
-	}
-	if local.Alive() {
-		return sessionStatus{Alive: true}
-	}
-	local.state.waitMu.Lock()
-	defer local.state.waitMu.Unlock()
-	exit, _ := convertExit(local.state.waitErr).(*ExitError)
-	return sessionStatus{Exit: exit}
 }

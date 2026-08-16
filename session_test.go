@@ -11,7 +11,7 @@ import (
 	"github.com/abcdlsj/ghostline"
 )
 
-func waitForSpool(t *testing.T, session *ghostline.Session, needle string) {
+func waitForSpool(t *testing.T, session ghostline.Session, needle string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
