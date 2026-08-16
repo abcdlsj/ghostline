@@ -1,8 +1,12 @@
+//go:build cgo
+
 package ghostline
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/third_party/include
-#cgo LDFLAGS: -L${SRCDIR}/third_party/lib -lghostty-vt -Wl,-rpath,${SRCDIR}/third_party/lib
+#cgo darwin,arm64 LDFLAGS: -L${SRCDIR}/third_party/lib -lghostty-vt -Wl,-rpath,${SRCDIR}/third_party/lib
+#cgo darwin,!arm64 LDFLAGS: -lghostty-vt
+#cgo !darwin LDFLAGS: -lghostty-vt
 #include <stdlib.h>
 #include <ghostty/vt.h>
 */
@@ -24,7 +28,7 @@ type VTTerminal struct {
 }
 
 func NewVTTerminal(cols, rows int) (*VTTerminal, error) {
-	if cols <= 0 || rows <= 0 {
+	if cols <= 0 || rows <= 0 || cols > maxTerminalDimension || rows > maxTerminalDimension {
 		return nil, fmt.Errorf("invalid terminal size %dx%d", cols, rows)
 	}
 	opts := C.GhosttyTerminalOptions{
@@ -58,10 +62,10 @@ func (v *VTTerminal) Feed(data []byte) {
 func (v *VTTerminal) Resize(cols, rows int) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if v.terminal == nil || cols <= 0 || rows <= 0 {
+	if v.terminal == nil || cols <= 0 || rows <= 0 || cols > maxTerminalDimension || rows > maxTerminalDimension {
 		return
 	}
-	C.ghostty_terminal_resize(v.terminal, C.uint16_t(cols), C.uint16_t(rows), 8, 16)
+	_ = C.ghostty_terminal_resize(v.terminal, C.uint16_t(cols), C.uint16_t(rows), 8, 16)
 }
 
 // Snapshot renders the current emulated screen (visible grid + scrollback)

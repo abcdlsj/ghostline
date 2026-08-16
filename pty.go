@@ -3,6 +3,7 @@ package ghostline
 import (
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,24 +18,24 @@ import (
 	"github.com/creack/pty"
 )
 
-// PTY is a tmux-free runtime that owns one pseudo-terminal per session. The
-// daemon keeps the child alive after every client disconnects, and raw PTY
-// bytes are appended to the same per-session spool consumed by SpoolWatcher,
-// so the output pipeline (ring, recovery anchors, reanchor) is unchanged.
-//
-// Known differences from the tmux adapter:
-//   - Input bytes are written to the PTY verbatim, so there is no tmux
-//     paste-vs-key translation layer and kitty-protocol keys (for example
-//     Shift+Enter) reach the application unchanged.
-//   - A daemon restart closes the PTY master and ends its sessions. tmux
-//     sessions survive a daemon restart because tmux owns them; the PTY
-//     runtime owns children directly and does not implement adoption yet.
-type PTY struct {
+// Manager owns a set of pseudo-terminal sessions. Sessions keep running while
+// clients disconnect, but they remain children of the embedding process and
+// therefore do not survive that process exiting.
+type Manager struct {
+	// OutputDir is kept for compatibility with the original PTY API. New code
+	// should configure it with Options when constructing the manager and treat
+	// it as immutable afterwards.
 	OutputDir string
 
-	mu       sync.Mutex
-	sessions map[string]*ptySession
+	mu          sync.Mutex
+	sessions    map[string]*ptySession
+	closed      bool
+	defaultSize Size
 }
+
+// PTY is the compatibility name for Manager.
+// Deprecated: use Manager and New.
+type PTY = Manager
 
 type ptySession struct {
 	name      string
@@ -45,50 +46,86 @@ type ptySession struct {
 	createdAt time.Time
 
 	inputMu   sync.Mutex
+	outputMu  sync.Mutex
+	waitMu    sync.Mutex
+	waitErr   error
 	closeOnce sync.Once
 	done      chan struct{}
 	reaped    chan struct{}
 }
 
+// NewPTY constructs a manager with the legacy constructor.
+// Deprecated: use New with Options.
 func NewPTY(outputDir string) *PTY {
-	return &PTY{OutputDir: outputDir, sessions: map[string]*ptySession{}}
+	manager, _ := New(Options{OutputDir: outputDir})
+	return manager
 }
 
-// Check reports whether the runtime can start. Unlike tmux there is no
-// external binary to find, so the check always succeeds.
-func (p *PTY) Check(context.Context) error {
+// Check reports whether the manager can construct a libghostty-vt terminal.
+func (p *Manager) Check(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	terminal, err := NewVTTerminal(1, 1)
+	if err != nil {
+		return err
+	}
+	terminal.Close()
 	return nil
 }
 
-func (p *PTY) Create(_ context.Context, runtimeName, directory, command string) error {
-	p.mu.Lock()
-	if p.sessions[runtimeName] != nil {
-		p.mu.Unlock()
-		return fmt.Errorf("pty session already exists: %s", runtimeName)
-	}
-	p.mu.Unlock()
+// Create starts a session through the legacy name-based API.
+func (p *Manager) Create(ctx context.Context, runtimeName, directory, command string) error {
+	_, err := p.Start(ctx, SessionOptions{
+		Name:      runtimeName,
+		Directory: directory,
+		Command:   command,
+	})
+	return err
+}
 
-	if p.OutputDir == "" {
-		p.OutputDir = defaultOutputDirectory()
+func (p *Manager) start(ctx context.Context, options SessionOptions) (*Session, error) {
+	runtimeName := options.Name
+	if err := validateRuntimeName(runtimeName); err != nil {
+		return nil, err
 	}
-	if err := os.MkdirAll(p.OutputDir, 0o700); err != nil {
-		return fmt.Errorf("create runtime output directory: %w", err)
+	if err := validateEnvironment(options.Environment); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	size, err := options.Size.normalized(p.sessionDefaultSize())
+	if err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return nil, ErrClosed
+	}
+	if p.sessions[runtimeName] != nil {
+		return nil, fmt.Errorf("%w: %s", ErrSessionExists, runtimeName)
+	}
+
+	if err := os.MkdirAll(p.outputDir(), 0o700); err != nil {
+		return nil, fmt.Errorf("create runtime output directory: %w", err)
+	}
+	vt, err := NewVTTerminal(size.Columns, size.Rows)
+	if err != nil {
+		return nil, fmt.Errorf("create ghostty vt: %w", err)
 	}
 	spool, err := os.OpenFile(p.SpoolPath(runtimeName), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		return fmt.Errorf("open output spool: %w", err)
+		vt.Close()
+		return nil, fmt.Errorf("open output spool: %w", err)
 	}
-	vt, err := NewVTTerminal(120, 36)
-	if err != nil {
-		_ = spool.Close()
-		return fmt.Errorf("create ghostty vt: %w", err)
-	}
-	cmd := ptyCommand(directory, command)
-	master, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: 120, Rows: 36})
+	cmd := ptyCommand(options.Directory, options.Command, options.Environment)
+	master, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(size.Columns), Rows: uint16(size.Rows)})
 	if err != nil {
 		_ = spool.Close()
 		vt.Close()
-		return fmt.Errorf("start pty: %w", err)
+		return nil, fmt.Errorf("start pty: %w", err)
 	}
 	session := &ptySession{
 		name:      runtimeName,
@@ -100,21 +137,60 @@ func (p *PTY) Create(_ context.Context, runtimeName, directory, command string) 
 		done:      make(chan struct{}),
 		reaped:    make(chan struct{}),
 	}
-	p.mu.Lock()
-	p.sessions[runtimeName] = session
-	p.mu.Unlock()
 	// Persist creation metadata so a restarted daemon can still identify and
 	// reclaim orphaned children (see ListCreated and Kill).
-	_ = os.WriteFile(p.CreatedPath(runtimeName), []byte(strconv.FormatInt(session.createdAt.Unix(), 10)+"\n"), 0o600)
-	_ = os.WriteFile(p.PIDPath(runtimeName), []byte(strconv.Itoa(cmd.Process.Pid)+"\n"), 0o600)
+	if err := os.WriteFile(p.CreatedPath(runtimeName), []byte(strconv.FormatInt(session.createdAt.Unix(), 10)+"\n"), 0o600); err != nil {
+		abortStartedSession(session)
+		return nil, fmt.Errorf("write session creation metadata: %w", err)
+	}
+	if err := os.WriteFile(p.PIDPath(runtimeName), []byte(strconv.Itoa(cmd.Process.Pid)+"\n"), 0o600); err != nil {
+		_ = os.Remove(p.CreatedPath(runtimeName))
+		abortStartedSession(session)
+		return nil, fmt.Errorf("write session process metadata: %w", err)
+	}
+	p.sessions[runtimeName] = session
 	go p.copyOutput(session)
-	return nil
+	return &Session{manager: p, state: session}, nil
+}
+
+// Close terminates every managed session and releases its resources. A closed
+// runtime cannot create new sessions.
+func (p *Manager) Close() error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil
+	}
+	p.closed = true
+	sessions := make([]*ptySession, 0, len(p.sessions))
+	for name, session := range p.sessions {
+		sessions = append(sessions, session)
+		delete(p.sessions, name)
+	}
+	p.mu.Unlock()
+
+	var errs []error
+	for _, session := range sessions {
+		if err := p.terminate(session); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func abortStartedSession(session *ptySession) {
+	if session.command.Process != nil {
+		_ = syscall.Kill(-session.command.Process.Pid, syscall.SIGKILL)
+		_ = session.command.Process.Kill()
+	}
+	_ = session.master.Close()
+	_ = session.command.Wait()
+	session.close()
 }
 
 // ptyCommand builds the child command. An empty command starts the user's
-// shell; otherwise the command is executed through sh -lc, matching how tmux
-// runs new-session commands.
-func ptyCommand(directory, command string) *exec.Cmd {
+// shell; otherwise the command is executed through sh -lc.
+func ptyCommand(directory, command string, environment []string) *exec.Cmd {
 	var cmd *exec.Cmd
 	if strings.TrimSpace(command) == "" {
 		shell := os.Getenv("SHELL")
@@ -126,20 +202,18 @@ func ptyCommand(directory, command string) *exec.Cmd {
 		cmd = exec.Command("sh", "-lc", command)
 	}
 	cmd.Dir = directory
-	// tmux forces a known TERM on its panes; a bare daemon may otherwise
-	// inherit an empty TERM and programs (git diff, ls, TUIs) would suppress
-	// colors. Pin the same 256-color environment for every child so the
-	// rendered output is stable regardless of how the daemon was launched.
-	cmd.Env = ptyEnvironment()
+	// A service process may otherwise inherit an empty TERM and cause programs
+	// to suppress colors. Pin a stable color-capable default for every child.
+	cmd.Env = ptyEnvironment(environment)
 	return cmd
 }
 
-func ptyEnvironment() []string {
+func ptyEnvironment(overrides []string) []string {
 	env := make([]string, 0, len(os.Environ())+2)
 	for _, item := range os.Environ() {
 		if strings.HasPrefix(item, "TERM=") ||
 			strings.HasPrefix(item, "COLORTERM=") ||
-			// The daemon host may export NO_COLOR (for example when launched
+			// The embedding process may export NO_COLOR (for example when launched
 			// from an agent session). It must not leak into PTY children:
 			// ghostline pins a color-capable terminal and the client renderer
 			// handles colors itself, so applications like Codex would
@@ -149,47 +223,66 @@ func ptyEnvironment() []string {
 		}
 		env = append(env, item)
 	}
-	return append(env, "TERM=xterm-256color", "COLORTERM=truecolor")
+	env = append(env, "TERM=xterm-256color", "COLORTERM=truecolor")
+	return mergeEnvironment(env, overrides)
 }
 
 // copyOutput drains the PTY master into the append-only spool, then reaps
 // the child. The spool file descriptor stays O_APPEND, so TruncateSpool can
-// compact the file in place without stopping the drain, exactly like the
-// tmux pipe-pane path.
-func (p *PTY) copyOutput(session *ptySession) {
+// compact the file in place without stopping the drain.
+func (p *Manager) copyOutput(session *ptySession) {
 	defer close(session.done)
+	defer session.master.Close()
+	defer session.spool.Close()
 	buffer := make([]byte, 32*1024)
 	for {
 		read, err := session.master.Read(buffer)
 		if read > 0 {
 			chunk := buffer[:read]
+			session.outputMu.Lock()
 			_, _ = session.spool.Write(chunk)
 			session.vt.Feed(chunk)
+			session.outputMu.Unlock()
 		}
 		if err != nil {
 			break
 		}
 	}
-	_ = session.command.Wait()
+	waitErr := session.command.Wait()
+	session.waitMu.Lock()
+	session.waitErr = waitErr
+	session.waitMu.Unlock()
 	close(session.reaped)
 }
 
-// EnsurePipe is idempotent by construction: the PTY runtime owns the spool
-// from Create on, so there is no pipe to install on adopt.
-func (p *PTY) EnsurePipe(_ context.Context, runtimeName string) error {
+// EnsurePipe verifies that a session exists. It is retained for compatibility
+// with adapters that install output pipes lazily; Manager owns its spool from
+// session creation and therefore needs no additional setup.
+func (p *Manager) EnsurePipe(_ context.Context, runtimeName string) error {
+	if err := validateRuntimeName(runtimeName); err != nil {
+		return err
+	}
 	if p.session(runtimeName) == nil {
 		return fmt.Errorf("pty session not found: %s", runtimeName)
 	}
 	return nil
 }
 
-func (p *PTY) Input(_ context.Context, runtimeName string, data []byte) error {
-	if len(data) == 0 {
-		return nil
+// Input writes bytes to a named session's PTY verbatim.
+func (p *Manager) Input(_ context.Context, runtimeName string, data []byte) error {
+	if err := validateRuntimeName(runtimeName); err != nil {
+		return err
 	}
 	session := p.session(runtimeName)
 	if session == nil {
-		return fmt.Errorf("pty session not found: %s", runtimeName)
+		return fmt.Errorf("%w: %s", ErrSessionNotFound, runtimeName)
+	}
+	return writeSessionInput(session, data)
+}
+
+func writeSessionInput(session *ptySession, data []byte) error {
+	if len(data) == 0 {
+		return nil
 	}
 	session.inputMu.Lock()
 	defer session.inputMu.Unlock()
@@ -199,14 +292,25 @@ func (p *PTY) Input(_ context.Context, runtimeName string, data []byte) error {
 	return nil
 }
 
-func (p *PTY) Resize(_ context.Context, runtimeName string, columns, rows int) error {
+// Resize updates a named session's PTY and VT grid.
+func (p *Manager) Resize(_ context.Context, runtimeName string, columns, rows int) error {
 	if columns <= 0 || rows <= 0 {
 		return nil
 	}
+	if columns > maxTerminalDimension || rows > maxTerminalDimension {
+		return fmt.Errorf("invalid terminal size %dx%d", columns, rows)
+	}
+	if err := validateRuntimeName(runtimeName); err != nil {
+		return err
+	}
 	session := p.session(runtimeName)
 	if session == nil {
-		return fmt.Errorf("pty session not found: %s", runtimeName)
+		return fmt.Errorf("%w: %s", ErrSessionNotFound, runtimeName)
 	}
+	return resizeSession(session, columns, rows)
+}
+
+func resizeSession(session *ptySession, columns, rows int) error {
 	session.inputMu.Lock()
 	defer session.inputMu.Unlock()
 	if err := pty.Setsize(session.master, &pty.Winsize{Cols: uint16(columns), Rows: uint16(rows)}); err != nil {
@@ -220,11 +324,24 @@ func (p *PTY) Resize(_ context.Context, runtimeName string, columns, rows int) e
 // with SGR styles preserved, so the client can replay a complete snapshot at
 // its own size. This replaces the raw spool replay, which could not restore
 // the screen when the PTY history was produced at a different size.
-func (p *PTY) Capture(_ context.Context, runtimeName string) ([]byte, error) {
+func (p *Manager) Capture(_ context.Context, runtimeName string) ([]byte, error) {
+	if err := validateRuntimeName(runtimeName); err != nil {
+		return nil, err
+	}
 	session := p.session(runtimeName)
 	if session == nil {
-		return nil, fmt.Errorf("pty session not found: %s", runtimeName)
+		return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, runtimeName)
 	}
+	return captureSession(session)
+}
+
+func captureSession(session *ptySession) ([]byte, error) {
+	session.outputMu.Lock()
+	defer session.outputMu.Unlock()
+	return captureSessionLocked(session)
+}
+
+func captureSessionLocked(session *ptySession) ([]byte, error) {
 	snapshot, err := session.vt.Snapshot()
 	if err != nil {
 		return nil, err
@@ -236,10 +353,13 @@ func (p *PTY) Capture(_ context.Context, runtimeName string) ([]byte, error) {
 }
 
 // Recover returns the spool bytes in [offset, end), the raw PTY output a
-// client still needs after its anchor. Host prefers this over a full reanchor
+// client still needs after its anchor. Callers can prefer this over a full
 // snapshot whenever the spool still covers the anchor, so switching back to a
 // retained surface renders the missing tail without clearing the screen.
-func (p *PTY) Recover(_ context.Context, runtimeName string, offset, end int64) ([]byte, error) {
+func (p *Manager) Recover(_ context.Context, runtimeName string, offset, end int64) ([]byte, error) {
+	if err := validateRuntimeName(runtimeName); err != nil {
+		return nil, err
+	}
 	if p.session(runtimeName) == nil {
 		return nil, fmt.Errorf("pty session not found: %s", runtimeName)
 	}
@@ -274,7 +394,12 @@ func (p *PTY) Recover(_ context.Context, runtimeName string, offset, end int64) 
 	return data, nil
 }
 
-func (p *PTY) Kill(_ context.Context, runtimeName string) error {
+// Kill terminates a named session. If the current manager does not own it,
+// Kill uses persisted PID metadata to reclaim a process from an earlier run.
+func (p *Manager) Kill(_ context.Context, runtimeName string) error {
+	if err := validateRuntimeName(runtimeName); err != nil {
+		return err
+	}
 	session := p.session(runtimeName)
 	if session != nil {
 		p.removeSession(runtimeName)
@@ -292,7 +417,7 @@ func (p *PTY) Kill(_ context.Context, runtimeName string) error {
 	return nil
 }
 
-func (p *PTY) terminate(session *ptySession) error {
+func (p *Manager) terminate(session *ptySession) error {
 	select {
 	case <-session.done:
 		// The child already exited and was reaped by copyOutput.
@@ -323,7 +448,11 @@ func (s *ptySession) close() {
 	})
 }
 
-func (p *PTY) Exists(_ context.Context, runtimeName string) bool {
+// Exists reports whether a named session is currently running.
+func (p *Manager) Exists(_ context.Context, runtimeName string) bool {
+	if validateRuntimeName(runtimeName) != nil {
+		return false
+	}
 	session := p.session(runtimeName)
 	if session == nil {
 		return false
@@ -336,7 +465,8 @@ func (p *PTY) Exists(_ context.Context, runtimeName string) bool {
 	}
 }
 
-func (p *PTY) List(context.Context) (map[string]bool, error) {
+// List returns the names of all currently running sessions.
+func (p *Manager) List(context.Context) (map[string]bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	sessions := make(map[string]bool, len(p.sessions))
@@ -350,10 +480,9 @@ func (p *PTY) List(context.Context) (map[string]bool, error) {
 	return sessions, nil
 }
 
-// ListCreated returns live sessions with their creation time, persisted in
-// metadata files so a restarted daemon can reclaim orphans it no longer has
-// a process handle for.
-func (p *PTY) ListCreated(context.Context) (map[string]time.Time, error) {
+// ListCreated returns persisted session creation times. A restarted embedding
+// process can use them to identify and reclaim children it no longer owns.
+func (p *Manager) ListCreated(context.Context) (map[string]time.Time, error) {
 	matches, err := filepath.Glob(filepath.Join(p.outputDir(), "*"+spoolSuffix+createdSuffix))
 	if err != nil {
 		return nil, err
@@ -374,19 +503,38 @@ func (p *PTY) ListCreated(context.Context) (map[string]time.Time, error) {
 	return sessions, nil
 }
 
-func (p *PTY) SpoolPath(runtimeName string) string {
+// SpoolPath returns the raw output spool path, or an empty string for an
+// invalid session name.
+func (p *Manager) SpoolPath(runtimeName string) string {
+	if validateRuntimeName(runtimeName) != nil {
+		return ""
+	}
 	return filepath.Join(p.outputDir(), runtimeName+spoolSuffix)
 }
 
-func (p *PTY) CreatedPath(runtimeName string) string {
-	return p.SpoolPath(runtimeName) + createdSuffix
+// CreatedPath returns the persisted creation metadata path.
+func (p *Manager) CreatedPath(runtimeName string) string {
+	path := p.SpoolPath(runtimeName)
+	if path == "" {
+		return ""
+	}
+	return path + createdSuffix
 }
 
-func (p *PTY) PIDPath(runtimeName string) string {
-	return p.SpoolPath(runtimeName) + pidSuffix
+// PIDPath returns the persisted child process ID metadata path.
+func (p *Manager) PIDPath(runtimeName string) string {
+	path := p.SpoolPath(runtimeName)
+	if path == "" {
+		return ""
+	}
+	return path + pidSuffix
 }
 
-func (p *PTY) SpoolSize(_ context.Context, runtimeName string) (int64, error) {
+// SpoolSize returns the number of raw output bytes currently persisted.
+func (p *Manager) SpoolSize(_ context.Context, runtimeName string) (int64, error) {
+	if err := validateRuntimeName(runtimeName); err != nil {
+		return 0, err
+	}
 	info, err := os.Stat(p.SpoolPath(runtimeName))
 	if err != nil {
 		return 0, err
@@ -396,8 +544,11 @@ func (p *PTY) SpoolSize(_ context.Context, runtimeName string) (int64, error) {
 
 // TruncateSpool compacts the live spool in place. The copyOutput goroutine
 // keeps its O_APPEND file descriptor, so output continues into the same
-// inode from byte zero; Host bumps the epoch and reanchors clients.
-func (p *PTY) TruncateSpool(_ context.Context, runtimeName string) error {
+// inode from byte zero. Consumers should reset their offsets and reanchor.
+func (p *Manager) TruncateSpool(_ context.Context, runtimeName string) error {
+	if err := validateRuntimeName(runtimeName); err != nil {
+		return err
+	}
 	if err := os.Truncate(p.SpoolPath(runtimeName), 0); err != nil {
 		return fmt.Errorf("truncate output spool: %w", err)
 	}
@@ -406,11 +557,20 @@ func (p *PTY) TruncateSpool(_ context.Context, runtimeName string) error {
 
 // ArchiveSpool compresses the current spool to a timestamped .gz file and
 // prunes old archives. Best-effort diagnostics; truncation must not depend
-// on archive success. Mirrors the tmux adapter's spool helpers.
-func (p *PTY) ArchiveSpool(_ context.Context, runtimeName string) error {
+// on archive success.
+func (p *Manager) ArchiveSpool(_ context.Context, runtimeName string) error {
+	if err := validateRuntimeName(runtimeName); err != nil {
+		return err
+	}
 	path := p.SpoolPath(runtimeName)
 	info, err := os.Stat(path)
-	if err != nil || info.Size() == 0 {
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Size() == 0 {
 		return nil
 	}
 	archive := path + "." + strconv.FormatInt(time.Now().UnixNano(), 10) + ".gz"
@@ -441,7 +601,7 @@ func (p *PTY) ArchiveSpool(_ context.Context, runtimeName string) error {
 	return p.pruneArchives(path)
 }
 
-func (p *PTY) pruneArchives(path string) error {
+func (p *Manager) pruneArchives(path string) error {
 	matches, err := filepath.Glob(path + ".*.gz")
 	if err != nil {
 		return err
@@ -459,7 +619,12 @@ func (p *PTY) pruneArchives(path string) error {
 	return nil
 }
 
-func (p *PTY) RemoveSpool(runtimeName string) {
+// RemoveSpool removes a session's spool, metadata, and archives. Callers must
+// terminate the session and close its watchers first.
+func (p *Manager) RemoveSpool(runtimeName string) {
+	if validateRuntimeName(runtimeName) != nil {
+		return
+	}
 	_ = os.Remove(p.SpoolPath(runtimeName))
 	_ = os.Remove(p.CreatedPath(runtimeName))
 	_ = os.Remove(p.PIDPath(runtimeName))
@@ -468,20 +633,20 @@ func (p *PTY) RemoveSpool(runtimeName string) {
 	}
 }
 
-func (p *PTY) outputDir() string {
+func (p *Manager) outputDir() string {
 	if p.OutputDir != "" {
 		return p.OutputDir
 	}
 	return defaultOutputDirectory()
 }
 
-func (p *PTY) session(name string) *ptySession {
+func (p *Manager) session(name string) *ptySession {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.sessions[name]
 }
 
-func (p *PTY) removeSession(name string) {
+func (p *Manager) removeSession(name string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.sessions, name)
@@ -499,8 +664,16 @@ func readPID(path string) int {
 	return pid
 }
 
+func validateRuntimeName(name string) error {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\\") || strings.IndexByte(name, 0) >= 0 {
+		return fmt.Errorf("%w: %q", ErrInvalidSessionName, name)
+	}
+	return nil
+}
+
 const (
-	spoolSuffix   = ".out"
-	createdSuffix = ".created"
-	pidSuffix     = ".pid"
+	spoolSuffix          = ".out"
+	createdSuffix        = ".created"
+	pidSuffix            = ".pid"
+	maxTerminalDimension = 1<<16 - 1
 )

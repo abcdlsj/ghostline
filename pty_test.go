@@ -6,6 +6,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -13,7 +15,13 @@ import (
 
 func newTestPTY(t *testing.T) *PTY {
 	t.Helper()
-	return NewPTY(t.TempDir())
+	runtimeAdapter := NewPTY(t.TempDir())
+	t.Cleanup(func() {
+		if err := runtimeAdapter.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	return runtimeAdapter
 }
 
 func waitSpoolContains(t *testing.T, p *PTY, name, needle string) {
@@ -144,6 +152,98 @@ func TestPTYResize(t *testing.T) {
 	}
 	// stty size prints "rows cols"; we resized to 80 columns x 24 rows.
 	waitSpoolContains(t, runtimeAdapter, "ghost_test_resize", "24 80")
+}
+
+func TestPTYRejectsOversizedTerminalDimensions(t *testing.T) {
+	if terminal, err := NewVTTerminal(maxTerminalDimension+1, 24); err == nil {
+		terminal.Close()
+		t.Fatal("NewVTTerminal accepted dimensions that overflow uint16")
+	}
+
+	runtimeAdapter := newTestPTY(t)
+	ctx := context.Background()
+	if err := runtimeAdapter.Create(ctx, "ghost_test_large_resize", t.TempDir(), "sh"); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := runtimeAdapter.Resize(ctx, "ghost_test_large_resize", maxTerminalDimension+1, 24); err == nil {
+		t.Fatal("Resize accepted dimensions that overflow uint16")
+	}
+}
+
+func TestPTYCreateIsAtomicForDuplicateNames(t *testing.T) {
+	runtimeAdapter := newTestPTY(t)
+	ctx := context.Background()
+	const attempts = 8
+	workDir := t.TempDir()
+	start := make(chan struct{})
+	var successes atomic.Int32
+	var wait sync.WaitGroup
+	for range attempts {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			if err := runtimeAdapter.Create(ctx, "ghost_test_duplicate", workDir, "sleep 30"); err == nil {
+				successes.Add(1)
+			}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	if got := successes.Load(); got != 1 {
+		t.Fatalf("successful duplicate creates = %d, want 1", got)
+	}
+}
+
+func TestPTYRejectsUnsafeSessionNames(t *testing.T) {
+	outputDir := t.TempDir()
+	runtimeAdapter := NewPTY(outputDir)
+	t.Cleanup(func() { _ = runtimeAdapter.Close() })
+	ctx := context.Background()
+	for _, name := range []string{"", ".", "..", "../escape", `nested\\escape`} {
+		if err := runtimeAdapter.Create(ctx, name, t.TempDir(), "sleep 30"); err == nil {
+			t.Errorf("Create accepted unsafe name %q", name)
+		}
+		if path := runtimeAdapter.SpoolPath(name); path != "" {
+			t.Errorf("SpoolPath(%q) = %q, want empty", name, path)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(outputDir), "escape.out")); !os.IsNotExist(err) {
+		t.Fatalf("unsafe name created a spool outside the output directory: %v", err)
+	}
+}
+
+func TestPTYCreateCleansUpAfterMetadataFailure(t *testing.T) {
+	runtimeAdapter := newTestPTY(t)
+	name := "ghost_test_metadata_failure"
+	if err := os.MkdirAll(runtimeAdapter.CreatedPath(name), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtimeAdapter.Create(context.Background(), name, t.TempDir(), "sleep 30"); err == nil {
+		t.Fatal("Create succeeded despite an unwritable metadata path")
+	}
+	if runtimeAdapter.Exists(context.Background(), name) {
+		t.Fatal("failed Create left a managed session behind")
+	}
+}
+
+func TestPTYCloseTerminatesSessionsAndPreventsCreate(t *testing.T) {
+	runtimeAdapter := NewPTY(t.TempDir())
+	ctx := context.Background()
+	if err := runtimeAdapter.Create(ctx, "ghost_test_close", t.TempDir(), "sleep 30"); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	pid := readPID(runtimeAdapter.PIDPath("ghost_test_close"))
+	if err := runtimeAdapter.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	waitProcessGone(t, pid)
+	if err := runtimeAdapter.Create(ctx, "ghost_test_after_close", t.TempDir(), "sleep 30"); err == nil {
+		t.Fatal("Create succeeded after Close")
+	}
+	if err := runtimeAdapter.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
 }
 
 func TestPTYKillEndsChild(t *testing.T) {

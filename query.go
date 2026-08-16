@@ -8,10 +8,9 @@ import (
 
 // QueryResponder answers terminal capability queries while a session has no
 // attached terminal client. TUIs such as Codex send DA/DSR/OSC/kitty
-// keyboard queries at startup; tmux answers them through its own emulator,
-// but a raw PTY has nobody to answer until a client attaches, so the
-// application would downgrade itself (for example disabling colors). Replies
-// are written back into the PTY as input, never into the output spool.
+// keyboard queries at startup. A raw PTY has nobody to answer until a client
+// attaches, so the application may downgrade itself (for example disabling
+// colors). Replies are written back into the PTY as input, never into output.
 type QueryResponder struct {
 	mu      sync.Mutex
 	pending []byte

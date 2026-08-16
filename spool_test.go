@@ -3,6 +3,7 @@ package ghostline
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -78,6 +79,117 @@ func TestSpoolWatcherRejectsOffsetBeyondSize(t *testing.T) {
 	}
 	if _, err := NewSpoolWatcher(path, 3, nil, nil, nil); err == nil {
 		t.Fatal("offset beyond file size was accepted")
+	}
+}
+
+func TestSpoolWatcherReusesBufferAndAvoidsIdleReadBuffer(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.out")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	watcher, err := NewSpoolWatcher(path, 0, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer watcher.Close()
+
+	watcher.drain()
+	if watcher.buffer != nil {
+		t.Fatal("idle drain allocated a read buffer")
+	}
+	appendToFile(t, path, "abc")
+	watcher.drain()
+	if watcher.buffer == nil {
+		t.Fatal("non-empty drain did not allocate a read buffer")
+	}
+	buffer := &watcher.buffer[0]
+	watcher.drain()
+	if &watcher.buffer[0] != buffer {
+		t.Fatal("watcher replaced its read buffer")
+	}
+}
+
+func TestSpoolWatcherSkipToRequiresPauseAndValidOffset(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.out")
+	if err := os.WriteFile(path, []byte("abc"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	watcher, err := NewSpoolWatcher(path, 0, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer watcher.Close()
+
+	if err := watcher.SkipTo(1); err == nil {
+		t.Fatal("SkipTo succeeded while watcher was running")
+	}
+	watcher.Pause()
+	defer watcher.Resume()
+	if err := watcher.SkipTo(-1); err == nil {
+		t.Fatal("SkipTo accepted a negative offset")
+	}
+	if err := watcher.SkipTo(4); err == nil {
+		t.Fatal("SkipTo accepted an offset beyond EOF")
+	}
+	if err := watcher.SkipTo(2); err != nil {
+		t.Fatalf("SkipTo valid offset: %v", err)
+	}
+	if watcher.Offset() != 2 {
+		t.Fatalf("offset = %d, want 2", watcher.Offset())
+	}
+}
+
+func TestSpoolWatcherOffsetIsSafeDuringDrain(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.out")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	watcher, err := NewSpoolWatcher(path, 0, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer watcher.Close()
+
+	stop := make(chan struct{})
+	var wait sync.WaitGroup
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = watcher.Offset()
+			}
+		}
+	}()
+	for range 20 {
+		appendToFile(t, path, "x")
+		watcher.drain()
+	}
+	close(stop)
+	wait.Wait()
+	if watcher.Offset() != 20 {
+		t.Fatalf("offset = %d, want 20", watcher.Offset())
+	}
+}
+
+func BenchmarkSpoolWatcherIdleDrain(b *testing.B) {
+	path := filepath.Join(b.TempDir(), "session.out")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		b.Fatal(err)
+	}
+	watcher, err := NewSpoolWatcher(path, 0, nil, nil, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer watcher.Close()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		watcher.drain()
 	}
 }
 
