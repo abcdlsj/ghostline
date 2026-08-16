@@ -19,6 +19,14 @@ import (
 	"unsafe"
 )
 
+// snapshotContinuationMaxBytes is the terminal's replay-safe VT continuation
+// budget. Snapshot encoding requires the parser/UTF-8 continuation to be
+// tracked when a feed ends mid-sequence; without tracking, EncodeState returns
+// GHOSTTY_INVALID_VALUE for exactly the long-running TUI sessions we need to
+// migrate. One MiB covers the largest OSC/APC payloads without meaningful
+// per-session memory cost.
+const snapshotContinuationMaxBytes = 1 << 20
+
 // VTTerminal is a libghostty-vt terminal emulator that renders raw PTY bytes
 // into a complete screen snapshot (visible grid + scrollback) with SGR styles
 // preserved. It is the server-side counterpart of the Ghostty client, so a
@@ -42,7 +50,23 @@ func NewVTTerminal(cols, rows int) (*VTTerminal, error) {
 	); result != C.GHOSTTY_SUCCESS {
 		return nil, fmt.Errorf("ghostty terminal new failed: %d", result)
 	}
+	if err := enableContinuationTracking(terminal); err != nil {
+		C.ghostty_terminal_free(terminal)
+		return nil, err
+	}
 	return &VTTerminal{terminal: terminal}, nil
+}
+
+func enableContinuationTracking(terminal C.GhosttyTerminal) error {
+	maxContinuation := C.size_t(snapshotContinuationMaxBytes)
+	if result := C.ghostty_terminal_set(
+		terminal,
+		C.GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES,
+		unsafe.Pointer(&maxContinuation),
+	); result != C.GHOSTTY_SUCCESS {
+		return fmt.Errorf("enable continuation tracking: %d", result)
+	}
+	return nil
 }
 
 // Feed parses raw PTY bytes into the emulated terminal state.
@@ -111,6 +135,10 @@ func (v *VTTerminal) RestoreState(snapshot []byte) error {
 	var restored C.GhosttyTerminal
 	if result := C.ghostty_snapshot_decoder_decode(decoder, &restored); result != C.GHOSTTY_SUCCESS {
 		return fmt.Errorf("ghostty snapshot decode failed: %d", result)
+	}
+	if err := enableContinuationTracking(restored); err != nil {
+		C.ghostty_terminal_free(restored)
+		return err
 	}
 	C.ghostty_terminal_free(v.terminal)
 	v.terminal = restored
