@@ -27,10 +27,10 @@ type window struct {
 }
 
 type minimux struct {
-	manager *ghostline.Manager
-	stdin   *os.File
-	stdout  *os.File
-	dir     string
+	hub    *ghostline.Hub
+	stdin  *os.File
+	stdout *os.File
+	dir    string
 
 	windows []*window
 	current int
@@ -73,7 +73,7 @@ func run(initialCommand string) error {
 		return err
 	}
 	defer os.RemoveAll(outputDir)
-	manager, err := ghostline.New(ghostline.Options{
+	hub, err := ghostline.New(ghostline.Options{
 		OutputDir:   outputDir,
 		DefaultSize: size,
 	})
@@ -82,11 +82,11 @@ func run(initialCommand string) error {
 	}
 	workingDirectory, err := os.Getwd()
 	if err != nil {
-		_ = manager.Close()
+		_ = hub.Close()
 		return err
 	}
 	app := &minimux{
-		manager: manager,
+		hub:     hub,
 		stdin:   stdin,
 		stdout:  stdout,
 		dir:     workingDirectory,
@@ -162,7 +162,7 @@ func readInput(reader io.Reader, output chan<- []byte, failures chan<- error) {
 
 func (m *minimux) createWindow(command string) error {
 	m.nextID++
-	session, err := m.manager.Start(context.Background(), ghostline.SessionOptions{
+	session, err := m.hub.Start(context.Background(), ghostline.SessionOptions{
 		Name:      fmt.Sprintf("window-%d", m.nextID),
 		Directory: m.dir,
 		Command:   command,
@@ -354,5 +354,5 @@ func (m *minimux) shutdown() {
 	for _, w := range m.windows {
 		w.watcher.Close()
 	}
-	_ = m.manager.Close()
+	_ = m.hub.Close()
 }

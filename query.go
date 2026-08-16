@@ -18,10 +18,12 @@ type QueryResponder struct {
 	cols    int
 }
 
+// NewQueryResponder returns a responder initialized to a 120x36 terminal.
 func NewQueryResponder() *QueryResponder {
 	return &QueryResponder{rows: 36, cols: 120}
 }
 
+// Resize updates the window size reported in XTWINOPS replies.
 func (r *QueryResponder) Resize(columns, rows int) {
 	if columns <= 0 || rows <= 0 {
 		return

@@ -27,6 +27,7 @@ type VTTerminal struct {
 	terminal C.GhosttyTerminal
 }
 
+// NewVTTerminal creates a terminal emulator with the given grid size.
 func NewVTTerminal(cols, rows int) (*VTTerminal, error) {
 	if cols <= 0 || rows <= 0 || cols > maxTerminalDimension || rows > maxTerminalDimension {
 		return nil, fmt.Errorf("invalid terminal size %dx%d", cols, rows)
@@ -96,6 +97,7 @@ func (v *VTTerminal) Snapshot() ([]byte, error) {
 	return C.GoBytes(unsafe.Pointer(buffer), C.int(length)), nil
 }
 
+// Close releases the native terminal state. It must be called at most once.
 func (v *VTTerminal) Close() {
 	v.mu.Lock()
 	defer v.mu.Unlock()

@@ -18,13 +18,13 @@ import (
 	"github.com/creack/pty"
 )
 
-// Manager owns a set of pseudo-terminal sessions. Sessions keep running while
+// Hub owns a set of pseudo-terminal sessions. Sessions keep running while
 // clients disconnect, but they remain children of the embedding process and
 // therefore do not survive that process exiting.
-type Manager struct {
-	// OutputDir is kept for compatibility with the original PTY API. New code
-	// should configure it with Options when constructing the manager and treat
-	// it as immutable afterwards.
+type Hub struct {
+	// OutputDir is the directory used for spool and metadata files.
+	//
+	// Deprecated: configure Options.OutputDir when constructing the hub.
 	OutputDir string
 
 	mu          sync.Mutex
@@ -33,9 +33,9 @@ type Manager struct {
 	defaultSize Size
 }
 
-// PTY is the compatibility name for Manager.
-// Deprecated: use Manager and New.
-type PTY = Manager
+// PTY is the compatibility name for Hub.
+// Deprecated: use Hub and New.
+type PTY = Hub
 
 type ptySession struct {
 	name      string
@@ -54,15 +54,15 @@ type ptySession struct {
 	reaped    chan struct{}
 }
 
-// NewPTY constructs a manager with the legacy constructor.
+// NewPTY constructs a hub with the legacy constructor.
 // Deprecated: use New with Options.
 func NewPTY(outputDir string) *PTY {
-	manager, _ := New(Options{OutputDir: outputDir})
-	return manager
+	hub, _ := New(Options{OutputDir: outputDir})
+	return hub
 }
 
-// Check reports whether the manager can construct a libghostty-vt terminal.
-func (p *Manager) Check(ctx context.Context) error {
+// Check reports whether the hub can construct a libghostty-vt terminal.
+func (p *Hub) Check(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -75,7 +75,7 @@ func (p *Manager) Check(ctx context.Context) error {
 }
 
 // Create starts a session through the legacy name-based API.
-func (p *Manager) Create(ctx context.Context, runtimeName, directory, command string) error {
+func (p *Hub) Create(ctx context.Context, runtimeName, directory, command string) error {
 	_, err := p.Start(ctx, SessionOptions{
 		Name:      runtimeName,
 		Directory: directory,
@@ -84,7 +84,7 @@ func (p *Manager) Create(ctx context.Context, runtimeName, directory, command st
 	return err
 }
 
-func (p *Manager) start(ctx context.Context, options SessionOptions) (*Session, error) {
+func (p *Hub) start(ctx context.Context, options SessionOptions) (*Session, error) {
 	runtimeName := options.Name
 	if err := validateRuntimeName(runtimeName); err != nil {
 		return nil, err
@@ -105,7 +105,16 @@ func (p *Manager) start(ctx context.Context, options SessionOptions) (*Session, 
 		return nil, ErrClosed
 	}
 	if p.sessions[runtimeName] != nil {
-		return nil, fmt.Errorf("%w: %s", ErrSessionExists, runtimeName)
+		// A live session keeps its name. An exited one may be replaced by a
+		// fresh session with the same name; the old handle then fails with
+		// ErrSessionClosed because the map now points at the replacement.
+		select {
+		case <-p.sessions[runtimeName].done:
+			_ = os.Truncate(p.SpoolPath(runtimeName), 0)
+			delete(p.sessions, runtimeName)
+		default:
+			return nil, fmt.Errorf("%w: %s", ErrSessionExists, runtimeName)
+		}
 	}
 
 	if err := os.MkdirAll(p.outputDir(), 0o700); err != nil {
@@ -150,12 +159,12 @@ func (p *Manager) start(ctx context.Context, options SessionOptions) (*Session, 
 	}
 	p.sessions[runtimeName] = session
 	go p.copyOutput(session)
-	return &Session{manager: p, state: session}, nil
+	return &Session{&localSession{hub: p, state: session}}, nil
 }
 
 // Close terminates every managed session and releases its resources. A closed
 // runtime cannot create new sessions.
-func (p *Manager) Close() error {
+func (p *Hub) Close() error {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -230,7 +239,7 @@ func ptyEnvironment(overrides []string) []string {
 // copyOutput drains the PTY master into the append-only spool, then reaps
 // the child. The spool file descriptor stays O_APPEND, so TruncateSpool can
 // compact the file in place without stopping the drain.
-func (p *Manager) copyOutput(session *ptySession) {
+func (p *Hub) copyOutput(session *ptySession) {
 	defer close(session.done)
 	defer session.master.Close()
 	defer session.spool.Close()
@@ -256,9 +265,9 @@ func (p *Manager) copyOutput(session *ptySession) {
 }
 
 // EnsurePipe verifies that a session exists. It is retained for compatibility
-// with adapters that install output pipes lazily; Manager owns its spool from
+// with adapters that install output pipes lazily; Hub owns its spool from
 // session creation and therefore needs no additional setup.
-func (p *Manager) EnsurePipe(_ context.Context, runtimeName string) error {
+func (p *Hub) EnsurePipe(_ context.Context, runtimeName string) error {
 	if err := validateRuntimeName(runtimeName); err != nil {
 		return err
 	}
@@ -269,7 +278,7 @@ func (p *Manager) EnsurePipe(_ context.Context, runtimeName string) error {
 }
 
 // Input writes bytes to a named session's PTY verbatim.
-func (p *Manager) Input(_ context.Context, runtimeName string, data []byte) error {
+func (p *Hub) Input(_ context.Context, runtimeName string, data []byte) error {
 	if err := validateRuntimeName(runtimeName); err != nil {
 		return err
 	}
@@ -293,7 +302,7 @@ func writeSessionInput(session *ptySession, data []byte) error {
 }
 
 // Resize updates a named session's PTY and VT grid.
-func (p *Manager) Resize(_ context.Context, runtimeName string, columns, rows int) error {
+func (p *Hub) Resize(_ context.Context, runtimeName string, columns, rows int) error {
 	if columns <= 0 || rows <= 0 {
 		return nil
 	}
@@ -324,7 +333,7 @@ func resizeSession(session *ptySession, columns, rows int) error {
 // with SGR styles preserved, so the client can replay a complete snapshot at
 // its own size. This replaces the raw spool replay, which could not restore
 // the screen when the PTY history was produced at a different size.
-func (p *Manager) Capture(_ context.Context, runtimeName string) ([]byte, error) {
+func (p *Hub) Capture(_ context.Context, runtimeName string) ([]byte, error) {
 	if err := validateRuntimeName(runtimeName); err != nil {
 		return nil, err
 	}
@@ -356,7 +365,7 @@ func captureSessionLocked(session *ptySession) ([]byte, error) {
 // client still needs after its anchor. Callers can prefer this over a full
 // snapshot whenever the spool still covers the anchor, so switching back to a
 // retained surface renders the missing tail without clearing the screen.
-func (p *Manager) Recover(_ context.Context, runtimeName string, offset, end int64) ([]byte, error) {
+func (p *Hub) Recover(_ context.Context, runtimeName string, offset, end int64) ([]byte, error) {
 	if err := validateRuntimeName(runtimeName); err != nil {
 		return nil, err
 	}
@@ -394,9 +403,9 @@ func (p *Manager) Recover(_ context.Context, runtimeName string, offset, end int
 	return data, nil
 }
 
-// Kill terminates a named session. If the current manager does not own it,
+// Kill terminates a named session. If the current hub does not own it,
 // Kill uses persisted PID metadata to reclaim a process from an earlier run.
-func (p *Manager) Kill(_ context.Context, runtimeName string) error {
+func (p *Hub) Kill(_ context.Context, runtimeName string) error {
 	if err := validateRuntimeName(runtimeName); err != nil {
 		return err
 	}
@@ -417,7 +426,7 @@ func (p *Manager) Kill(_ context.Context, runtimeName string) error {
 	return nil
 }
 
-func (p *Manager) terminate(session *ptySession) error {
+func (p *Hub) terminate(session *ptySession) error {
 	select {
 	case <-session.done:
 		// The child already exited and was reaped by copyOutput.
@@ -449,7 +458,7 @@ func (s *ptySession) close() {
 }
 
 // Exists reports whether a named session is currently running.
-func (p *Manager) Exists(_ context.Context, runtimeName string) bool {
+func (p *Hub) Exists(_ context.Context, runtimeName string) bool {
 	if validateRuntimeName(runtimeName) != nil {
 		return false
 	}
@@ -466,7 +475,7 @@ func (p *Manager) Exists(_ context.Context, runtimeName string) bool {
 }
 
 // List returns the names of all currently running sessions.
-func (p *Manager) List(context.Context) (map[string]bool, error) {
+func (p *Hub) List(context.Context) (map[string]bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	sessions := make(map[string]bool, len(p.sessions))
@@ -482,7 +491,7 @@ func (p *Manager) List(context.Context) (map[string]bool, error) {
 
 // ListCreated returns persisted session creation times. A restarted embedding
 // process can use them to identify and reclaim children it no longer owns.
-func (p *Manager) ListCreated(context.Context) (map[string]time.Time, error) {
+func (p *Hub) ListCreated(context.Context) (map[string]time.Time, error) {
 	matches, err := filepath.Glob(filepath.Join(p.outputDir(), "*"+spoolSuffix+createdSuffix))
 	if err != nil {
 		return nil, err
@@ -505,7 +514,7 @@ func (p *Manager) ListCreated(context.Context) (map[string]time.Time, error) {
 
 // SpoolPath returns the raw output spool path, or an empty string for an
 // invalid session name.
-func (p *Manager) SpoolPath(runtimeName string) string {
+func (p *Hub) SpoolPath(runtimeName string) string {
 	if validateRuntimeName(runtimeName) != nil {
 		return ""
 	}
@@ -513,7 +522,7 @@ func (p *Manager) SpoolPath(runtimeName string) string {
 }
 
 // CreatedPath returns the persisted creation metadata path.
-func (p *Manager) CreatedPath(runtimeName string) string {
+func (p *Hub) CreatedPath(runtimeName string) string {
 	path := p.SpoolPath(runtimeName)
 	if path == "" {
 		return ""
@@ -522,7 +531,7 @@ func (p *Manager) CreatedPath(runtimeName string) string {
 }
 
 // PIDPath returns the persisted child process ID metadata path.
-func (p *Manager) PIDPath(runtimeName string) string {
+func (p *Hub) PIDPath(runtimeName string) string {
 	path := p.SpoolPath(runtimeName)
 	if path == "" {
 		return ""
@@ -531,7 +540,7 @@ func (p *Manager) PIDPath(runtimeName string) string {
 }
 
 // SpoolSize returns the number of raw output bytes currently persisted.
-func (p *Manager) SpoolSize(_ context.Context, runtimeName string) (int64, error) {
+func (p *Hub) SpoolSize(_ context.Context, runtimeName string) (int64, error) {
 	if err := validateRuntimeName(runtimeName); err != nil {
 		return 0, err
 	}
@@ -545,7 +554,7 @@ func (p *Manager) SpoolSize(_ context.Context, runtimeName string) (int64, error
 // TruncateSpool compacts the live spool in place. The copyOutput goroutine
 // keeps its O_APPEND file descriptor, so output continues into the same
 // inode from byte zero. Consumers should reset their offsets and reanchor.
-func (p *Manager) TruncateSpool(_ context.Context, runtimeName string) error {
+func (p *Hub) TruncateSpool(_ context.Context, runtimeName string) error {
 	if err := validateRuntimeName(runtimeName); err != nil {
 		return err
 	}
@@ -558,7 +567,7 @@ func (p *Manager) TruncateSpool(_ context.Context, runtimeName string) error {
 // ArchiveSpool compresses the current spool to a timestamped .gz file and
 // prunes old archives. Best-effort diagnostics; truncation must not depend
 // on archive success.
-func (p *Manager) ArchiveSpool(_ context.Context, runtimeName string) error {
+func (p *Hub) ArchiveSpool(_ context.Context, runtimeName string) error {
 	if err := validateRuntimeName(runtimeName); err != nil {
 		return err
 	}
@@ -601,7 +610,7 @@ func (p *Manager) ArchiveSpool(_ context.Context, runtimeName string) error {
 	return p.pruneArchives(path)
 }
 
-func (p *Manager) pruneArchives(path string) error {
+func (p *Hub) pruneArchives(path string) error {
 	matches, err := filepath.Glob(path + ".*.gz")
 	if err != nil {
 		return err
@@ -621,7 +630,7 @@ func (p *Manager) pruneArchives(path string) error {
 
 // RemoveSpool removes a session's spool, metadata, and archives. Callers must
 // terminate the session and close its watchers first.
-func (p *Manager) RemoveSpool(runtimeName string) {
+func (p *Hub) RemoveSpool(runtimeName string) {
 	if validateRuntimeName(runtimeName) != nil {
 		return
 	}
@@ -633,20 +642,20 @@ func (p *Manager) RemoveSpool(runtimeName string) {
 	}
 }
 
-func (p *Manager) outputDir() string {
+func (p *Hub) outputDir() string {
 	if p.OutputDir != "" {
 		return p.OutputDir
 	}
 	return defaultOutputDirectory()
 }
 
-func (p *Manager) session(name string) *ptySession {
+func (p *Hub) session(name string) *ptySession {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.sessions[name]
 }
 
-func (p *Manager) removeSession(name string) {
+func (p *Hub) removeSession(name string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.sessions, name)

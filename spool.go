@@ -12,7 +12,7 @@ import (
 )
 
 // SpoolRecoverer reads a contiguous byte range from a session's append-only
-// spool. Manager implements it so a consumer can recover an evicted client
+// spool. Hub implements it so a consumer can recover an evicted client
 // anchor without forcing a full screen reset and replay.
 type SpoolRecoverer interface {
 	Recover(context.Context, string, int64, int64) ([]byte, error)
@@ -46,6 +46,8 @@ type SpoolWatcher struct {
 	paused    bool
 }
 
+// NewSpoolWatcher returns a watcher positioned at offset in the file at path.
+// The callbacks may be nil. Start begins polling.
 func NewSpoolWatcher(path string, offset int64, onBytes func([]byte), onRotate func(), onOverflow func()) (*SpoolWatcher, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -92,6 +94,7 @@ func (e *spoolOffsetError) Error() string {
 	return "spool offset " + strconv.FormatInt(e.Offset, 10) + " is beyond file size " + strconv.FormatInt(e.Size, 10) + ": " + e.Path
 }
 
+// Offset returns the next byte position the watcher will deliver.
 func (w *SpoolWatcher) Offset() int64 {
 	return w.offset.Load()
 }
@@ -117,6 +120,8 @@ func (w *SpoolWatcher) Start() {
 	w.startOnce.Do(func() { go w.loop() })
 }
 
+// Close stops the watcher and releases its file descriptor. It is safe to call
+// multiple times.
 func (w *SpoolWatcher) Close() {
 	w.closeOnce.Do(func() {
 		close(w.done)
@@ -132,6 +137,8 @@ func (w *SpoolWatcher) Pause() {
 	w.readMu.Unlock()
 }
 
+// Resume re-enables draining after Pause and asks the watcher to check
+// immediately.
 func (w *SpoolWatcher) Resume() {
 	w.readMu.Lock()
 	w.paused = false

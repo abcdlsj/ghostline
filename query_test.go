@@ -80,3 +80,22 @@ func TestQueryResponderBuffersAcrossPlainText(t *testing.T) {
 		t.Fatalf("plain text should have been dropped, pending = %q", responder.pending)
 	}
 }
+
+func FuzzQueryResponderNeverPanics(f *testing.F) {
+	f.Add([]byte("\x1b[6n"), byte(0))
+	f.Add([]byte("\x1b]10;?\x1b\\"), byte(1))
+	f.Add([]byte("plain text\x1b[?u"), byte(2))
+	f.Add([]byte("\x1b[?2026$p\x1b[31m\x1b]0;title\x1b\\"), byte(3))
+	f.Fuzz(func(t *testing.T, data []byte, split byte) {
+		responder := NewQueryResponder()
+		if len(data) == 0 {
+			return
+		}
+		cut := int(split) % len(data)
+		_ = responder.Feed(data[:cut])
+		_ = responder.Feed(data[cut:])
+		if len(responder.pending) > 4096 {
+			t.Fatalf("pending buffer exceeded its bound: %d", len(responder.pending))
+		}
+	})
+}
