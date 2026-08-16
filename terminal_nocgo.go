@@ -23,5 +23,15 @@ func (*VTTerminal) Snapshot() ([]byte, error) {
 	return nil, fmt.Errorf("%w: libghostty-vt requires cgo", ErrUnavailable)
 }
 
+// EncodeState reports that libghostty-vt requires CGo.
+func (*VTTerminal) EncodeState() ([]byte, error) {
+	return nil, fmt.Errorf("%w: libghostty-vt requires cgo", ErrUnavailable)
+}
+
+// RestoreState reports that libghostty-vt requires CGo.
+func (*VTTerminal) RestoreState([]byte) error {
+	return fmt.Errorf("%w: libghostty-vt requires cgo", ErrUnavailable)
+}
+
 // Close is a no-op on an unavailable terminal.
 func (*VTTerminal) Close() {}

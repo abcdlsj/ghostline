@@ -70,6 +70,7 @@ extern "C" {
 #define GHOSTTY_MODE_REVERSE_WRAP     (ghostty_mode_new(45, false))  /**< Reverse wrap */
 #define GHOSTTY_MODE_ALT_SCREEN_LEGACY (ghostty_mode_new(47, false)) /**< Alternate screen (legacy) */
 #define GHOSTTY_MODE_KEYPAD_KEYS      (ghostty_mode_new(66, false))  /**< Application keypad */
+#define GHOSTTY_MODE_BACKARROW_KEY_MODE (ghostty_mode_new(67, false))  /**< Backarrow key mode (DECBKM) */
 #define GHOSTTY_MODE_LEFT_RIGHT_MARGIN (ghostty_mode_new(69, false)) /**< Left/right margin mode */
 #define GHOSTTY_MODE_NORMAL_MOUSE     (ghostty_mode_new(1000, false)) /**< Normal mouse tracking */
 #define GHOSTTY_MODE_BUTTON_MOUSE     (ghostty_mode_new(1002, false)) /**< Button-event mouse tracking */
@@ -91,6 +92,7 @@ extern "C" {
 #define GHOSTTY_MODE_SYNC_OUTPUT      (ghostty_mode_new(2026, false)) /**< Synchronized output */
 #define GHOSTTY_MODE_GRAPHEME_CLUSTER (ghostty_mode_new(2027, false)) /**< Grapheme cluster mode */
 #define GHOSTTY_MODE_COLOR_SCHEME_REPORT (ghostty_mode_new(2031, false)) /**< Report color scheme */
+#define GHOSTTY_MODE_VISIBILITY_REPORT (ghostty_mode_new(2033, false)) /**< Report terminal visibility */
 #define GHOSTTY_MODE_IN_BAND_RESIZE   (ghostty_mode_new(2048, false)) /**< In-band size reports */
 /** @} */
 
@@ -146,7 +148,7 @@ static inline bool ghostty_mode_ansi(GhosttyMode mode) {
  * These correspond to the Ps2 parameter in a DECRPM response
  * sequence (CSI ? Ps1 ; Ps2 $ y).
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
     /** Mode is not recognized */
     GHOSTTY_MODE_REPORT_NOT_RECOGNIZED = 0,
     /** Mode is set (enabled) */
@@ -157,6 +159,7 @@ typedef enum {
     GHOSTTY_MODE_REPORT_PERMANENTLY_SET = 3,
     /** Mode is permanently reset */
     GHOSTTY_MODE_REPORT_PERMANENTLY_RESET = 4,
+    GHOSTTY_MODE_REPORT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyModeReportState;
 
 /**
@@ -180,7 +183,7 @@ typedef enum {
  * @return GHOSTTY_SUCCESS on success, GHOSTTY_OUT_OF_SPACE if the buffer
  *         is too small
  */
-GhosttyResult ghostty_mode_report_encode(
+GHOSTTY_API GhosttyResult ghostty_mode_report_encode(
     GhosttyMode mode,
     GhosttyModeReportState state,
     char* buf,

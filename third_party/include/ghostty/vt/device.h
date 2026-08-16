@@ -11,6 +11,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <ghostty/vt/types.h>
+
 /* DA1 conformance levels (Pp parameter). */
 #define GHOSTTY_DA_CONFORMANCE_VT100  1
 #define GHOSTTY_DA_CONFORMANCE_VT101  1
@@ -71,9 +73,10 @@ extern "C" {
  *
  * @ingroup terminal
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
     GHOSTTY_COLOR_SCHEME_LIGHT = 0,
     GHOSTTY_COLOR_SCHEME_DARK = 1,
+    GHOSTTY_COLOR_SCHEME_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyColorScheme;
 
 /**
