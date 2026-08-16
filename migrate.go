@@ -383,6 +383,19 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 		return 0, fmt.Errorf("create output dir: %w", err)
 	}
 
+	// Servers older than the current protocol may fail to encode their native
+	// emulator state (libghostty-vt returns GHOSTTY_INVALID_VALUE). Worse, a
+	// v0.3.4 server removes the session from its pending batch the moment that
+	// encode fails, so there is no way to commit after the fact. Detect the
+	// old protocol up front and rebuild every session from its raw spool
+	// instead, while the old server is still paused and the spool is stable.
+	replayFromSpool := false
+	if versionClient := NewClient(strings.TrimSuffix(adminSocket, ".admin")); versionClient != nil {
+		if version, versionErr := versionClient.Version(ctx); versionErr == nil && version != ProtocolVersion {
+			replayFromSpool = true
+		}
+	}
+
 	connection, err := dialAdmin(ctx, adminSocket)
 	if err != nil {
 		return 0, err
@@ -434,13 +447,8 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 			}
 			master = os.NewFile(uintptr(masterFD), "adopted-master")
 		}
-		var snapshotResult adminSnapshotResult
-		if err := client.call(ctx, adminMethodSnapshot, adoptParams{Name: meta.Name}, &snapshotResult); err != nil {
-			// Some older libghostty-vt builds cannot encode their native
-			// state for long-running TUIs. The append-only spool still has
-			// every byte the old emulator parsed, so rebuild the new
-			// emulator from that instead of failing the whole upgrade.
-			state, fallbackErr := adoptStateFromSpool(
+		if replayFromSpool {
+			state, err := adoptStateFromSpool(
 				adopted.Name,
 				master,
 				Size{Columns: adopted.Cols, Rows: adopted.Rows},
@@ -449,12 +457,17 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 				adopted.PID,
 				adopted.Exit.error(),
 			)
-			if fallbackErr == nil {
-				prepared = append(prepared, state)
-				continue
+			if err != nil {
+				closeFileQuietly(master)
+				return 0, fmt.Errorf("replay spool for %s: %w", meta.Name, err)
 			}
+			prepared = append(prepared, state)
+			continue
+		}
+		var snapshotResult adminSnapshotResult
+		if err := client.call(ctx, adminMethodSnapshot, adoptParams{Name: meta.Name}, &snapshotResult); err != nil {
 			closeFileQuietly(master)
-			return 0, fmt.Errorf("encode snapshot for %s: %v (spool replay fallback: %w)", meta.Name, err, fallbackErr)
+			return 0, fmt.Errorf("encode snapshot for %s: %w", meta.Name, err)
 		}
 		snapshot, err := base64.StdEncoding.DecodeString(snapshotResult.Snapshot)
 		if err != nil {

@@ -1,6 +1,7 @@
 package ghostline
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -241,6 +242,33 @@ func startFailingEncodeAdminServer(t *testing.T, socket string, meta sessionMeta
 	}()
 }
 
+func startLegacyPublicVersionServer(t *testing.T, socket string) {
+	t.Helper()
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatalf("ListenUnix public: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		connection, err := listener.AcceptUnix()
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		reader := bufio.NewReader(connection)
+		line, err := readLine(reader, maxRPCLine)
+		if err != nil {
+			return
+		}
+		var req request
+		if err := json.Unmarshal(line, &req); err != nil {
+			return
+		}
+		writer := bufio.NewWriter(connection)
+		_ = writeResponse(writer, req.ID, versionResult{Version: "0.3.4"}, nil)
+	}()
+}
+
 func TestRollingAdoptFallsBackToSpoolReplay(t *testing.T) {
 	ctx := context.Background()
 	outputDir := t.TempDir()
@@ -267,14 +295,16 @@ func TestRollingAdoptFallsBackToSpoolReplay(t *testing.T) {
 		PID:       4242,
 		Alive:     true,
 	}
-	startFailingEncodeAdminServer(t, filepath.Join(socketDir, "old.admin"), meta, readFD)
+	publicSocket := filepath.Join(socketDir, "old")
+	startLegacyPublicVersionServer(t, publicSocket)
+	startFailingEncodeAdminServer(t, publicSocket+".admin", meta, readFD)
 
 	hub, err := New(Options{OutputDir: outputDir})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	defer hub.Close()
-	adopted, err := Adopt(ctx, filepath.Join(socketDir, "old.admin"), hub)
+	adopted, err := Adopt(ctx, publicSocket+".admin", hub)
 	if err != nil {
 		t.Fatalf("Adopt: %v", err)
 	}
