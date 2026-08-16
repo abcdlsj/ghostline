@@ -218,6 +218,13 @@ func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessag
 		}
 		return createResult{Created: session.CreatedAt().Unix()}, nil
 
+	case rpcMethodCreated:
+		session, err := s.namedSession(raw)
+		if err != nil {
+			return nil, err
+		}
+		return createResult{Created: session.CreatedAt().Unix()}, nil
+
 	case rpcMethodStatus:
 		session, err := s.namedSession(raw)
 		if err != nil {

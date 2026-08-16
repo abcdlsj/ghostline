@@ -132,6 +132,46 @@ func TestClientStartSendsSizeAndEnvironment(t *testing.T) {
 	waitRemoteSpool(t, session, "env=remote")
 }
 
+func TestClientSessionByNameAndSessions(t *testing.T) {
+	_, client := startTestServer(t)
+	ctx := context.Background()
+	if _, err := client.Start(ctx, ghostline.SessionOptions{
+		Name:    "ghost_test_named",
+		Command: "sh",
+	}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	session, ok := client.Session("ghost_test_named")
+	if !ok {
+		t.Fatal("Session should find the started session")
+	}
+	if session.Name() != "ghost_test_named" {
+		t.Fatalf("session name = %q", session.Name())
+	}
+	if session.CreatedAt().IsZero() {
+		t.Fatal("Session handle should resolve CreatedAt lazily")
+	}
+	if err := session.Input(ctx, []byte("echo named-ok\r")); err != nil {
+		t.Fatalf("Input on named session: %v", err)
+	}
+
+	if _, ok := client.Session("ghost_test_missing"); ok {
+		t.Fatal("Session should not find a missing session")
+	}
+
+	sessions := client.Sessions()
+	found := false
+	for _, existing := range sessions {
+		if existing.Name() == "ghost_test_named" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Sessions missing the started session: %d handles", len(sessions))
+	}
+}
+
 func TestClientWaitReturnsExitError(t *testing.T) {
 	_, client := startTestServer(t)
 	session, err := client.Start(context.Background(), ghostline.SessionOptions{

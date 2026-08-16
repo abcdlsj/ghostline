@@ -18,6 +18,7 @@ const (
 const (
 	rpcMethodCreate        = "create"
 	rpcMethodStatus        = "status"
+	rpcMethodCreated       = "created"
 	rpcMethodWait          = "wait"
 	rpcMethodClose         = "close"
 	rpcMethodRemove        = "remove"

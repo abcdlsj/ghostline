@@ -347,6 +347,36 @@ func (c *Client) List(ctx context.Context) ([]string, error) {
 	return result.Sessions, nil
 }
 
+// Session returns a handle for a session known to the server, mirroring
+// Hub.Session. The handle is lazy; operations fail with the server's error if
+// the session disappears.
+func (c *Client) Session(name string) (Session, bool) {
+	sessions, err := c.List(context.Background())
+	if err != nil {
+		return nil, false
+	}
+	for _, existing := range sessions {
+		if existing == name {
+			return &remoteSession{client: c, name: name}, true
+		}
+	}
+	return nil, false
+}
+
+// Sessions returns handles for all sessions known to the server, ordered by
+// name, mirroring Hub.Sessions.
+func (c *Client) Sessions() []Session {
+	sessions, err := c.List(context.Background())
+	if err != nil {
+		return nil
+	}
+	result := make([]Session, 0, len(sessions))
+	for _, name := range sessions {
+		result = append(result, &remoteSession{client: c, name: name})
+	}
+	return result
+}
+
 func (c *Client) status(ctx context.Context, name string) (Status, error) {
 	var result Status
 	if err := c.callRetryable(ctx, rpcMethodStatus, nameParams{Name: name}, &result); err != nil {
@@ -374,10 +404,23 @@ type remoteSession struct {
 	doneCloseOnce sync.Once
 	done          chan struct{}
 	exit          atomic.Pointer[ExitError]
+	createdAtOnce sync.Once
 }
 
-func (r *remoteSession) Name() string         { return r.name }
-func (r *remoteSession) CreatedAt() time.Time { return r.createdAt }
+func (r *remoteSession) Name() string { return r.name }
+
+func (r *remoteSession) CreatedAt() time.Time {
+	r.createdAtOnce.Do(func() {
+		if !r.createdAt.IsZero() {
+			return
+		}
+		var result createResult
+		if err := r.call(context.Background(), rpcMethodCreated, nameParams{Name: r.name}, &result); err == nil {
+			r.createdAt = time.Unix(result.Created, 0)
+		}
+	})
+	return r.createdAt
+}
 
 func (r *remoteSession) call(ctx context.Context, method string, params, result any) error {
 	return r.client.call(ctx, method, params, result)
