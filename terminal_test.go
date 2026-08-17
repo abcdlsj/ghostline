@@ -7,9 +7,9 @@ import (
 	"testing"
 )
 
-func newTestVTTerminal(t *testing.T, options VTTerminalOptions) *VTTerminal {
+func newTestVTTerminalSize(t *testing.T, cols, rows int, options VTTerminalOptions) *VTTerminal {
 	t.Helper()
-	vt, err := NewVTTerminalWithOptions(80, 24, options)
+	vt, err := NewVTTerminalWithOptions(cols, rows, options)
 	if errors.Is(err, ErrUnavailable) {
 		t.Skip("libghostty-vt requires cgo")
 	}
@@ -17,6 +17,10 @@ func newTestVTTerminal(t *testing.T, options VTTerminalOptions) *VTTerminal {
 		t.Fatalf("NewVTTerminalWithOptions: %v", err)
 	}
 	return vt
+}
+
+func newTestVTTerminal(t *testing.T, options VTTerminalOptions) *VTTerminal {
+	return newTestVTTerminalSize(t, 80, 24, options)
 }
 
 func TestVTTerminalOptionsResolveDefaults(t *testing.T) {
@@ -88,5 +92,54 @@ func TestEncodeStateSupportsUnfinishedContinuation(t *testing.T) {
 	defer restored.Close()
 	if err := restored.RestoreState(encoded); err != nil {
 		t.Fatalf("RestoreState of unfinished continuation: %v", err)
+	}
+}
+
+func TestVTTerminalResizeKeepsSnapshotEncodableAfterWideBoundary(t *testing.T) {
+	vt := newTestVTTerminalSize(t, 138, 42, VTTerminalOptions{})
+	defer vt.Close()
+
+	// The wide character occupies columns 123-124. Shrinking to 123 columns
+	// reproduces the old no-reflow resize bug at the new right edge.
+	vt.Feed([]byte("\x1b[?1049h\x1b[7;123H\xe5\x86\x99"))
+	vt.Resize(123, 40)
+
+	if _, err := vt.EncodeState(); err != nil {
+		t.Fatalf("EncodeState after wide-boundary resize: %v", err)
+	}
+}
+
+func TestVTTerminalResizeRepairsInactiveAlternateBoundary(t *testing.T) {
+	vt := newTestVTTerminalSize(t, 138, 42, VTTerminalOptions{})
+	defer vt.Close()
+
+	// Leave the malformed wide pair on the inactive alternate screen while
+	// keeping primary active, matching the migration failure observed in the
+	// retained session.
+	vt.Feed([]byte("primary\x1b[?1049h\x1b[7;123H\xe5\x86\x99\x1b[?1049l"))
+	vt.Resize(123, 40)
+
+	if _, err := vt.EncodeState(); err != nil {
+		t.Fatalf("EncodeState with inactive alternate boundary: %v", err)
+	}
+	vt.Feed([]byte("P"))
+	snapshot, err := vt.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot after inactive alternate repair: %v", err)
+	}
+	if !bytes.Contains(snapshot, []byte("primaryP")) {
+		t.Fatalf("active primary cursor moved during alternate repair: %q", snapshot)
+	}
+}
+
+func TestVTTerminalResizeKeepsNoReflowPrimaryEncodable(t *testing.T) {
+	vt := newTestVTTerminalSize(t, 138, 42, VTTerminalOptions{})
+	defer vt.Close()
+
+	vt.Feed([]byte("\x1b[?7l\x1b[7;123H\xe5\x86\x99"))
+	vt.Resize(123, 40)
+
+	if _, err := vt.EncodeState(); err != nil {
+		t.Fatalf("EncodeState after no-reflow primary resize: %v", err)
 	}
 }
