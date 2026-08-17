@@ -3,8 +3,27 @@ package ghostline
 import (
 	"bytes"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 )
+
+// ColorQueryKind identifies the terminal color requested by an OSC query.
+type ColorQueryKind uint8
+
+const (
+	// ColorQueryForeground is the default text color (OSC 10).
+	ColorQueryForeground ColorQueryKind = 10
+	// ColorQueryBackground is the default background color (OSC 11).
+	ColorQueryBackground ColorQueryKind = 11
+)
+
+// ColorQueryCallback supplies a color for an OSC 10 or OSC 11 query.
+//
+// The callback should return a six-digit RGB value with an optional leading
+// '#'. It returns false when the requested color is not available. A callback
+// is optional; without one, unknown colors receive no reply.
+type ColorQueryCallback func(ColorQueryKind) (color string, ok bool)
 
 // QueryResponder answers terminal capability queries while a session has no
 // attached terminal client. TUIs such as Codex send DA/DSR/OSC/kitty
@@ -12,15 +31,22 @@ import (
 // attaches, so the application may downgrade itself (for example disabling
 // colors). Replies are written back into the PTY as input, never into output.
 type QueryResponder struct {
-	mu      sync.Mutex
-	pending []byte
-	rows    int
-	cols    int
+	mu         sync.Mutex
+	pending    []byte
+	rows       int
+	cols       int
+	colorQuery ColorQueryCallback
 }
 
 // NewQueryResponder returns a responder initialized to a 120x36 terminal.
 func NewQueryResponder() *QueryResponder {
-	return &QueryResponder{rows: 36, cols: 120}
+	return NewQueryResponderWithColorQuery(nil)
+}
+
+// NewQueryResponderWithColorQuery returns a responder that uses callback to
+// answer OSC 10 and OSC 11 color queries.
+func NewQueryResponderWithColorQuery(callback ColorQueryCallback) *QueryResponder {
+	return &QueryResponder{rows: 36, cols: 120, colorQuery: callback}
 }
 
 // Resize updates the window size reported in XTWINOPS replies.
@@ -185,11 +211,59 @@ func (r *QueryResponder) csiReply(sequence []byte) []byte {
 }
 
 func (r *QueryResponder) oscReply(sequence []byte) []byte {
+	if r.colorQuery == nil {
+		return nil
+	}
+	var kind ColorQueryKind
 	switch string(sequence) {
 	case "10;?":
-		return []byte("\x1b]10;rgb:ffff/ffff/ffff\x1b\\")
+		kind = ColorQueryForeground
 	case "11;?":
-		return []byte("\x1b]11;rgb:0000/0000/0000\x1b\\")
+		kind = ColorQueryBackground
+	default:
+		return nil
 	}
-	return nil
+	color, ok := r.colorQuery(kind)
+	if !ok {
+		return nil
+	}
+	value, ok := formatOSCColor(color)
+	if !ok {
+		return nil
+	}
+	return []byte(fmt.Sprintf("\x1b]%d;%s\x1b\\", kind, value))
+}
+
+func formatOSCColor(color string) (string, bool) {
+	value := strings.TrimSpace(color)
+	if strings.HasPrefix(strings.ToLower(value), "rgb:") {
+		components := strings.Split(value[4:], "/")
+		if len(components) != 3 {
+			return "", false
+		}
+		for _, component := range components {
+			if len(component) == 0 || len(component) > 4 {
+				return "", false
+			}
+			if _, err := strconv.ParseUint(component, 16, 16); err != nil {
+				return "", false
+			}
+		}
+		return "rgb:" + strings.ToLower(strings.Join(components, "/")), true
+	}
+	value = strings.TrimPrefix(value, "#")
+	if len(value) == 3 {
+		value = strings.Repeat(string(value[0]), 2) +
+			strings.Repeat(string(value[1]), 2) +
+			strings.Repeat(string(value[2]), 2)
+	}
+	if len(value) != 6 {
+		return "", false
+	}
+	for _, component := range []string{value[0:2], value[2:4], value[4:6]} {
+		if _, err := strconv.ParseUint(component, 16, 8); err != nil {
+			return "", false
+		}
+	}
+	return fmt.Sprintf("rgb:%[1]s%[1]s/%[2]s%[2]s/%[3]s%[3]s", strings.ToLower(value[0:2]), strings.ToLower(value[2:4]), strings.ToLower(value[4:6])), true
 }

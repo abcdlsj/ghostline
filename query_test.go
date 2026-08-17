@@ -35,8 +35,34 @@ func TestQueryResponderAnswersCapabilityQueries(t *testing.T) {
 	assertReplies(t, responder, []byte("\x1b[?u"), "\x1b[?u")
 	assertReplies(t, responder, []byte("\x1b[?2026$p"), "\x1b[?2026;1$y")
 	assertReplies(t, responder, []byte("\x1b[?2004$p"), "\x1b[?2004;1$y")
+	assertReplies(t, responder, []byte("\x1b]10;?\x1b\\"))
+	assertReplies(t, responder, []byte("\x1b]11;?\x07"))
+}
+
+func TestQueryResponderAnswersColorQueriesWithCallback(t *testing.T) {
+	responder := NewQueryResponderWithColorQuery(func(kind ColorQueryKind) (string, bool) {
+		switch kind {
+		case ColorQueryForeground:
+			return "#eae8e6", true
+		case ColorQueryBackground:
+			return "151110", true
+		default:
+			return "", false
+		}
+	})
+	assertReplies(t, responder, []byte("\x1b]10;?\x1b\\"), "\x1b]10;rgb:eaea/e8e8/e6e6\x1b\\")
+	assertReplies(t, responder, []byte("\x1b]11;?\x07"), "\x1b]11;rgb:1515/1111/1010\x1b\\")
+}
+
+func TestQueryResponderSkipsUnsupportedColorQueries(t *testing.T) {
+	responder := NewQueryResponderWithColorQuery(func(kind ColorQueryKind) (string, bool) {
+		if kind == ColorQueryForeground {
+			return "#ffffff", true
+		}
+		return "", false
+	})
 	assertReplies(t, responder, []byte("\x1b]10;?\x1b\\"), "\x1b]10;rgb:ffff/ffff/ffff\x1b\\")
-	assertReplies(t, responder, []byte("\x1b]11;?\x07"), "\x1b]11;rgb:0000/0000/0000\x1b\\")
+	assertReplies(t, responder, []byte("\x1b]11;?\x1b\\"))
 }
 
 func TestQueryResponderReportsWindowSize(t *testing.T) {
@@ -47,7 +73,9 @@ func TestQueryResponderReportsWindowSize(t *testing.T) {
 }
 
 func TestQueryResponderHandlesSplitQueries(t *testing.T) {
-	responder := NewQueryResponder()
+	responder := NewQueryResponderWithColorQuery(func(kind ColorQueryKind) (string, bool) {
+		return "#ffffff", true
+	})
 	if replies := responder.Feed([]byte("hello ")); len(replies) != 0 {
 		t.Fatalf("plain text must not reply, got %q", replyStrings(replies))
 	}
@@ -57,6 +85,26 @@ func TestQueryResponderHandlesSplitQueries(t *testing.T) {
 	assertReplies(t, responder, []byte("[6n"), "\x1b[1;1R")
 	assertReplies(t, responder, []byte("\x1b]1"))
 	assertReplies(t, responder, []byte("0;?\x1b\\"), "\x1b]10;rgb:ffff/ffff/ffff\x1b\\")
+}
+
+func TestFormatOSCColor(t *testing.T) {
+	tests := map[string]string{
+		"#123456":         "rgb:1212/3434/5656",
+		"abcdef":          "rgb:abab/cdcd/efef",
+		"#abc":            "rgb:aaaa/bbbb/cccc",
+		"rgb:12/345/ABCD": "rgb:12/345/abcd",
+	}
+	for input, want := range tests {
+		got, ok := formatOSCColor(input)
+		if !ok || got != want {
+			t.Errorf("formatOSCColor(%q) = %q, %t; want %q, true", input, got, ok, want)
+		}
+	}
+	for _, input := range []string{"", "#12", "#1234567", "#gggggg", "rgb:123/456", "rgb:12345/0000/0000"} {
+		if got, ok := formatOSCColor(input); ok {
+			t.Errorf("formatOSCColor(%q) = %q, true; want no color", input, got)
+		}
+	}
 }
 
 func TestQueryResponderIgnoresNonQueries(t *testing.T) {
