@@ -31,7 +31,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: ghostline serve --socket <path> [--output-dir <dir>] [--default-term <term>] [--adopt-from <admin-socket>] [--probe-foreground]")
+	fmt.Fprintln(os.Stderr, "usage: ghostline serve --socket <path> [--output-dir <dir>] [--default-term <term>] [--vt-scrollback-max-bytes <bytes>] [--adopt-from <admin-socket>] [--probe-foreground]")
 }
 
 // serveCommand runs the standalone session server. The server owns PTY
@@ -42,6 +42,7 @@ func serveCommand(args []string) {
 	socket := flags.String("socket", "", "unix socket path (required)")
 	outputDir := flags.String("output-dir", "", "output spool directory (default ~/.ghostline/output)")
 	defaultTerm := flags.String("default-term", "", "TERM for sessions without one (default xterm-256color)")
+	vtScrollbackMaxBytes := flags.Uint64("vt-scrollback-max-bytes", 0, "VT scrollback budget in bytes (default 2 MiB)")
 	adoptFrom := flags.String("adopt-from", "", "old server admin socket to adopt sessions from before serving")
 	probeForeground := flags.Bool("probe-foreground", false, "probe OS-level foreground process/cwd metadata (off by default)")
 	_ = flags.Parse(args)
@@ -55,9 +56,10 @@ func serveCommand(args []string) {
 		dir = filepath.Join(home, ".ghostline", "output")
 	}
 	server, err := ghostline.NewServer(ghostline.Options{
-		OutputDir:       dir,
-		DefaultTerm:     *defaultTerm,
-		ProbeForeground: *probeForeground,
+		OutputDir:            dir,
+		DefaultTerm:          *defaultTerm,
+		VTScrollbackMaxBytes: *vtScrollbackMaxBytes,
+		ProbeForeground:      *probeForeground,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ghostline serve: %v\n", err)

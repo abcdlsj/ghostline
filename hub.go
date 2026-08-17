@@ -21,6 +21,9 @@ type Options struct {
 	// DefaultTerm is used for pty children whose environment has no
 	// non-empty TERM. An empty value defaults to xterm-256color.
 	DefaultTerm string
+	// VTScrollbackMaxBytes is the default logical scrollback budget for new
+	// sessions. Zero uses DefaultVTScrollbackMaxBytes.
+	VTScrollbackMaxBytes uint64
 	// ProbeForeground enables OS-level foreground process/cwd metadata.
 	// Disabled by default; Session.Metadata returns empty values without
 	// spawning any OS probes.
@@ -42,14 +45,18 @@ type SessionOptions struct {
 	Size Size
 	// Environment entries use KEY=value form and override inherited values.
 	Environment []string
+	// VTScrollbackMaxBytes overrides the Hub default for this session. Zero
+	// inherits the Hub setting.
+	VTScrollbackMaxBytes uint64
 }
 
 // Hub owns local pseudo-terminal sessions.
 type Hub struct {
-	outputDir       string
-	defaultSize     Size
-	defaultTerm     string
-	probeForeground bool
+	outputDir                   string
+	defaultSize                 Size
+	defaultTerm                 string
+	defaultVTScrollbackMaxBytes uint64
+	probeForeground             bool
 
 	// lifecycleMu is a reader/writer gate around hub-wide mutations. Normal
 	// session operations take a read lock; a rolling-upgrade batch takes the
@@ -73,12 +80,13 @@ func New(options Options) (*Hub, error) {
 		dir = defaultOutputDirectory()
 	}
 	return &Hub{
-		outputDir:       dir,
-		defaultSize:     size,
-		defaultTerm:     options.DefaultTerm,
-		probeForeground: options.ProbeForeground,
-		sessions:        make(map[string]*sessionState),
-		pending:         make(map[string]struct{}),
+		outputDir:                   dir,
+		defaultSize:                 size,
+		defaultTerm:                 options.DefaultTerm,
+		defaultVTScrollbackMaxBytes: resolveVTScrollbackMaxBytes(options.VTScrollbackMaxBytes, DefaultVTScrollbackMaxBytes),
+		probeForeground:             options.ProbeForeground,
+		sessions:                    make(map[string]*sessionState),
+		pending:                     make(map[string]struct{}),
 	}, nil
 }
 
@@ -100,6 +108,7 @@ func (h *Hub) Start(ctx context.Context, options SessionOptions) (Session, error
 	if err != nil {
 		return nil, err
 	}
+	scrollbackMaxBytes := resolveVTScrollbackMaxBytes(options.VTScrollbackMaxBytes, h.defaultVTScrollbackMaxBytes)
 
 	h.mu.Lock()
 	if h.closed {
@@ -123,7 +132,7 @@ func (h *Hub) Start(ctx context.Context, options SessionOptions) (Session, error
 		return nil, fmt.Errorf("create output dir: %w", err)
 	}
 	path := filepath.Join(h.outputDir, options.Name+spoolSuffix)
-	state, err := startSession(ctx, options, size, path, h.defaultTerm)
+	state, err := startSession(ctx, options, size, path, h.defaultTerm, scrollbackMaxBytes)
 	if err != nil {
 		release()
 		return nil, err
@@ -145,6 +154,13 @@ func (h *Hub) Start(ctx context.Context, options SessionOptions) (Session, error
 	h.mu.Unlock()
 	go copyOutput(state)
 	return &localSession{hub: h, state: state}, nil
+}
+
+func resolveVTScrollbackMaxBytes(value, fallback uint64) uint64 {
+	if value != 0 {
+		return value
+	}
+	return fallback
 }
 
 // Session returns a handle for a known session name.

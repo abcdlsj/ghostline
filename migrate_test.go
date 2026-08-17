@@ -244,18 +244,22 @@ func TestRollingAdoptRestoresSnapshot(t *testing.T) {
 		t.Fatalf("EncodeState: %v", err)
 	}
 	meta := sessionMeta{
-		Name:      "warren_snapshot",
-		Cols:      80,
-		Rows:      24,
-		CreatedAt: time.Now().Unix(),
-		PID:       4242,
-		Alive:     false,
-		Exit:      &exitMeta{Code: 0},
+		Name:                 "warren_snapshot",
+		Cols:                 80,
+		Rows:                 24,
+		CreatedAt:            time.Now().Unix(),
+		PID:                  4242,
+		Alive:                false,
+		VTScrollbackMaxBytes: 3 << 20,
+		Exit:                 &exitMeta{Code: 0},
 	}
 	adminSocket := filepath.Join(socketDir, "old.admin")
 	startAdminServerWithSnapshot(t, adminSocket, meta, nil, nativeSnapshot, true)
 
-	hub, err := New(Options{OutputDir: outputDir})
+	hub, err := New(Options{
+		OutputDir:            outputDir,
+		VTScrollbackMaxBytes: 1 << 20,
+	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -270,6 +274,9 @@ func TestRollingAdoptRestoresSnapshot(t *testing.T) {
 	session, ok := hub.Session("warren_snapshot")
 	if !ok {
 		t.Fatal("adopted session missing")
+	}
+	if got := session.(*localSession).state.scrollbackMaxBytes; got != 3<<20 {
+		t.Fatalf("adopted scrollback = %d, want %d", got, 3<<20)
 	}
 	snapshot, err := session.Snapshot(ctx)
 	if err != nil {

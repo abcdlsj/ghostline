@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,21 @@ import (
 	"testing"
 	"time"
 )
+
+func TestCreateParamsCarriesVTScrollbackLimit(t *testing.T) {
+	want := uint64(4 << 20)
+	encoded, err := json.Marshal(createParams{VTScrollbackMaxBytes: want})
+	if err != nil {
+		t.Fatalf("marshal create params: %v", err)
+	}
+	var decoded createParams
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal create params: %v", err)
+	}
+	if decoded.VTScrollbackMaxBytes != want {
+		t.Fatalf("VTScrollbackMaxBytes = %d, want %d", decoded.VTScrollbackMaxBytes, want)
+	}
+}
 
 func FuzzReadLine(f *testing.F) {
 	f.Add([]byte("hello\n"), 1024)

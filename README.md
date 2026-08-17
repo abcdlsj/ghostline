@@ -16,6 +16,7 @@ terminal, or their own session protocol on top.
   synchronized output
 - Raw append-only output subscriptions with resumable byte offsets
 - Atomic checkpoints pairing a full VT replay with its exact spool boundary
+- Configurable VT scrollback budgets with a 2 MiB default
 - Detached-mode terminal query responses for TUIs
 - Rolling server upgrades that keep PTY children and emulator state alive
 - Local `Hub` and Unix-socket `Server`/`Client` with one `Session` API
@@ -65,6 +66,12 @@ _ = session.Resize(ctx, ghostline.Size{Columns: 100, Rows: 30})
 `WatchOutput` starts at a raw spool offset. Its callback receives a borrowed
 slice that is valid only until the callback returns; copy it if it must be
 retained.
+
+VT scrollback and raw spool retention are separate. Configure the default VT
+scrollback for a Hub with `Options.VTScrollbackMaxBytes`, or override it for a
+single session with `SessionOptions.VTScrollbackMaxBytes`. See
+[scrollback and output retention](docs/scrollback.md) for the retention model,
+recommended values, and comparisons with other terminal runtimes.
 
 Child processes inherit the embedding process's environment;
 `SessionOptions.Environment` overrides individual `KEY=value` entries. When

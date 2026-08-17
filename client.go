@@ -361,12 +361,13 @@ func contextErr(ctx context.Context, err error) error {
 func (c *Client) Start(ctx context.Context, options SessionOptions) (Session, error) {
 	var result createResult
 	err := c.callRetryable(ctx, rpcMethodCreate, createParams{
-		Name:    options.Name,
-		Dir:     options.Directory,
-		Command: options.Command,
-		Cols:    options.Size.Columns,
-		Rows:    options.Size.Rows,
-		Env:     options.Environment,
+		Name:                 options.Name,
+		Dir:                  options.Directory,
+		Command:              options.Command,
+		Cols:                 options.Size.Columns,
+		Rows:                 options.Size.Rows,
+		Env:                  options.Environment,
+		VTScrollbackMaxBytes: options.VTScrollbackMaxBytes,
 	}, &result)
 	if err != nil {
 		return nil, err

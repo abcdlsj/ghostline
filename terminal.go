@@ -32,15 +32,23 @@ const snapshotContinuationMaxBytes = 1 << 20
 // preserved. It is the server-side counterpart of the Ghostty client, so a
 // replayed snapshot matches exactly what the client would have rendered.
 type VTTerminal struct {
-	mu       sync.Mutex
-	terminal C.GhosttyTerminal
+	mu                 sync.Mutex
+	terminal           C.GhosttyTerminal
+	scrollbackMaxBytes uint64
 }
 
 // NewVTTerminal creates a terminal emulator with the given grid size.
 func NewVTTerminal(cols, rows int) (*VTTerminal, error) {
+	return NewVTTerminalWithOptions(cols, rows, VTTerminalOptions{})
+}
+
+// NewVTTerminalWithOptions creates a terminal emulator with the given grid
+// size and VT configuration.
+func NewVTTerminalWithOptions(cols, rows int, options VTTerminalOptions) (*VTTerminal, error) {
 	if cols <= 0 || rows <= 0 || cols > maxTerminalDimension || rows > maxTerminalDimension {
 		return nil, fmt.Errorf("invalid terminal size %dx%d", cols, rows)
 	}
+	scrollbackMaxBytes := options.resolvedScrollbackMaxBytes()
 	var terminal C.GhosttyTerminal
 	if result := C.ghostty_terminal_new(
 		nil,
@@ -50,11 +58,33 @@ func NewVTTerminal(cols, rows int) (*VTTerminal, error) {
 	); result != C.GHOSTTY_SUCCESS {
 		return nil, fmt.Errorf("ghostty terminal new failed: %d", result)
 	}
+	if err := setScrollbackMaxBytes(terminal, scrollbackMaxBytes); err != nil {
+		C.ghostty_terminal_free(terminal)
+		return nil, err
+	}
 	if err := enableContinuationTracking(terminal); err != nil {
 		C.ghostty_terminal_free(terminal)
 		return nil, err
 	}
-	return &VTTerminal{terminal: terminal}, nil
+	return &VTTerminal{
+		terminal:           terminal,
+		scrollbackMaxBytes: scrollbackMaxBytes,
+	}, nil
+}
+
+func setScrollbackMaxBytes(terminal C.GhosttyTerminal, maxBytes uint64) error {
+	value := C.size_t(maxBytes)
+	if uint64(value) != maxBytes {
+		return fmt.Errorf("scrollback limit exceeds platform size_t: %d", maxBytes)
+	}
+	if result := C.ghostty_terminal_set(
+		terminal,
+		C.GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES,
+		unsafe.Pointer(&value),
+	); result != C.GHOSTTY_SUCCESS {
+		return fmt.Errorf("configure scrollback: %d", result)
+	}
+	return nil
 }
 
 func enableContinuationTracking(terminal C.GhosttyTerminal) error {
@@ -135,6 +165,10 @@ func (v *VTTerminal) RestoreState(snapshot []byte) error {
 	var restored C.GhosttyTerminal
 	if result := C.ghostty_snapshot_decoder_decode(decoder, &restored); result != C.GHOSTTY_SUCCESS {
 		return fmt.Errorf("ghostty snapshot decode failed: %d", result)
+	}
+	if err := setScrollbackMaxBytes(restored, v.scrollbackMaxBytes); err != nil {
+		C.ghostty_terminal_free(restored)
+		return err
 	}
 	if err := enableContinuationTracking(restored); err != nil {
 		C.ghostty_terminal_free(restored)

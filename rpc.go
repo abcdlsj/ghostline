@@ -47,12 +47,13 @@ type nameParams struct {
 }
 
 type createParams struct {
-	Name    string   `json:"name"`
-	Dir     string   `json:"dir"`
-	Command string   `json:"command"`
-	Cols    int      `json:"cols"`
-	Rows    int      `json:"rows"`
-	Env     []string `json:"env"`
+	Name                 string   `json:"name"`
+	Dir                  string   `json:"dir"`
+	Command              string   `json:"command"`
+	Cols                 int      `json:"cols"`
+	Rows                 int      `json:"rows"`
+	Env                  []string `json:"env"`
+	VTScrollbackMaxBytes uint64   `json:"vtScrollbackMaxBytes,omitempty"`
 }
 
 type inputParams struct {

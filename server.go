@@ -490,11 +490,12 @@ func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessag
 			return nil, err
 		}
 		session, err := s.hub.Start(ctx, SessionOptions{
-			Name:        params.Name,
-			Directory:   params.Dir,
-			Command:     params.Command,
-			Size:        Size{Columns: params.Cols, Rows: params.Rows},
-			Environment: params.Env,
+			Name:                 params.Name,
+			Directory:            params.Dir,
+			Command:              params.Command,
+			Size:                 Size{Columns: params.Cols, Rows: params.Rows},
+			Environment:          params.Env,
+			VTScrollbackMaxBytes: params.VTScrollbackMaxBytes,
 		})
 		if err != nil {
 			return nil, err

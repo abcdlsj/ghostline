@@ -59,13 +59,14 @@ type exitMeta struct {
 }
 
 type sessionMeta struct {
-	Name      string    `json:"name"`
-	Cols      int       `json:"cols"`
-	Rows      int       `json:"rows"`
-	CreatedAt int64     `json:"createdAt"`
-	PID       int       `json:"pid"`
-	Alive     bool      `json:"alive"`
-	Exit      *exitMeta `json:"exit,omitempty"`
+	Name                 string    `json:"name"`
+	Cols                 int       `json:"cols"`
+	Rows                 int       `json:"rows"`
+	CreatedAt            int64     `json:"createdAt"`
+	PID                  int       `json:"pid"`
+	Alive                bool      `json:"alive"`
+	VTScrollbackMaxBytes uint64    `json:"vtScrollbackMaxBytes,omitempty"`
+	Exit                 *exitMeta `json:"exit,omitempty"`
 }
 
 type adminListResult struct {
@@ -293,12 +294,13 @@ func sessionMetaLocked(state *sessionState) sessionMeta {
 	state.outputMu.Lock()
 	defer state.outputMu.Unlock()
 	meta := sessionMeta{
-		Name:      state.name,
-		Cols:      state.size.Columns,
-		Rows:      state.size.Rows,
-		CreatedAt: state.createdAt.Unix(),
-		PID:       state.pid,
-		Alive:     true,
+		Name:                 state.name,
+		Cols:                 state.size.Columns,
+		Rows:                 state.size.Rows,
+		CreatedAt:            state.createdAt.Unix(),
+		PID:                  state.pid,
+		Alive:                true,
+		VTScrollbackMaxBytes: state.scrollbackMaxBytes,
 	}
 	select {
 	case <-state.done:
@@ -452,6 +454,7 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 			time.Unix(adopted.CreatedAt, 0),
 			adopted.PID,
 			adopted.Exit.error(),
+			resolveVTScrollbackMaxBytes(adopted.VTScrollbackMaxBytes, h.defaultVTScrollbackMaxBytes),
 		)
 		if err != nil {
 			return 0, fmt.Errorf("restore snapshot for %s: %w", meta.Name, err)

@@ -24,16 +24,17 @@ const (
 )
 
 type sessionState struct {
-	name      string
-	path      string
-	command   *exec.Cmd
-	pid       int
-	masterFD  int
-	size      Size
-	master    *os.File
-	spool     *os.File
-	vt        *VTTerminal
-	createdAt time.Time
+	name               string
+	path               string
+	command            *exec.Cmd
+	pid                int
+	masterFD           int
+	size               Size
+	master             *os.File
+	spool              *os.File
+	vt                 *VTTerminal
+	scrollbackMaxBytes uint64
+	createdAt          time.Time
 
 	// operationMu is the session's read/write gate. Ordinary operations share
 	// it; migration takes the write side and keeps it until commit or abort.
@@ -112,11 +113,13 @@ func (t *migrationTicket) markStopped() {
 	t.stoppedOnce.Do(func() { close(t.stopped) })
 }
 
-func startSession(ctx context.Context, options SessionOptions, size Size, path string, defaultTerm string) (*sessionState, error) {
+func startSession(ctx context.Context, options SessionOptions, size Size, path string, defaultTerm string, scrollbackMaxBytes uint64) (*sessionState, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	vt, err := NewVTTerminal(size.Columns, size.Rows)
+	vt, err := NewVTTerminalWithOptions(size.Columns, size.Rows, VTTerminalOptions{
+		ScrollbackMaxBytes: scrollbackMaxBytes,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("create vt: %w", err)
 	}
@@ -133,18 +136,19 @@ func startSession(ctx context.Context, options SessionOptions, size Size, path s
 		return nil, fmt.Errorf("start pty: %w", err)
 	}
 	return &sessionState{
-		name:      options.Name,
-		path:      path,
-		command:   command,
-		pid:       command.Process.Pid,
-		masterFD:  int(master.Fd()),
-		size:      size,
-		master:    master,
-		spool:     spool,
-		vt:        vt,
-		createdAt: time.Now(),
-		done:      make(chan struct{}),
-		reaped:    make(chan struct{}),
+		name:               options.Name,
+		path:               path,
+		command:            command,
+		pid:                command.Process.Pid,
+		masterFD:           int(master.Fd()),
+		size:               size,
+		master:             master,
+		spool:              spool,
+		vt:                 vt,
+		scrollbackMaxBytes: scrollbackMaxBytes,
+		createdAt:          time.Now(),
+		done:               make(chan struct{}),
+		reaped:             make(chan struct{}),
 	}, nil
 }
 
@@ -385,8 +389,10 @@ func (s *sessionState) finishMigration(ticket *migrationTicket, commit bool) err
 // adoptState builds a session around a PTY master transferred from another
 // server process. The child keeps running; only the owner of the master
 // changes. The emulator state is restored from the encoded snapshot.
-func adoptState(name string, master *os.File, snapshot []byte, size Size, path string, createdAt time.Time, pid int, exit *ExitError) (*sessionState, error) {
-	vt, err := NewVTTerminal(size.Columns, size.Rows)
+func adoptState(name string, master *os.File, snapshot []byte, size Size, path string, createdAt time.Time, pid int, exit *ExitError, scrollbackMaxBytes uint64) (*sessionState, error) {
+	vt, err := NewVTTerminalWithOptions(size.Columns, size.Rows, VTTerminalOptions{
+		ScrollbackMaxBytes: scrollbackMaxBytes,
+	})
 	if err != nil {
 		closeFileQuietly(master)
 		return nil, fmt.Errorf("create vt: %w", err)
@@ -403,17 +409,18 @@ func adoptState(name string, master *os.File, snapshot []byte, size Size, path s
 		return nil, fmt.Errorf("open spool: %w", err)
 	}
 	state := &sessionState{
-		name:      name,
-		path:      path,
-		pid:       pid,
-		masterFD:  -1,
-		size:      size,
-		master:    master,
-		spool:     spool,
-		vt:        vt,
-		createdAt: createdAt,
-		done:      make(chan struct{}),
-		reaped:    make(chan struct{}),
+		name:               name,
+		path:               path,
+		pid:                pid,
+		masterFD:           -1,
+		size:               size,
+		master:             master,
+		spool:              spool,
+		vt:                 vt,
+		scrollbackMaxBytes: scrollbackMaxBytes,
+		createdAt:          createdAt,
+		done:               make(chan struct{}),
+		reaped:             make(chan struct{}),
 	}
 	if master == nil {
 		if exit == nil {

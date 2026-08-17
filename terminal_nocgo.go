@@ -12,6 +12,11 @@ func NewVTTerminal(int, int) (*VTTerminal, error) {
 	return nil, fmt.Errorf("%w: libghostty-vt requires cgo", ErrUnavailable)
 }
 
+// NewVTTerminalWithOptions reports that libghostty-vt requires CGo.
+func NewVTTerminalWithOptions(int, int, VTTerminalOptions) (*VTTerminal, error) {
+	return nil, fmt.Errorf("%w: libghostty-vt requires cgo", ErrUnavailable)
+}
+
 // Feed is a no-op on an unavailable terminal.
 func (*VTTerminal) Feed([]byte) {}
 
