@@ -137,6 +137,18 @@ spool offsets remain valid because the spool is never rewound or truncated.
 
 - Both servers must speak the admin-socket protocol. If the source endpoint
   cannot be adopted, the daemon keeps serving from it until a later restart.
+- Protocol `0.6.0` contains a bounded compatibility bridge for source
+  protocols `0.4.0` and `0.5.0`. Those versions can leave an invalid wide-cell
+  pair after a no-reflow shrink and abort when asked to encode native state.
+  The new server detects those source versions before preparing sessions,
+  keeps the source migration ticket paused, and rebuilds each destination VT
+  state from the source's archived and live spool instead of sending the
+  `snapshot` request. Sources advertising newer protocols use native snapshot
+  transfer and never enter this path.
+- Spool replay requires the source output directory to be shared and the
+  retained archives to cover the session history. If replay cannot establish a
+  complete destination state, adoption fails safely and the source server
+  remains the owner.
 - The snapshot reconstructs the emulator's grid, scrollback, cursor, and
   terminal modes. Exotic features such as kitty graphics or OSC state are
   expected to travel with the snapshot but are not separately verified.

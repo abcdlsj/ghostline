@@ -18,7 +18,7 @@ const (
 // ProtocolVersion identifies the RPC protocol spoken by the server. Clients
 // use it to detect an outdated server process during upgrades instead of
 // failing on unknown methods.
-const ProtocolVersion = "0.5.0"
+const ProtocolVersion = "0.6.0"
 
 const (
 	rpcMethodCreate        = "create"

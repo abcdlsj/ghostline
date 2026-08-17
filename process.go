@@ -1,11 +1,15 @@
 package ghostline
 
 import (
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -433,6 +437,131 @@ func adoptState(name string, master *os.File, snapshot []byte, size Size, path s
 		state.masterFD = int(master.Fd())
 	}
 	return state, nil
+}
+
+// adoptStateFromSpool rebuilds a session's emulator by replaying the source
+// server's archived and live PTY output while the source migration ticket is
+// still paused. It is intentionally used only for the bounded compatibility
+// window in Adopt; current servers transfer authoritative native snapshots.
+func adoptStateFromSpool(ctx context.Context, name string, master *os.File, size Size, path string, createdAt time.Time, pid int, exit *ExitError, scrollbackMaxBytes uint64) (*sessionState, error) {
+	vt, err := NewVTTerminalWithOptions(size.Columns, size.Rows, VTTerminalOptions{
+		ScrollbackMaxBytes: scrollbackMaxBytes,
+	})
+	if err != nil {
+		closeFileQuietly(master)
+		return nil, fmt.Errorf("create vt: %w", err)
+	}
+	if err := replaySpool(ctx, vt, path); err != nil {
+		vt.Close()
+		closeFileQuietly(master)
+		return nil, err
+	}
+
+	spool, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		vt.Close()
+		closeFileQuietly(master)
+		return nil, fmt.Errorf("open spool: %w", err)
+	}
+	state := &sessionState{
+		name:               name,
+		path:               path,
+		pid:                pid,
+		masterFD:           -1,
+		size:               size,
+		master:             master,
+		spool:              spool,
+		vt:                 vt,
+		scrollbackMaxBytes: scrollbackMaxBytes,
+		createdAt:          createdAt,
+		done:               make(chan struct{}),
+		reaped:             make(chan struct{}),
+	}
+	if master == nil {
+		if exit == nil {
+			exit = &ExitError{Code: -1, Unknown: true}
+		}
+		state.waitErr = exit
+		close(state.done)
+		close(state.reaped)
+	} else {
+		state.masterFD = int(master.Fd())
+	}
+	return state, nil
+}
+
+func replaySpool(ctx context.Context, vt *VTTerminal, path string) error {
+	archives, err := filepath.Glob(path + ".*.gz")
+	if err != nil {
+		return fmt.Errorf("find spool archives: %w", err)
+	}
+	sort.Strings(archives)
+	paths := make([]struct {
+		path       string
+		compressed bool
+	}, 0, len(archives)+1)
+	for _, archive := range archives {
+		paths = append(paths, struct {
+			path       string
+			compressed bool
+		}{path: archive, compressed: true})
+	}
+	if _, err := os.Stat(path); err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("stat spool: %w", err)
+		}
+		if len(paths) == 0 {
+			return fmt.Errorf("stat spool: %w", err)
+		}
+	} else {
+		paths = append(paths, struct {
+			path       string
+			compressed bool
+		}{path: path})
+	}
+
+	for _, item := range paths {
+		if err := replaySpoolFile(ctx, vt, item.path, item.compressed); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func replaySpoolFile(ctx context.Context, vt *VTTerminal, path string, compressed bool) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open spool replay %s: %w", path, err)
+	}
+	defer closeQuietly(file)
+
+	var reader io.Reader = file
+	var compressedReader *gzip.Reader
+	if compressed {
+		compressedReader, err = gzip.NewReader(file)
+		if err != nil {
+			return fmt.Errorf("open compressed spool replay %s: %w", path, err)
+		}
+		defer compressedReader.Close()
+		reader = compressedReader
+	}
+
+	buffer := make([]byte, 256*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		read, readErr := reader.Read(buffer)
+		if read > 0 {
+			vt.Feed(buffer[:read])
+		}
+		if readErr == io.EOF {
+			return nil
+		}
+		if readErr != nil {
+			return fmt.Errorf("replay spool %s: %w", path, readErr)
+		}
+	}
 }
 
 func terminate(state *sessionState) error {

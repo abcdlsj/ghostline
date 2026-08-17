@@ -1,7 +1,9 @@
 package ghostline
 
 import (
+	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -9,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -218,6 +221,187 @@ func startAdminServerWithSnapshot(t *testing.T, socket string, meta sessionMeta,
 			}
 		}
 	}()
+}
+
+func TestLegacySpoolReplayVersionAllowlist(t *testing.T) {
+	for version, want := range map[string]bool{
+		"0.3.10": false,
+		"0.4.0":  true,
+		"0.5.0":  true,
+		"0.6.0":  false,
+		"":       false,
+	} {
+		if got := legacySpoolReplayVersion(version); got != want {
+			t.Fatalf("legacySpoolReplayVersion(%q) = %t, want %t", version, got, want)
+		}
+	}
+}
+
+func TestAdoptStateFromSpoolReplaysArchivesBeforeLiveSpool(t *testing.T) {
+	outputDir := t.TempDir()
+	path := filepath.Join(outputDir, "warren_spool.out")
+	archive, err := os.OpenFile(path+".100.gz", os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("create archive: %v", err)
+	}
+	writer := gzip.NewWriter(archive)
+	if _, err := writer.Write([]byte("archived\r\n")); err != nil {
+		t.Fatalf("write archive: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close archive: %v", err)
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatalf("close archive file: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("live"), 0o600); err != nil {
+		t.Fatalf("write live spool: %v", err)
+	}
+
+	state, err := adoptStateFromSpool(
+		context.Background(),
+		"warren_spool",
+		nil,
+		Size{Columns: 80, Rows: 24},
+		path,
+		time.Now(),
+		4242,
+		nil,
+		DefaultVTScrollbackMaxBytes,
+	)
+	if err != nil {
+		t.Fatalf("adoptStateFromSpool: %v", err)
+	}
+	defer state.close()
+
+	snapshot, err := state.vt.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if !bytes.Contains(snapshot, []byte("archived")) || !bytes.Contains(snapshot, []byte("live")) {
+		t.Fatalf("spool replay lost content: %q", snapshot)
+	}
+}
+
+func TestAdoptUsesSpoolForLegacySourceVersion(t *testing.T) {
+	ctx := context.Background()
+	outputDir := t.TempDir()
+	socketDir, err := os.MkdirTemp("/tmp", "ghostline-legacy-")
+	if err != nil {
+		t.Fatalf("create socket dir: %v", err)
+	}
+	defer os.RemoveAll(socketDir)
+	publicSocket := filepath.Join(socketDir, "old.sock")
+	adminSocket := publicSocket + ".admin"
+	name := "warren_legacy_spool"
+	spoolPath := filepath.Join(outputDir, name+spoolSuffix)
+	if err := os.WriteFile(spoolPath, []byte("\x1b[5;10Hlegacy"), 0o600); err != nil {
+		t.Fatalf("write spool: %v", err)
+	}
+	meta := sessionMeta{
+		Name:      name,
+		Cols:      80,
+		Rows:      24,
+		CreatedAt: time.Now().Unix(),
+		PID:       4242,
+		Alive:     false,
+		Exit:      &exitMeta{Code: 0},
+	}
+
+	publicListener, err := net.ListenUnix("unix", &net.UnixAddr{Name: publicSocket, Net: "unix"})
+	if err != nil {
+		t.Fatalf("listen public socket: %v", err)
+	}
+	publicDone := make(chan struct{})
+	go func() {
+		defer close(publicDone)
+		for {
+			connection, acceptErr := publicListener.AcceptUnix()
+			if acceptErr != nil {
+				return
+			}
+			go func() {
+				defer connection.Close()
+				requestReader := bufio.NewReader(connection)
+				var request request
+				if err := json.NewDecoder(requestReader).Decode(&request); err != nil {
+					return
+				}
+				result, _ := json.Marshal(versionResult{Version: "0.5.0"})
+				_ = json.NewEncoder(connection).Encode(response{ID: request.ID, Result: result})
+			}()
+		}
+	}()
+	defer func() {
+		_ = publicListener.Close()
+		<-publicDone
+	}()
+
+	adminListener, err := net.ListenUnix("unix", &net.UnixAddr{Name: adminSocket, Net: "unix"})
+	if err != nil {
+		t.Fatalf("listen admin socket: %v", err)
+	}
+	defer adminListener.Close()
+	var snapshotCalls atomic.Int32
+	go func() {
+		connection, acceptErr := adminListener.AcceptUnix()
+		if acceptErr != nil {
+			return
+		}
+		defer connection.Close()
+		transport := newAdminTransport(connection)
+		for {
+			var adminRequest adminRequest
+			if err := transport.read(&adminRequest); err != nil {
+				return
+			}
+			switch adminRequest.Method {
+			case adminMethodList:
+				raw, _ := json.Marshal(adminListResult{Sessions: []sessionMeta{meta}})
+				_ = transport.write(adminResponse{ID: adminRequest.ID, Result: raw}, -1)
+			case adminMethodAdopt:
+				raw, _ := json.Marshal(meta)
+				_ = transport.write(adminResponse{ID: adminRequest.ID, Result: raw}, -1)
+			case adminMethodSnapshot:
+				snapshotCalls.Add(1)
+				_ = transport.write(adminResponse{ID: adminRequest.ID, Error: "unexpected snapshot request"}, -1)
+			case adminMethodCommit:
+				raw, _ := json.Marshal(adminBatchResult{Committed: 1})
+				_ = transport.write(adminResponse{ID: adminRequest.ID, Result: raw}, -1)
+			case adminMethodExit:
+				_ = publicListener.Close()
+				_ = transport.write(adminResponse{ID: adminRequest.ID, Result: json.RawMessage("{}")}, -1)
+				return
+			}
+		}
+	}()
+
+	hub, err := New(Options{OutputDir: outputDir})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer hub.Close()
+	adopted, err := Adopt(ctx, adminSocket, hub)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	if adopted != 1 {
+		t.Fatalf("adopted = %d, want 1", adopted)
+	}
+	if got := snapshotCalls.Load(); got != 0 {
+		t.Fatalf("legacy source received %d native snapshot requests", got)
+	}
+	session, ok := hub.Session(name)
+	if !ok {
+		t.Fatalf("adopted session %q missing", name)
+	}
+	snapshot, err := session.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if !bytes.Contains(snapshot, []byte("legacy")) {
+		t.Fatalf("spool replay lost content: %q", snapshot)
+	}
 }
 
 func TestRollingAdoptRestoresSnapshot(t *testing.T) {

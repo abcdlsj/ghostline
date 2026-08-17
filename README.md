@@ -18,7 +18,8 @@ terminal, or their own session protocol on top.
 - Atomic checkpoints pairing a full VT replay with its exact spool boundary
 - Configurable VT scrollback budgets with a 2 MiB default
 - Detached-mode terminal query responses for TUIs
-- Rolling server upgrades that keep PTY children and emulator state alive
+- Rolling server upgrades that keep PTY children and emulator state alive,
+  including a bounded spool-replay bridge for pre-0.6.0 sources
 - Local `Hub` and Unix-socket `Server`/`Client` with one `Session` API
 
 ## Requirements

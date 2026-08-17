@@ -400,6 +400,14 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 	if err := client.call(ctx, adminMethodList, nil, &listed); err != nil {
 		return 0, err
 	}
+	// Ghostline releases through protocol 0.5.0 used native snapshot encoding
+	// during migration. Those releases can retain an invalid wide-cell pair
+	// after a no-reflow shrink, and the source server aborts its pending
+	// adoption as soon as native encoding returns GHOSTTY_INVALID_VALUE. Detect
+	// that bounded compatibility window before preparing the first session so
+	// the destination can replay the stable spool without asking the old server
+	// to encode the known-bad native state.
+	legacySpoolReplay := legacySpoolReplayRequired(ctx, adminSocket)
 
 	prepared := make([]*sessionState, 0, len(listed.Sessions))
 	preparedNames := make([]string, 0, len(listed.Sessions))
@@ -434,6 +442,24 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 				return 0, err
 			}
 			master = os.NewFile(uintptr(masterFD), "adopted-master")
+		}
+		if legacySpoolReplay {
+			state, err := adoptStateFromSpool(
+				ctx,
+				adopted.Name,
+				master,
+				Size{Columns: adopted.Cols, Rows: adopted.Rows},
+				h.spoolPath(adopted.Name),
+				time.Unix(adopted.CreatedAt, 0),
+				adopted.PID,
+				adopted.Exit.error(),
+				resolveVTScrollbackMaxBytes(adopted.VTScrollbackMaxBytes, h.defaultVTScrollbackMaxBytes),
+			)
+			if err != nil {
+				return 0, fmt.Errorf("replay legacy spool for %s: %w", meta.Name, err)
+			}
+			prepared = append(prepared, state)
+			continue
 		}
 		var snapshotResult adminSnapshotResult
 		if err := client.call(ctx, adminMethodSnapshot, adoptParams{Name: adopted.Name}, &snapshotResult); err != nil {
@@ -494,6 +520,33 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 	_ = waitOldServerGone(retireCtx, adminSocket)
 	cancel()
 	return len(prepared), nil
+}
+
+// legacySpoolReplayRequired enables the temporary migration bridge for source
+// servers that predate the wide-cell resize fix. Keep this an explicit
+// allowlist: once a source advertises a newer protocol, native snapshots are
+// authoritative again and this compatibility path is unreachable.
+func legacySpoolReplayRequired(ctx context.Context, adminSocket string) bool {
+	publicSocket := strings.TrimSuffix(adminSocket, ".admin")
+	if publicSocket == adminSocket {
+		return false
+	}
+	versionContext, cancel := context.WithTimeout(ctx, adminTimeout)
+	defer cancel()
+	version, err := NewClient(publicSocket).Version(versionContext)
+	if err != nil {
+		return false
+	}
+	return legacySpoolReplayVersion(version)
+}
+
+func legacySpoolReplayVersion(version string) bool {
+	switch version {
+	case "0.4.0", "0.5.0":
+		return true
+	default:
+		return false
+	}
 }
 
 func waitOldServerGone(ctx context.Context, adminSocket string) error {
