@@ -215,6 +215,9 @@ The repository includes the Ghostty C headers and a prebuilt macOS arm64
 library. Other platforms must build libghostty-vt from Ghostty source with
 Zig 0.16.0 or newer:
 
+The bundled copy is built from [Ghostty commit `5851d986`](https://github.com/ghostty-org/ghostty/commit/5851d98615187d85052e41042bcf66e0ccec11d4)
+(`1.3.2-dev`) with Zig 0.16.0 and `ReleaseFast` optimization.
+
 ```sh
 brew install zig@0.16
 git clone https://github.com/ghostty-org/ghostty
