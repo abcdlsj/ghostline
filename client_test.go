@@ -187,6 +187,20 @@ func TestClientVersionReportsProtocol(t *testing.T) {
 	}
 }
 
+func TestClientVersionInfoReportsProtocolAndTag(t *testing.T) {
+	_, client := startTestServer(t)
+	info, err := client.VersionInfo(context.Background())
+	if err != nil {
+		t.Fatalf("VersionInfo: %v", err)
+	}
+	if info.ProtocolVersion != ghostline.ProtocolVersion {
+		t.Fatalf("VersionInfo protocol = %q, want %q", info.ProtocolVersion, ghostline.ProtocolVersion)
+	}
+	if info.TagVersion != ghostline.TagVersion() {
+		t.Fatalf("VersionInfo tag = %q, want %q", info.TagVersion, ghostline.TagVersion())
+	}
+}
+
 func TestClientWaitReturnsExitError(t *testing.T) {
 	_, client := startTestServer(t)
 	session, err := client.Start(context.Background(), ghostline.SessionOptions{

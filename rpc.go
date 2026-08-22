@@ -78,7 +78,8 @@ type createResult struct {
 }
 
 type versionResult struct {
-	Version string `json:"version"`
+	Version    string `json:"version"`
+	TagVersion string `json:"tagVersion,omitempty"`
 }
 
 type listResult struct {

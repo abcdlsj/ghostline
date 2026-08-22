@@ -149,15 +149,33 @@ func (c *Client) Check(ctx context.Context) error {
 	return nil
 }
 
-// Version returns the server's RPC protocol version. An error or an empty
-// value means the server predates protocol versioning; embedders use this to
-// decide whether to roll the server (see RFC 0002) or keep serving from it.
-func (c *Client) Version(ctx context.Context) (string, error) {
+// VersionInfo describes the protocol and release tag reported by a server.
+// Older servers may leave TagVersion empty because the field was added after
+// protocol versioning; callers can still use ProtocolVersion for compatibility
+// checks.
+type VersionInfo struct {
+	ProtocolVersion string
+	TagVersion      string
+}
+
+// VersionInfo returns the server's RPC protocol version and release tag. An
+// error means the server predates version reporting or is unreachable.
+func (c *Client) VersionInfo(ctx context.Context) (VersionInfo, error) {
 	var result versionResult
 	if err := c.call(ctx, rpcMethodVersion, nil, &result); err != nil {
-		return "", err
+		return VersionInfo{}, err
 	}
-	return result.Version, nil
+	return VersionInfo{
+		ProtocolVersion: result.Version,
+		TagVersion:      result.TagVersion,
+	}, nil
+}
+
+// Version returns the server's RPC protocol version. Use VersionInfo when the
+// release tag is also needed.
+func (c *Client) Version(ctx context.Context) (string, error) {
+	info, err := c.VersionInfo(ctx)
+	return info.ProtocolVersion, err
 }
 
 func dial(ctx context.Context, socket string) (net.Conn, error) {

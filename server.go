@@ -482,7 +482,7 @@ func (s *Server) namedSession(raw json.RawMessage) (Session, error) {
 func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessage) (any, error) {
 	switch method {
 	case rpcMethodVersion:
-		return versionResult{Version: ProtocolVersion}, nil
+		return versionResult{Version: ProtocolVersion, TagVersion: TagVersion()}, nil
 
 	case rpcMethodCreate:
 		params, err := decode[createParams](raw)
