@@ -30,6 +30,7 @@ type SpoolWatcher struct {
 	onOverflow func()
 	notifier   spoolNotifier
 	heartbeat  time.Duration
+	eventDelay time.Duration
 	stat       func() (os.FileInfo, error)
 
 	ping      chan struct{}
@@ -72,6 +73,10 @@ func NewSpoolWatcher(path string, offset int64, onBytes func([]byte), onRotate f
 		onOverflow: onOverflow,
 		notifier:   notifier,
 		heartbeat:  time.Second,
+		// PTYs commonly emit one logical screen update as many adjacent file
+		// writes. A short delay preserves interactive latency while allowing the
+		// watcher to deliver that burst in one read and one callback.
+		eventDelay: 4 * time.Millisecond,
 		stat:       file.Stat,
 		ping:       make(chan struct{}, 1),
 		done:       make(chan struct{}),
@@ -179,10 +184,29 @@ func (w *SpoolWatcher) loop() {
 		case <-w.ping:
 			w.drain()
 		case <-w.notifier.Events():
+			if !w.waitForEventBurst() {
+				return
+			}
 			w.drain()
 		case <-heartbeat.C:
 			w.drain()
 		}
+	}
+}
+
+func (w *SpoolWatcher) waitForEventBurst() bool {
+	if w.eventDelay <= 0 {
+		return true
+	}
+	timer := time.NewTimer(w.eventDelay)
+	defer timer.Stop()
+	select {
+	case <-w.done:
+		return false
+	case <-w.ping:
+		return true
+	case <-timer.C:
+		return true
 	}
 }
 
