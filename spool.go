@@ -24,11 +24,13 @@ type SpoolWatcher struct {
 	file       *os.File
 	offset     atomic.Int64
 	maxBytes   atomic.Int64
-	interval   time.Duration
 	buffer     []byte
 	onBytes    func([]byte)
 	onRotate   func()
 	onOverflow func()
+	notifier   spoolNotifier
+	heartbeat  time.Duration
+	stat       func() (os.FileInfo, error)
 
 	ping      chan struct{}
 	done      chan struct{}
@@ -39,7 +41,7 @@ type SpoolWatcher struct {
 }
 
 // NewSpoolWatcher returns a watcher positioned at offset in the file at path.
-// The callbacks may be nil. Start begins polling.
+// The callbacks may be nil. Start begins watching.
 func NewSpoolWatcher(path string, offset int64, onBytes func([]byte), onRotate func(), onOverflow func()) (*SpoolWatcher, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -61,13 +63,16 @@ func NewSpoolWatcher(path string, offset int64, onBytes func([]byte), onRotate f
 		closeQuietly(file)
 		return nil, err
 	}
+	notifier := newSpoolNotifier(path, file)
 	w := &SpoolWatcher{
 		path:       path,
 		file:       file,
-		interval:   10 * time.Millisecond,
 		onBytes:    onBytes,
 		onRotate:   onRotate,
 		onOverflow: onOverflow,
+		notifier:   notifier,
+		heartbeat:  time.Second,
+		stat:       file.Stat,
 		ping:       make(chan struct{}, 1),
 		done:       make(chan struct{}),
 	}
@@ -117,6 +122,7 @@ func (w *SpoolWatcher) Start() {
 func (w *SpoolWatcher) Close() {
 	w.closeOnce.Do(func() {
 		close(w.done)
+		w.notifier.Close()
 		closeQuietly(w.file)
 	})
 }
@@ -163,8 +169,8 @@ func (w *SpoolWatcher) SkipTo(offset int64) error {
 }
 
 func (w *SpoolWatcher) loop() {
-	ticker := time.NewTicker(w.interval)
-	defer ticker.Stop()
+	heartbeat := time.NewTicker(w.heartbeat)
+	defer heartbeat.Stop()
 	w.drain()
 	for {
 		select {
@@ -172,7 +178,9 @@ func (w *SpoolWatcher) loop() {
 			return
 		case <-w.ping:
 			w.drain()
-		case <-ticker.C:
+		case <-w.notifier.Events():
+			w.drain()
+		case <-heartbeat.C:
 			w.drain()
 		}
 	}
@@ -184,7 +192,7 @@ func (w *SpoolWatcher) drain() {
 	if w.paused {
 		return
 	}
-	info, err := w.file.Stat()
+	info, err := w.stat()
 	if err != nil {
 		return
 	}
