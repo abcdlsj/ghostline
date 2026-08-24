@@ -6,6 +6,9 @@ import (
 )
 
 type spoolNotifier interface {
+	// Events returns coalesced wake-up hints. Notifications carry no output
+	// data; SpoolWatcher reads the spool from its offset through EOF after a
+	// wake-up.
 	Events() <-chan struct{}
 	Close()
 }

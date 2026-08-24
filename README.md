@@ -66,9 +66,11 @@ _ = session.Resize(ctx, ghostline.Size{Columns: 100, Rows: 30})
 
 `WatchOutput` starts at a raw spool offset. Its callback receives a borrowed
 slice that is valid only until the callback returns; copy it if it must be
-retained. File notifications wake idle watchers when output arrives on Darwin
-and Linux; a low-frequency heartbeat covers filesystems that miss or coalesce
-notifications without continuously polling every Session.
+retained. File notifications are wake-up hints, not output records: each wake
+reads the spool from the current offset through EOF and delivers ordered byte
+chunks. Chunk boundaries do not correspond to file writes. A low-frequency
+heartbeat covers filesystems that miss or coalesce notifications without
+continuously polling every Session.
 
 VT scrollback and raw spool retention are separate. Configure the default VT
 scrollback for a Hub with `Options.VTScrollbackMaxBytes`, or override it for a

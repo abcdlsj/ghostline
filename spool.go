@@ -11,9 +11,10 @@ import (
 )
 
 // SpoolWatcher reads an append-only spool from a persisted byte offset,
-// draining to EOF whenever the file grows. The byte slice passed to onBytes is
+// draining to EOF whenever it is woken. The byte slice passed to onBytes is
 // valid only for the duration of the callback; callers must copy it to retain
-// it.
+// it. Chunk boundaries are determined by file reads, not by writes or
+// notifications.
 //
 // The watcher also detects in-place truncation (spool compaction). After a
 // truncate the file size drops below the watcher offset; the watcher re-bases
@@ -30,7 +31,6 @@ type SpoolWatcher struct {
 	onOverflow func()
 	notifier   spoolNotifier
 	heartbeat  time.Duration
-	eventDelay time.Duration
 	stat       func() (os.FileInfo, error)
 
 	ping      chan struct{}
@@ -73,10 +73,6 @@ func NewSpoolWatcher(path string, offset int64, onBytes func([]byte), onRotate f
 		onOverflow: onOverflow,
 		notifier:   notifier,
 		heartbeat:  time.Second,
-		// PTYs commonly emit one logical screen update as many adjacent file
-		// writes. A short delay preserves interactive latency while allowing the
-		// watcher to deliver that burst in one read and one callback.
-		eventDelay: 4 * time.Millisecond,
 		stat:       file.Stat,
 		ping:       make(chan struct{}, 1),
 		done:       make(chan struct{}),
@@ -176,44 +172,16 @@ func (w *SpoolWatcher) SkipTo(offset int64) error {
 func (w *SpoolWatcher) loop() {
 	heartbeat := time.NewTicker(w.heartbeat)
 	defer heartbeat.Stop()
-	eventTimer := time.NewTimer(time.Hour)
-	if !eventTimer.Stop() {
-		<-eventTimer.C
-	}
-	defer eventTimer.Stop()
-	var eventTimerC <-chan time.Time
-	stopEventTimer := func() {
-		if eventTimerC == nil {
-			return
-		}
-		if !eventTimer.Stop() {
-			select {
-			case <-eventTimer.C:
-			default:
-			}
-		}
-		eventTimerC = nil
-	}
 	w.drain()
 	for {
 		select {
 		case <-w.done:
 			return
 		case <-w.ping:
-			stopEventTimer()
 			w.drain()
 		case <-w.notifier.Events():
-			if w.eventDelay <= 0 {
-				w.drain()
-			} else if eventTimerC == nil {
-				eventTimer.Reset(w.eventDelay)
-				eventTimerC = eventTimer.C
-			}
-		case <-eventTimerC:
-			eventTimerC = nil
 			w.drain()
 		case <-heartbeat.C:
-			stopEventTimer()
 			w.drain()
 		}
 	}

@@ -37,7 +37,7 @@ func TestSpoolWatcherFileEventPrecedesHeartbeat(t *testing.T) {
 	}
 }
 
-func TestSpoolWatcherDoesNotStatIdleFileAtInteractiveCadence(t *testing.T) {
+func TestSpoolWatcherDoesNotPollIdleFileBeforeHeartbeat(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "idle.out")
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -69,24 +69,21 @@ func TestSpoolWatcherDoesNotStatIdleFileAtInteractiveCadence(t *testing.T) {
 	}
 }
 
-func TestSpoolWatcherCoalescesInteractiveWriteBurst(t *testing.T) {
+func TestSpoolWatcherDrainsWriteBurstInOrder(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "burst.out")
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var mu sync.Mutex
 	var delivered []byte
-	var callbacks int
 	watcher, err := NewSpoolWatcher(path, 0, func(data []byte) {
 		mu.Lock()
 		defer mu.Unlock()
 		delivered = append(delivered, data...)
-		callbacks++
 	}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	watcher.eventDelay = 20 * time.Millisecond
 	var checks atomic.Int64
 	stat := watcher.stat
 	watcher.stat = func() (os.FileInfo, error) {
@@ -103,8 +100,9 @@ func TestSpoolWatcherCoalescesInteractiveWriteBurst(t *testing.T) {
 		t.Fatal("watcher did not complete its initial drain")
 	}
 
-	for range 10 {
-		appendToFile(t, path, "x")
+	want := "0123456789"
+	for _, chunk := range want {
+		appendToFile(t, path, string(chunk))
 		time.Sleep(2 * time.Millisecond)
 	}
 	deadline := time.Now().Add(500 * time.Millisecond)
@@ -112,7 +110,7 @@ func TestSpoolWatcherCoalescesInteractiveWriteBurst(t *testing.T) {
 		mu.Lock()
 		count := len(delivered)
 		mu.Unlock()
-		if count == 10 || time.Now().After(deadline) {
+		if count == len(want) || time.Now().After(deadline) {
 			break
 		}
 		time.Sleep(time.Millisecond)
@@ -120,10 +118,60 @@ func TestSpoolWatcherCoalescesInteractiveWriteBurst(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if string(delivered) != "xxxxxxxxxx" {
-		t.Fatalf("delivered = %q, want ten bytes", delivered)
+	if string(delivered) != want {
+		t.Fatalf("delivered = %q, want %q", delivered, want)
 	}
-	if callbacks > 5 {
-		t.Fatalf("callbacks = %d, want the ten-write burst to be coalesced", callbacks)
+	if got := watcher.Offset(); got != int64(len(want)) {
+		t.Fatalf("offset = %d, want %d", got, len(want))
 	}
 }
+
+func TestSpoolWatcherHeartbeatRecoversWithoutFileEvent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "heartbeat.out")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	delivered := make(chan string, 1)
+	watcher, err := NewSpoolWatcher(path, 0, func(data []byte) {
+		delivered <- string(append([]byte(nil), data...))
+	}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldNotifier := watcher.notifier
+	oldNotifier.Close()
+	watcher.notifier = &silentSpoolNotifier{events: make(chan struct{})}
+	watcher.heartbeat = 20 * time.Millisecond
+	initialCheck := make(chan struct{})
+	var initialOnce sync.Once
+	stat := watcher.stat
+	watcher.stat = func() (os.FileInfo, error) {
+		initialOnce.Do(func() { close(initialCheck) })
+		return stat()
+	}
+	watcher.Start()
+	defer watcher.Close()
+
+	select {
+	case <-initialCheck:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("watcher did not perform its initial check")
+	}
+	appendToFile(t, path, "heartbeat")
+	select {
+	case got := <-delivered:
+		if got != "heartbeat" {
+			t.Fatalf("delivered = %q, want heartbeat", got)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("heartbeat did not recover output without a file event")
+	}
+}
+
+type silentSpoolNotifier struct {
+	events <-chan struct{}
+}
+
+func (n *silentSpoolNotifier) Events() <-chan struct{} { return n.events }
+
+func (*silentSpoolNotifier) Close() {}
