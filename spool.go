@@ -176,37 +176,46 @@ func (w *SpoolWatcher) SkipTo(offset int64) error {
 func (w *SpoolWatcher) loop() {
 	heartbeat := time.NewTicker(w.heartbeat)
 	defer heartbeat.Stop()
+	eventTimer := time.NewTimer(time.Hour)
+	if !eventTimer.Stop() {
+		<-eventTimer.C
+	}
+	defer eventTimer.Stop()
+	var eventTimerC <-chan time.Time
+	stopEventTimer := func() {
+		if eventTimerC == nil {
+			return
+		}
+		if !eventTimer.Stop() {
+			select {
+			case <-eventTimer.C:
+			default:
+			}
+		}
+		eventTimerC = nil
+	}
 	w.drain()
 	for {
 		select {
 		case <-w.done:
 			return
 		case <-w.ping:
+			stopEventTimer()
 			w.drain()
 		case <-w.notifier.Events():
-			if !w.waitForEventBurst() {
-				return
+			if w.eventDelay <= 0 {
+				w.drain()
+			} else if eventTimerC == nil {
+				eventTimer.Reset(w.eventDelay)
+				eventTimerC = eventTimer.C
 			}
+		case <-eventTimerC:
+			eventTimerC = nil
 			w.drain()
 		case <-heartbeat.C:
+			stopEventTimer()
 			w.drain()
 		}
-	}
-}
-
-func (w *SpoolWatcher) waitForEventBurst() bool {
-	if w.eventDelay <= 0 {
-		return true
-	}
-	timer := time.NewTimer(w.eventDelay)
-	defer timer.Stop()
-	select {
-	case <-w.done:
-		return false
-	case <-w.ping:
-		return true
-	case <-timer.C:
-		return true
 	}
 }
 

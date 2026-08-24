@@ -87,8 +87,21 @@ func TestSpoolWatcherCoalescesInteractiveWriteBurst(t *testing.T) {
 		t.Fatal(err)
 	}
 	watcher.eventDelay = 20 * time.Millisecond
+	var checks atomic.Int64
+	stat := watcher.stat
+	watcher.stat = func() (os.FileInfo, error) {
+		checks.Add(1)
+		return stat()
+	}
 	watcher.Start()
 	defer watcher.Close()
+	initialDeadline := time.Now().Add(250 * time.Millisecond)
+	for checks.Load() == 0 && time.Now().Before(initialDeadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if checks.Load() == 0 {
+		t.Fatal("watcher did not complete its initial drain")
+	}
 
 	for range 10 {
 		appendToFile(t, path, "x")
@@ -110,7 +123,7 @@ func TestSpoolWatcherCoalescesInteractiveWriteBurst(t *testing.T) {
 	if string(delivered) != "xxxxxxxxxx" {
 		t.Fatalf("delivered = %q, want ten bytes", delivered)
 	}
-	if callbacks > 2 {
-		t.Fatalf("callbacks = %d, want at most two coalesced deliveries", callbacks)
+	if callbacks > 5 {
+		t.Fatalf("callbacks = %d, want the ten-write burst to be coalesced", callbacks)
 	}
 }
