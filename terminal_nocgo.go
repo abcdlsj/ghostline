@@ -1,42 +1,39 @@
-//go:build !cgo
+//go:build !cgo || (!darwin && !linux) || ((darwin || linux) && !amd64 && !arm64)
 
 package ghostline
 
 import "fmt"
 
-// VTTerminal is unavailable in builds that disable CGo.
-type VTTerminal struct{}
+type vtTerminal struct{}
 
-// NewVTTerminal reports that libghostty-vt requires CGo.
-func NewVTTerminal(int, int) (*VTTerminal, error) {
-	return nil, fmt.Errorf("%w: libghostty-vt requires cgo", ErrUnavailable)
+func newVTTerminal(int, int) (*vtTerminal, error) {
+	return nil, fmt.Errorf("%w: libghostty-vt is unavailable for this build", ErrUnavailable)
 }
 
-// NewVTTerminalWithOptions reports that libghostty-vt requires CGo.
-func NewVTTerminalWithOptions(int, int, VTTerminalOptions) (*VTTerminal, error) {
-	return nil, fmt.Errorf("%w: libghostty-vt requires cgo", ErrUnavailable)
+func newVTTerminalWithOptions(int, int, vtTerminalOptions) (*vtTerminal, error) {
+	return nil, fmt.Errorf("%w: libghostty-vt is unavailable for this build", ErrUnavailable)
 }
 
 // Feed is a no-op on an unavailable terminal.
-func (*VTTerminal) Feed([]byte) {}
+func (*vtTerminal) Feed([]byte) {}
 
 // Resize is a no-op on an unavailable terminal.
-func (*VTTerminal) Resize(int, int) {}
+func (*vtTerminal) Resize(int, int) {}
 
-// Snapshot reports that libghostty-vt requires CGo.
-func (*VTTerminal) Snapshot() ([]byte, error) {
-	return nil, fmt.Errorf("%w: libghostty-vt requires cgo", ErrUnavailable)
+// Snapshot reports that libghostty-vt is unavailable in this build.
+func (*vtTerminal) Snapshot() ([]byte, error) {
+	return nil, fmt.Errorf("%w: libghostty-vt is unavailable for this build", ErrUnavailable)
 }
 
-// EncodeState reports that libghostty-vt requires CGo.
-func (*VTTerminal) EncodeState() ([]byte, error) {
-	return nil, fmt.Errorf("%w: libghostty-vt requires cgo", ErrUnavailable)
+// EncodeState reports that libghostty-vt is unavailable in this build.
+func (*vtTerminal) EncodeState() ([]byte, error) {
+	return nil, fmt.Errorf("%w: libghostty-vt is unavailable for this build", ErrUnavailable)
 }
 
-// RestoreState reports that libghostty-vt requires CGo.
-func (*VTTerminal) RestoreState([]byte) error {
-	return fmt.Errorf("%w: libghostty-vt requires cgo", ErrUnavailable)
+// RestoreState reports that libghostty-vt is unavailable in this build.
+func (*vtTerminal) RestoreState([]byte) error {
+	return fmt.Errorf("%w: libghostty-vt is unavailable for this build", ErrUnavailable)
 }
 
 // Close is a no-op on an unavailable terminal.
-func (*VTTerminal) Close() {}
+func (*vtTerminal) Close() {}

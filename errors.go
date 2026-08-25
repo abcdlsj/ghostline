@@ -16,8 +16,22 @@ var (
 	ErrSessionNotFound = errors.New("ghostline: session not found")
 	// ErrSessionClosed indicates that a session handle is no longer usable.
 	ErrSessionClosed = errors.New("ghostline: session closed")
-	// ErrInvalidSessionName indicates that a name cannot identify a spool file.
+	// ErrInvalidSessionName indicates that a name cannot identify session
+	// storage safely.
 	ErrInvalidSessionName = errors.New("ghostline: invalid session name")
+	// ErrInvalidSignal indicates that Signal received nil, zero, or a signal
+	// value that is not backed by syscall.Signal.
+	ErrInvalidSignal = errors.New("ghostline: invalid process signal")
+	// ErrInvalidCursor indicates a malformed cursor or a position beyond the
+	// output currently available in its generation.
+	ErrInvalidCursor = errors.New("ghostline: invalid output cursor")
+	// ErrCursorExpired indicates that retention pruned the cursor's generation.
+	ErrCursorExpired = errors.New("ghostline: output cursor expired")
+	// ErrFrameTooLarge indicates that one RPC frame exceeded the protocol
+	// limit. Large protocol payloads must use a chunked stream instead.
+	ErrFrameTooLarge = errors.New("ghostline: RPC frame too large")
+	// ErrProtocolMismatch indicates that peers use incompatible wire framing.
+	ErrProtocolMismatch = errors.New("ghostline: RPC protocol mismatch")
 )
 
 // ExitError describes a terminated child process.

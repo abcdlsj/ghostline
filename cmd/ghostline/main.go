@@ -40,7 +40,7 @@ func usage() {
 func serveCommand(args []string) {
 	flags := flag.NewFlagSet("serve", flag.ExitOnError)
 	socket := flags.String("socket", "", "unix socket path (required)")
-	outputDir := flags.String("output-dir", "", "output spool directory (default ~/.ghostline/output)")
+	outputDir := flags.String("output-dir", "", "segmented output root (default ~/.ghostline/output)")
 	defaultTerm := flags.String("default-term", "", "TERM for sessions without one (default xterm-256color)")
 	vtScrollbackMaxBytes := flags.Uint64("vt-scrollback-max-bytes", 0, "VT scrollback budget in bytes (default 2 MiB)")
 	adoptFrom := flags.String("adopt-from", "", "old server admin socket to adopt sessions from before serving")

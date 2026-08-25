@@ -1,12 +1,13 @@
-//go:build cgo
+//go:build cgo && ((darwin && (amd64 || arm64)) || (linux && (amd64 || arm64)))
 
 package ghostline
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/third_party/include
-#cgo darwin,arm64 LDFLAGS: -L${SRCDIR}/third_party/lib -lghostty-vt -Wl,-rpath,${SRCDIR}/third_party/lib
-#cgo darwin,!arm64 LDFLAGS: -lghostty-vt
-#cgo !darwin LDFLAGS: -lghostty-vt
+#cgo darwin LDFLAGS: ${SRCDIR}/third_party/lib/libghostty-vt.a -lc++
+#cgo linux,amd64 LDFLAGS: ${SRCDIR}/third_party/lib/linux_amd64/libghostty-vt.a -lstdc++ -lm -lrt
+#cgo linux,arm64 LDFLAGS: ${SRCDIR}/third_party/lib/linux_arm64/libghostty-vt.a -lstdc++ -lm -lrt
+#cgo !darwin,!linux LDFLAGS: -lghostty-vt
 #include <stdlib.h>
 #include <ghostty/vt.h>
 #include <ghostty/vt/snapshot.h>
@@ -67,6 +68,9 @@ static bool ghostline_terminal_mode(
 import "C"
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"strconv"
 	"sync"
@@ -74,27 +78,25 @@ import (
 )
 
 // snapshotContinuationMaxBytes keeps unfinished VT and UTF-8 input replayable
-// during migration. It is independent of the resize compatibility below.
+// during migration. It is independent of the resize repair below.
 const snapshotContinuationMaxBytes = 1 << 20
 
-// VTTerminal is a libghostty-vt terminal emulator that renders raw PTY bytes
-// into a complete screen snapshot (visible grid + scrollback) with SGR styles
-// preserved. It is the server-side counterpart of the Ghostty client, so a
-// replayed snapshot matches exactly what the client would have rendered.
-type VTTerminal struct {
+const (
+	vtStateMagic      = "ghostline-vt-v1\x00"
+	vtStateHeaderSize = len(vtStateMagic) + 8 + sha256.Size
+)
+
+type vtTerminal struct {
 	mu                 sync.Mutex
 	terminal           C.GhosttyTerminal
 	scrollbackMaxBytes uint64
 }
 
-// NewVTTerminal creates a terminal emulator with the given grid size.
-func NewVTTerminal(cols, rows int) (*VTTerminal, error) {
-	return NewVTTerminalWithOptions(cols, rows, VTTerminalOptions{})
+func newVTTerminal(cols, rows int) (*vtTerminal, error) {
+	return newVTTerminalWithOptions(cols, rows, vtTerminalOptions{})
 }
 
-// NewVTTerminalWithOptions creates a terminal emulator with the given grid
-// size and VT configuration.
-func NewVTTerminalWithOptions(cols, rows int, options VTTerminalOptions) (*VTTerminal, error) {
+func newVTTerminalWithOptions(cols, rows int, options vtTerminalOptions) (*vtTerminal, error) {
 	if cols <= 0 || rows <= 0 || cols > maxTerminalDimension || rows > maxTerminalDimension {
 		return nil, fmt.Errorf("invalid terminal size %dx%d", cols, rows)
 	}
@@ -116,7 +118,7 @@ func NewVTTerminalWithOptions(cols, rows int, options VTTerminalOptions) (*VTTer
 		C.ghostty_terminal_free(terminal)
 		return nil, err
 	}
-	return &VTTerminal{
+	return &vtTerminal{
 		terminal:           terminal,
 		scrollbackMaxBytes: scrollbackMaxBytes,
 	}, nil
@@ -150,7 +152,7 @@ func enableContinuationTracking(terminal C.GhosttyTerminal) error {
 }
 
 // Feed parses raw PTY bytes into the emulated terminal state.
-func (v *VTTerminal) Feed(data []byte) {
+func (v *vtTerminal) Feed(data []byte) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.terminal == nil || len(data) == 0 {
@@ -159,7 +161,7 @@ func (v *VTTerminal) Feed(data []byte) {
 	v.writeLocked(data)
 }
 
-func (v *VTTerminal) writeLocked(data []byte) {
+func (v *vtTerminal) writeLocked(data []byte) {
 	if len(data) == 0 {
 		return
 	}
@@ -174,7 +176,7 @@ func (v *VTTerminal) writeLocked(data []byte) {
 // their spacer tail by an old no-reflow resize implementation. The public
 // Ghostty API exposes cells as read-only, so the repair is expressed as an
 // ordinary erase operation on the active terminal screen.
-func (v *VTTerminal) clearWideResizeBoundaryLocked(cols, rows int, onlyNoReflow bool) {
+func (v *vtTerminal) clearWideResizeBoundaryLocked(cols, rows int, onlyNoReflow bool) {
 	if v.terminal == nil || cols <= 0 || rows <= 0 {
 		return
 	}
@@ -268,7 +270,7 @@ func (v *VTTerminal) clearWideResizeBoundaryLocked(cols, rows int, onlyNoReflow 
 // an older no-reflow resize cannot leave an unpaired wide head there. This is
 // only used after snapshot encoding reports GHOSTTY_INVALID_VALUE; the public
 // API has no read-only handle for an inactive screen.
-func (v *VTTerminal) clearInactiveAlternateBoundaryLocked() {
+func (v *vtTerminal) clearInactiveAlternateBoundaryLocked() {
 	if v.terminal == nil || !C.ghostline_terminal_is_ground(v.terminal) ||
 		C.ghostline_terminal_mode(v.terminal, C.GHOSTTY_MODE_ORIGIN) {
 		return
@@ -326,7 +328,7 @@ func (v *VTTerminal) clearInactiveAlternateBoundaryLocked() {
 	v.writeLocked(restore)
 }
 
-func (v *VTTerminal) encodeStateLocked() ([]byte, C.GhosttyResult) {
+func (v *vtTerminal) encodeStateLocked() ([]byte, C.GhosttyResult) {
 	var buffer *C.uint8_t
 	var length C.size_t
 	result := C.ghostty_snapshot_encode_alloc(v.terminal, nil, &buffer, &length)
@@ -339,7 +341,7 @@ func (v *VTTerminal) encodeStateLocked() ([]byte, C.GhosttyResult) {
 
 // Resize reflows the emulated terminal. The caller keeps the real PTY size
 // in sync so snapshots are rendered at the client's dimensions.
-func (v *VTTerminal) Resize(cols, rows int) {
+func (v *vtTerminal) Resize(cols, rows int) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.terminal == nil || cols <= 0 || rows <= 0 || cols > maxTerminalDimension || rows > maxTerminalDimension {
@@ -352,7 +354,7 @@ func (v *VTTerminal) Resize(cols, rows int) {
 // EncodeState encodes the full emulator state (visible grid, scrollback,
 // cursor, and terminal modes) so a session can be migrated to another server
 // process.
-func (v *VTTerminal) EncodeState() ([]byte, error) {
+func (v *vtTerminal) EncodeState() ([]byte, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.terminal == nil {
@@ -381,25 +383,25 @@ func (v *VTTerminal) EncodeState() ([]byte, error) {
 	if result != C.GHOSTTY_SUCCESS {
 		return nil, fmt.Errorf("ghostty snapshot encode failed: %d", result)
 	}
-	return snapshot, nil
+	return wrapVTState(snapshot), nil
 }
 
-// RestoreState replaces the emulated state with bytes produced by EncodeState.
-func (v *VTTerminal) RestoreState(snapshot []byte) error {
+func (v *vtTerminal) RestoreState(snapshot []byte) error {
+	raw, err := unwrapVTState(snapshot)
+	if err != nil {
+		return err
+	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.terminal == nil {
 		return fmt.Errorf("ghostty terminal is closed")
 	}
-	if len(snapshot) == 0 {
-		return fmt.Errorf("ghostty snapshot is empty")
-	}
 	var decoder C.GhosttySnapshotDecoder
 	if result := C.ghostty_snapshot_decoder_new_buf(
 		nil,
 		&decoder,
-		(*C.uint8_t)(unsafe.Pointer(&snapshot[0])),
-		C.size_t(len(snapshot)),
+		(*C.uint8_t)(unsafe.Pointer(&raw[0])),
+		C.size_t(len(raw)),
 	); result != C.GHOSTTY_SUCCESS {
 		return fmt.Errorf("ghostty snapshot decoder new failed: %d", result)
 	}
@@ -421,9 +423,38 @@ func (v *VTTerminal) RestoreState(snapshot []byte) error {
 	return nil
 }
 
+func wrapVTState(raw []byte) []byte {
+	state := make([]byte, vtStateHeaderSize+len(raw))
+	copy(state, vtStateMagic)
+	binary.LittleEndian.PutUint64(state[len(vtStateMagic):], uint64(len(raw)))
+	digest := sha256.Sum256(raw)
+	copy(state[len(vtStateMagic)+8:], digest[:])
+	copy(state[vtStateHeaderSize:], raw)
+	return state
+}
+
+func unwrapVTState(state []byte) ([]byte, error) {
+	if len(state) < vtStateHeaderSize || !bytes.Equal(state[:len(vtStateMagic)], []byte(vtStateMagic)) {
+		return nil, fmt.Errorf("invalid ghostline VT state envelope")
+	}
+	raw := state[vtStateHeaderSize:]
+	if binary.LittleEndian.Uint64(state[len(vtStateMagic):]) != uint64(len(raw)) {
+		return nil, fmt.Errorf("invalid ghostline VT state length")
+	}
+	want := state[len(vtStateMagic)+8 : vtStateHeaderSize]
+	got := sha256.Sum256(raw)
+	if !bytes.Equal(want, got[:]) {
+		return nil, fmt.Errorf("invalid ghostline VT state checksum")
+	}
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("ghostline VT state payload is empty")
+	}
+	return raw, nil
+}
+
 // Snapshot renders the current emulated screen (visible grid + scrollback)
 // as VT sequences that preserve colors and styles.
-func (v *VTTerminal) Snapshot() ([]byte, error) {
+func (v *vtTerminal) Snapshot() ([]byte, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.terminal == nil {
@@ -456,7 +487,7 @@ func (v *VTTerminal) Snapshot() ([]byte, error) {
 }
 
 // Close releases the native terminal state. It must be called at most once.
-func (v *VTTerminal) Close() {
+func (v *vtTerminal) Close() {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.terminal != nil {

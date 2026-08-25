@@ -25,7 +25,7 @@ func removeQuietly(path string) {
 	_ = os.Remove(path)
 }
 
-// defaultOutputDirectory is the per-session output spool directory when the
+// defaultOutputDirectory is the per-session output root when the
 // caller does not configure one.
 func defaultOutputDirectory() string {
 	home, _ := os.UserHomeDir()

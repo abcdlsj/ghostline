@@ -22,7 +22,10 @@ const (
 //
 // The callback should return a six-digit RGB value with an optional leading
 // '#'. It returns false when the requested color is not available. A callback
-// is optional; without one, unknown colors receive no reply.
+// is optional; without one, unknown colors receive no reply. Feed invokes the
+// callback synchronously without holding the responder's internal lock. The
+// callback may re-enter the responder. Concurrent Feed calls may invoke it
+// concurrently.
 type ColorQueryCallback func(ColorQueryKind) (color string, ok bool)
 
 // QueryResponder answers terminal capability queries while a session has no
@@ -30,6 +33,8 @@ type ColorQueryCallback func(ColorQueryKind) (color string, ok bool)
 // keyboard queries at startup. A raw PTY has nobody to answer until a client
 // attaches, so the application may downgrade itself (for example disabling
 // colors). Replies are written back into the PTY as input, never into output.
+// Feed and Resize are safe for concurrent use. The responder starts no
+// goroutines.
 type QueryResponder struct {
 	mu         sync.Mutex
 	pending    []byte
@@ -49,6 +54,11 @@ func NewQueryResponderWithColorQuery(callback ColorQueryCallback) *QueryResponde
 	return &QueryResponder{rows: 36, cols: 120, colorQuery: callback}
 }
 
+type pendingQueryReply struct {
+	fixed     []byte
+	colorKind ColorQueryKind
+}
+
 // Resize updates the window size reported in XTWINOPS replies.
 func (r *QueryResponder) Resize(columns, rows int) {
 	if columns <= 0 || rows <= 0 {
@@ -62,12 +72,39 @@ func (r *QueryResponder) Resize(columns, rows int) {
 
 // Feed scans output bytes for complete terminal queries and returns the
 // replies to write back into the PTY. Queries split across chunks are
-// buffered until complete or until they prove not to be queries.
+// buffered until complete or until they prove not to be queries. Color
+// callbacks run synchronously after parsing and outside the internal lock.
 func (r *QueryResponder) Feed(data []byte) [][]byte {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	pending := r.feedLocked(data)
+	callback := r.colorQuery
+	r.mu.Unlock()
+
+	replies := make([][]byte, 0, len(pending))
+	for _, reply := range pending {
+		if len(reply.fixed) != 0 {
+			replies = append(replies, reply.fixed)
+			continue
+		}
+		if callback == nil || reply.colorKind == 0 {
+			continue
+		}
+		color, ok := callback(reply.colorKind)
+		if !ok {
+			continue
+		}
+		value, ok := formatOSCColor(color)
+		if !ok {
+			continue
+		}
+		replies = append(replies, []byte(fmt.Sprintf("\x1b]%d;%s\x1b\\", reply.colorKind, value)))
+	}
+	return replies
+}
+
+func (r *QueryResponder) feedLocked(data []byte) []pendingQueryReply {
 	r.pending = append(r.pending, data...)
-	var replies [][]byte
+	var replies []pendingQueryReply
 	for {
 		index := bytes.IndexByte(r.pending, 0x1b)
 		if index < 0 {
@@ -98,7 +135,7 @@ func (r *QueryResponder) Feed(data []byte) [][]byte {
 			sequence := r.pending[2 : 2+final+1]
 			r.pending = r.pending[2+final+1:]
 			if reply := r.csiReply(sequence); len(reply) > 0 {
-				replies = append(replies, reply)
+				replies = append(replies, pendingQueryReply{fixed: reply})
 			}
 		case ']':
 			end, complete := oscEnd(r.pending[2:])
@@ -114,8 +151,8 @@ func (r *QueryResponder) Feed(data []byte) [][]byte {
 			}
 			sequence := r.pending[2 : 2+end]
 			r.pending = r.pending[2+end:]
-			if reply := r.oscReply(sequence); len(reply) > 0 {
-				replies = append(replies, reply)
+			if kind, ok := oscColorQuery(sequence); ok {
+				replies = append(replies, pendingQueryReply{colorKind: kind})
 			}
 		default:
 			r.pending = r.pending[1:]
@@ -210,28 +247,15 @@ func (r *QueryResponder) csiReply(sequence []byte) []byte {
 	return nil
 }
 
-func (r *QueryResponder) oscReply(sequence []byte) []byte {
-	if r.colorQuery == nil {
-		return nil
-	}
-	var kind ColorQueryKind
+func oscColorQuery(sequence []byte) (ColorQueryKind, bool) {
 	switch string(sequence) {
 	case "10;?":
-		kind = ColorQueryForeground
+		return ColorQueryForeground, true
 	case "11;?":
-		kind = ColorQueryBackground
+		return ColorQueryBackground, true
 	default:
-		return nil
+		return 0, false
 	}
-	color, ok := r.colorQuery(kind)
-	if !ok {
-		return nil
-	}
-	value, ok := formatOSCColor(color)
-	if !ok {
-		return nil
-	}
-	return []byte(fmt.Sprintf("\x1b]%d;%s\x1b\\", kind, value))
 }
 
 func formatOSCColor(color string) (string, bool) {

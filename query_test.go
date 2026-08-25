@@ -1,7 +1,9 @@
 package ghostline
 
 import (
+	"sync"
 	"testing"
+	"time"
 )
 
 func replyStrings(replies [][]byte) []string {
@@ -63,6 +65,48 @@ func TestQueryResponderSkipsUnsupportedColorQueries(t *testing.T) {
 	})
 	assertReplies(t, responder, []byte("\x1b]10;?\x1b\\"), "\x1b]10;rgb:ffff/ffff/ffff\x1b\\")
 	assertReplies(t, responder, []byte("\x1b]11;?\x1b\\"))
+}
+
+func TestQueryResponderColorCallbackMayReenter(t *testing.T) {
+	var responder *QueryResponder
+	responder = NewQueryResponderWithColorQuery(func(kind ColorQueryKind) (string, bool) {
+		responder.Resize(100, 40)
+		assertReplies(t, responder, []byte("\x1b[5n"), "\x1b[0n")
+		return "#ffffff", true
+	})
+	done := make(chan [][]byte, 1)
+	go func() {
+		done <- responder.Feed([]byte("\x1b]10;?\x1b\\"))
+	}()
+	select {
+	case replies := <-done:
+		got := replyStrings(replies)
+		want := []string{"\x1b]10;rgb:ffff/ffff/ffff\x1b\\"}
+		if len(got) != 1 || got[0] != want[0] {
+			t.Fatalf("reentrant Feed replies = %q, want %q", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("color callback deadlocked while re-entering responder")
+	}
+}
+
+func TestQueryResponderConcurrentFeedAndResize(t *testing.T) {
+	responder := NewQueryResponderWithColorQuery(func(ColorQueryKind) (string, bool) {
+		return "#ffffff", true
+	})
+	var group sync.WaitGroup
+	for index := 0; index < 32; index++ {
+		group.Add(2)
+		go func() {
+			defer group.Done()
+			_ = responder.Feed([]byte("\x1b]10;?\x1b\\"))
+		}()
+		go func(columns int) {
+			defer group.Done()
+			responder.Resize(columns, 40)
+		}(80 + index)
+	}
+	group.Wait()
 }
 
 func TestQueryResponderReportsWindowSize(t *testing.T) {

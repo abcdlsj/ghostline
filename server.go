@@ -5,18 +5,21 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
 // Server owns PTY sessions in a standalone process so clients can restart
-// without ending any session. The wire protocol is one JSON object per line
-// on a Unix socket; []byte fields use JSON base64 encoding automatically.
+// without ending any session. The wire protocol uses bounded JSON envelopes
+// with optional exact-length raw payloads over a Unix socket.
 type Server struct {
 	hub      *Hub
 	mu       sync.Mutex
@@ -145,9 +148,21 @@ func (s *Server) handleAdmin(connection net.Conn) {
 			}
 			batchFrozen = true
 			states := s.hub.sessionStates()
-			result := adminListResult{Sessions: make([]sessionMeta, 0, len(states))}
+			result := adminListResult{Version: ProtocolVersion, Sessions: make([]sessionMeta, 0, len(states))}
+			var listErr error
 			for _, state := range states {
-				result.Sessions = append(result.Sessions, sessionMetaOf(state))
+				meta, err := sessionMetaOf(state)
+				if err != nil {
+					listErr = err
+					break
+				}
+				result.Sessions = append(result.Sessions, meta)
+			}
+			if listErr != nil {
+				s.hub.endMigrationBatch()
+				batchFrozen = false
+				_ = transport.write(adminResponse{ID: request.ID, Error: listErr.Error()}, -1)
+				continue
 			}
 			if err := writeAdminResult(transport, request.ID, result, -1); err != nil {
 				return
@@ -192,7 +207,13 @@ func (s *Server) handleAdmin(connection net.Conn) {
 				_ = transport.write(adminResponse{ID: request.ID, Error: err.Error()}, -1)
 				continue
 			}
-			meta := sessionMetaLocked(state)
+			meta, err := sessionMetaLocked(state)
+			if err != nil {
+				_ = s.resolveAdoption(adoption, false)
+				delete(pending, params.Name)
+				_ = transport.write(adminResponse{ID: request.ID, Error: err.Error()}, -1)
+				continue
+			}
 			fd := -1
 			if ticket.alive {
 				fd = int(state.master.Fd())
@@ -367,7 +388,7 @@ func (s *Server) requestExit() {
 // listenUnix binds socketPath without unlinking a live server's socket.
 func listenUnix(socketPath string) (net.Listener, error) {
 	if _, err := os.Lstat(socketPath); err == nil {
-		if Ping(socketPath) {
+		if socketReady(socketPath) {
 			return nil, fmt.Errorf("socket already in use: %s", socketPath)
 		}
 		removeQuietly(socketPath)
@@ -407,15 +428,27 @@ func (s *Server) handle(connection net.Conn) {
 	writer := bufio.NewWriter(connection)
 	for {
 		_ = connection.SetReadDeadline(time.Now().Add(rpcIdleTimeout))
-		line, err := readLine(reader, maxRPCLine)
+		req, err := readRequest(reader)
 		if err != nil {
+			_ = writeResponse(writer, -1, nil, err)
 			return
 		}
 		_ = connection.SetReadDeadline(time.Time{})
-		var req request
-		if err := json.Unmarshal(line, &req); err != nil {
-			_ = writeResponse(writer, -1, nil, fmt.Errorf("invalid request: %w", err))
-			continue
+		if req.Method == rpcMethodOutput {
+			if len(req.payload) != 0 {
+				_ = writeResponse(writer, req.ID, nil, errors.New("output open request cannot contain a payload"))
+				return
+			}
+			s.serveOutput(connection, reader, writer, req)
+			return
+		}
+		if req.Method == rpcMethodReplay || req.Method == rpcMethodCheckpoint {
+			if len(req.payload) != 0 {
+				_ = writeResponse(writer, req.ID, nil, errors.New("blob open request cannot contain a payload"))
+				return
+			}
+			s.serveBlob(connection, reader, writer, req)
+			return
 		}
 
 		result, dispatchErr := s.dispatchRequest(connection, req)
@@ -425,15 +458,175 @@ func (s *Server) handle(connection net.Conn) {
 	}
 }
 
+func (s *Server) serveBlob(connection net.Conn, wireReader *bufio.Reader, writer *bufio.Writer, req request) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stop := make(chan struct{})
+	monitored := make(chan struct{})
+	go func() {
+		defer close(monitored)
+		monitorConnection(connection, cancel, stop)
+	}()
+
+	session, err := s.namedSession(ctx, req.Params)
+	var data []byte
+	opened := blobOpenResult{}
+	if err == nil {
+		switch req.Method {
+		case rpcMethodReplay:
+			data, err = session.Replay(ctx)
+		case rpcMethodCheckpoint:
+			var checkpoint Checkpoint
+			checkpoint, err = session.Checkpoint(ctx)
+			data = checkpoint.Replay
+			opened.Cursor = checkpoint.Cursor
+		}
+	}
+	close(stop)
+	_ = connection.SetReadDeadline(time.Now())
+	<-monitored
+	_ = connection.SetReadDeadline(time.Time{})
+	if err != nil {
+		_ = writeResponse(writer, req.ID, nil, err)
+		return
+	}
+	opened.Size = len(data)
+	if err := writeResponse(writer, req.ID, opened, nil); err != nil {
+		return
+	}
+
+	offset := 0
+	for {
+		_ = connection.SetReadDeadline(time.Now().Add(rpcIdleTimeout))
+		next, err := readRequest(wireReader)
+		if err != nil {
+			_ = writeResponse(writer, -1, nil, err)
+			return
+		}
+		_ = connection.SetReadDeadline(time.Time{})
+		if len(next.payload) != 0 {
+			_ = writeResponse(writer, next.ID, nil, errors.New("blob control request cannot contain a payload"))
+			continue
+		}
+		switch next.Method {
+		case rpcMethodBlobClose:
+			_ = writeResponse(writer, next.ID, nil, nil)
+			return
+		case rpcMethodBlobRead:
+			readParams, err := decode[chunkReadParams](next.Params)
+			if err != nil {
+				_ = writeResponse(writer, next.ID, nil, err)
+				continue
+			}
+			if readParams.MaxBytes <= 0 || readParams.MaxBytes > maxRPCChunk {
+				_ = writeResponse(writer, next.ID, nil, errors.New("invalid blob chunk size"))
+				continue
+			}
+			end := offset + readParams.MaxBytes
+			if end > len(data) {
+				end = len(data)
+			}
+			chunk := data[offset:end]
+			result := blobReadResult{EOF: end == len(data)}
+			offset = end
+			if err := writeRawResponse(writer, next.ID, result, chunk, nil); err != nil {
+				return
+			}
+			if result.EOF {
+				return
+			}
+		default:
+			_ = writeResponse(writer, next.ID, nil, fmt.Errorf("unknown blob method: %s", next.Method))
+		}
+	}
+}
+
+func (s *Server) serveOutput(connection net.Conn, wireReader *bufio.Reader, writer *bufio.Writer, req request) {
+	params, err := decode[outputParams](req.Params)
+	if err != nil {
+		_ = writeResponse(writer, req.ID, nil, err)
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	session, err := s.hub.Get(ctx, params.Name)
+	if err != nil {
+		_ = writeResponse(writer, req.ID, nil, err)
+		return
+	}
+	output, err := session.Output(ctx, params.Cursor)
+	if err != nil {
+		_ = writeResponse(writer, req.ID, nil, err)
+		return
+	}
+	defer output.Close()
+	if err := writeResponse(writer, req.ID, cursorResult{Cursor: output.Cursor()}, nil); err != nil {
+		return
+	}
+	for {
+		_ = connection.SetReadDeadline(time.Now().Add(rpcIdleTimeout))
+		next, err := readRequest(wireReader)
+		if err != nil {
+			_ = writeResponse(writer, -1, nil, err)
+			return
+		}
+		_ = connection.SetReadDeadline(time.Time{})
+		if len(next.payload) != 0 {
+			_ = writeResponse(writer, next.ID, nil, errors.New("output control request cannot contain a payload"))
+			continue
+		}
+		switch next.Method {
+		case rpcMethodOutputClose:
+			_ = writeResponse(writer, next.ID, nil, nil)
+			return
+		case rpcMethodOutputRead:
+			readParams, err := decode[chunkReadParams](next.Params)
+			if err != nil {
+				_ = writeResponse(writer, next.ID, nil, err)
+				continue
+			}
+			if readParams.MaxBytes <= 0 || readParams.MaxBytes > maxRPCChunk {
+				_ = writeResponse(writer, next.ID, nil, errors.New("invalid output chunk size"))
+				continue
+			}
+			buffer := make([]byte, readParams.MaxBytes)
+			stop := make(chan struct{})
+			monitored := make(chan struct{})
+			go func() {
+				defer close(monitored)
+				monitorConnection(connection, cancel, stop)
+			}()
+			n, readErr := output.Read(buffer)
+			close(stop)
+			_ = connection.SetReadDeadline(time.Now())
+			<-monitored
+			_ = connection.SetReadDeadline(time.Time{})
+			result := outputReadResult{Cursor: output.Cursor()}
+			if errors.Is(readErr, io.EOF) {
+				result.EOF = true
+				readErr = nil
+			}
+			if err := writeRawResponse(writer, next.ID, result, buffer[:n], readErr); err != nil {
+				return
+			}
+			if result.EOF {
+				return
+			}
+		default:
+			_ = writeResponse(writer, next.ID, nil, fmt.Errorf("unknown output method: %s", next.Method))
+		}
+	}
+}
+
 func (s *Server) dispatchRequest(connection net.Conn, req request) (any, error) {
 	if req.Method != rpcMethodWait {
-		return s.dispatch(context.Background(), req.Method, req.Params)
+		return s.dispatch(context.Background(), req.Method, req.Params, req.payload)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	stop := make(chan struct{})
 	go monitorConnection(connection, cancel, stop)
-	result, err := s.dispatch(ctx, req.Method, req.Params)
+	result, err := s.dispatch(ctx, req.Method, req.Params, req.payload)
 	close(stop)
 	_ = connection.SetReadDeadline(time.Now())
 	cancel()
@@ -463,26 +656,28 @@ func monitorConnection(connection net.Conn, cancel context.CancelFunc, stop <-ch
 	}
 }
 
-func (s *Server) session(name string) (Session, error) {
-	session, ok := s.hub.Session(name)
-	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, name)
-	}
-	return session, nil
+func (s *Server) session(ctx context.Context, name string) (*Session, error) {
+	return s.hub.Get(ctx, name)
 }
 
-func (s *Server) namedSession(raw json.RawMessage) (Session, error) {
+func (s *Server) namedSession(ctx context.Context, raw json.RawMessage) (*Session, error) {
 	params, err := decode[nameParams](raw)
 	if err != nil {
 		return nil, err
 	}
-	return s.session(params.Name)
+	return s.session(ctx, params.Name)
 }
 
-func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessage) (any, error) {
+func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessage, payload []byte) (any, error) {
+	if method != rpcMethodWriteInput && len(payload) != 0 {
+		return nil, errors.New("RPC method does not accept a payload")
+	}
 	switch method {
 	case rpcMethodVersion:
-		return versionResult{Version: ProtocolVersion, TagVersion: TagVersion()}, nil
+		return versionResult{
+			Version: ProtocolVersion, TagVersion: TagVersion(),
+			Capabilities: append([]string(nil), protocolCapabilities...), Limits: currentProtocolLimits,
+		}, nil
 
 	case rpcMethodCreate:
 		params, err := decode[createParams](raw)
@@ -490,49 +685,71 @@ func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessag
 			return nil, err
 		}
 		session, err := s.hub.Start(ctx, SessionOptions{
-			Name:                 params.Name,
-			Directory:            params.Dir,
-			Command:              params.Command,
+			Name: params.Name,
+			Process: ProcessSpec{
+				Path:         params.Path,
+				Args:         params.Args,
+				Directory:    params.Dir,
+				Environment:  params.Env,
+				ShellCommand: params.ShellCommand,
+			},
 			Size:                 Size{Columns: params.Cols, Rows: params.Rows},
-			Environment:          params.Env,
 			VTScrollbackMaxBytes: params.VTScrollbackMaxBytes,
 		})
 		if err != nil {
 			return nil, err
 		}
-		return createResult{Created: session.CreatedAt().Unix()}, nil
+		return createResult{Info: session.Info()}, nil
 
 	case rpcMethodCreated:
-		session, err := s.namedSession(raw)
+		session, err := s.namedSession(ctx, raw)
 		if err != nil {
 			return nil, err
 		}
-		return createResult{Created: session.CreatedAt().Unix()}, nil
+		return createResult{Info: session.Info()}, nil
 
 	case rpcMethodStatus:
-		session, err := s.namedSession(raw)
+		session, err := s.namedSession(ctx, raw)
 		if err != nil {
 			return nil, err
 		}
 		return session.Status(ctx)
 
 	case rpcMethodMetadata:
-		session, err := s.namedSession(raw)
+		session, err := s.namedSession(ctx, raw)
 		if err != nil {
 			return nil, err
 		}
-		provider, ok := session.(MetadataProvider)
-		if !ok {
-			return metadataResult{}, nil
-		}
-		metadata, err := provider.Metadata(ctx)
+		metadata, err := session.Metadata(ctx)
 		if err != nil {
 			return nil, err
 		}
 		return metadataResult{Process: metadata.Process, Directory: metadata.Directory}, nil
 
+	case rpcMethodSize:
+		session, err := s.namedSession(ctx, raw)
+		if err != nil {
+			return nil, err
+		}
+		size, err := session.Size(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return sizeResult{Columns: size.Columns, Rows: size.Rows}, nil
+
+	case rpcMethodSignal:
+		params, err := decode[signalParams](raw)
+		if err != nil {
+			return nil, err
+		}
+		session, err := s.session(ctx, params.Name)
+		if err != nil {
+			return nil, err
+		}
+		return nil, session.Signal(ctx, syscall.Signal(params.Signal))
+
 	case rpcMethodWait:
-		session, err := s.namedSession(raw)
+		session, err := s.namedSession(ctx, raw)
 		if err != nil {
 			return nil, err
 		}
@@ -542,153 +759,88 @@ func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessag
 		}
 		return session.Status(ctx)
 
-	case rpcMethodClose:
-		session, err := s.namedSession(raw)
+	case rpcMethodTerminate:
+		session, err := s.namedSession(ctx, raw)
 		if err != nil {
 			return nil, err
 		}
-		return nil, session.Close()
+		return nil, session.Terminate(ctx)
 
-	case rpcMethodRemove:
-		session, err := s.namedSession(raw)
+	case rpcMethodDelete:
+		session, err := s.namedSession(ctx, raw)
 		if err != nil {
 			return nil, err
 		}
-		status, err := session.Status(ctx)
-		if err != nil {
+		if err := session.Delete(ctx); err != nil {
 			return nil, err
 		}
-		if err := session.Remove(); err != nil {
-			return nil, err
-		}
-		return removeResult{Exit: status.Exit}, nil
+		return nil, nil
 
-	case rpcMethodInput:
+	case rpcMethodWriteInput:
 		params, err := decode[inputParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		session, err := s.session(params.Name)
+		session, err := s.session(ctx, params.Name)
 		if err != nil {
 			return nil, err
 		}
-		return nil, session.Input(ctx, params.Data)
+		return nil, session.WriteInput(ctx, payload)
 
 	case rpcMethodResize:
 		params, err := decode[resizeParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		session, err := s.session(params.Name)
+		session, err := s.session(ctx, params.Name)
 		if err != nil {
 			return nil, err
 		}
 		return nil, session.Resize(ctx, Size{Columns: params.Cols, Rows: params.Rows})
 
-	case rpcMethodSnapshot:
-		session, err := s.namedSession(raw)
+	case rpcMethodRotateOutput:
+		session, err := s.namedSession(ctx, raw)
 		if err != nil {
 			return nil, err
 		}
-		data, err := session.Snapshot(ctx)
+		cursor, err := session.RotateOutput(ctx)
 		if err != nil {
 			return nil, err
 		}
-		return dataResult{Data: data}, nil
+		return cursorResult{Cursor: cursor}, nil
 
-	case rpcMethodCheckpoint:
-		session, err := s.namedSession(raw)
+	case rpcMethodOutputCursor:
+		session, err := s.namedSession(ctx, raw)
 		if err != nil {
 			return nil, err
 		}
-		checkpoint, err := session.Checkpoint(ctx)
+		cursor, err := session.OutputCursor(ctx)
 		if err != nil {
 			return nil, err
 		}
-		return checkpointResult(checkpoint), nil
+		return cursorResult{Cursor: cursor}, nil
 
-	case rpcMethodRecover:
-		params, err := decode[recoverParams](raw)
+	case rpcMethodPruneOutput:
+		params, err := decode[pruneOutputParams](raw)
 		if err != nil {
 			return nil, err
 		}
-		session, err := s.session(params.Name)
+		session, err := s.session(ctx, params.Name)
 		if err != nil {
 			return nil, err
 		}
-		data, err := session.Recover(ctx, params.Offset, params.End)
-		if err != nil {
-			return nil, err
-		}
-		return dataResult{Data: data}, nil
-
-	case rpcMethodSpoolPath:
-		params, err := decode[nameParams](raw)
-		if err != nil {
-			return nil, err
-		}
-		session, err := s.session(params.Name)
-		if err != nil {
-			return nil, err
-		}
-		return spoolPathResult{Path: session.SpoolPath()}, nil
-
-	case rpcMethodSpoolSize:
-		params, err := decode[nameParams](raw)
-		if err != nil {
-			return nil, err
-		}
-		session, err := s.session(params.Name)
-		if err != nil {
-			return nil, err
-		}
-		size, err := session.SpoolSize(ctx)
-		if err != nil {
-			return nil, err
-		}
-		return spoolSizeResult{Size: size}, nil
-
-	case rpcMethodTruncateSpool:
-		params, err := decode[nameParams](raw)
-		if err != nil {
-			return nil, err
-		}
-		session, err := s.session(params.Name)
-		if err != nil {
-			return nil, err
-		}
-		return nil, session.TruncateSpool(ctx)
-
-	case rpcMethodArchiveSpool:
-		params, err := decode[nameParams](raw)
-		if err != nil {
-			return nil, err
-		}
-		session, err := s.session(params.Name)
-		if err != nil {
-			return nil, err
-		}
-		return nil, session.ArchiveSpool(ctx)
-
-	case rpcMethodRemoveSpool:
-		params, err := decode[nameParams](raw)
-		if err != nil {
-			return nil, err
-		}
-		session, err := s.session(params.Name)
-		if err != nil {
-			return nil, err
-		}
-		session.RemoveSpool()
-		return nil, nil
+		return nil, session.PruneOutput(ctx, params.Before)
 
 	case rpcMethodList:
-		sessions := s.hub.Sessions()
-		names := make([]string, 0, len(sessions))
-		for _, session := range sessions {
-			names = append(names, session.Name())
+		sessions, err := s.hub.List(ctx)
+		if err != nil {
+			return nil, err
 		}
-		return listResult{Sessions: names}, nil
+		infos := make([]SessionInfo, 0, len(sessions))
+		for _, session := range sessions {
+			infos = append(infos, session.Info())
+		}
+		return listResult{Sessions: infos}, nil
 
 	default:
 		return nil, fmt.Errorf("unknown method: %s", method)

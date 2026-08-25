@@ -5,41 +5,61 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"os"
 	"time"
 )
 
 const (
-	maxRPCLine     = 1 << 20
-	rpcIdleTimeout = time.Minute
-	maxConnections = 64
+	maxRPCFrame        = 1 << 20
+	maxRPCPayload      = 1 << 20
+	maxRPCChunk        = 64 << 10
+	maxRPCErrorMessage = 4 << 10
+	rpcIdleTimeout     = time.Minute
+	maxConnections     = 64
+	wireVersion        = 1
 )
 
 // ProtocolVersion identifies the RPC protocol spoken by the server. Clients
 // use it to detect an outdated server process during upgrades instead of
 // failing on unknown methods.
-const ProtocolVersion = "0.6.0"
+const ProtocolVersion = "1.0.0"
 
 const (
-	rpcMethodCreate        = "create"
-	rpcMethodStatus        = "status"
-	rpcMethodMetadata      = "metadata"
-	rpcMethodCreated       = "created"
-	rpcMethodVersion       = "version"
-	rpcMethodWait          = "wait"
-	rpcMethodClose         = "close"
-	rpcMethodRemove        = "remove"
-	rpcMethodInput         = "input"
-	rpcMethodResize        = "resize"
-	rpcMethodSnapshot      = "snapshot"
-	rpcMethodCheckpoint    = "checkpoint"
-	rpcMethodRecover       = "recover"
-	rpcMethodSpoolPath     = "spoolPath"
-	rpcMethodSpoolSize     = "spoolSize"
-	rpcMethodTruncateSpool = "truncateSpool"
-	rpcMethodArchiveSpool  = "archiveSpool"
-	rpcMethodRemoveSpool   = "removeSpool"
-	rpcMethodList          = "list"
+	// CapabilityRawPayload indicates that envelopes may be followed by an
+	// exact-length unencoded payload.
+	CapabilityRawPayload = "raw-payload-v1"
+	// CapabilityStreams indicates support for the v1 pull-stream state machine.
+	CapabilityStreams = "pull-stream-v1"
+)
+
+var protocolCapabilities = []string{CapabilityRawPayload, CapabilityStreams}
+
+const (
+	rpcMethodCreate       = "create"
+	rpcMethodStatus       = "status"
+	rpcMethodMetadata     = "metadata"
+	rpcMethodSize         = "size"
+	rpcMethodSignal       = "signal"
+	rpcMethodCreated      = "created"
+	rpcMethodVersion      = "version"
+	rpcMethodWait         = "wait"
+	rpcMethodTerminate    = "terminate"
+	rpcMethodDelete       = "delete"
+	rpcMethodWriteInput   = "writeInput"
+	rpcMethodResize       = "resize"
+	rpcMethodReplay       = "replay"
+	rpcMethodCheckpoint   = "checkpoint"
+	rpcMethodOutput       = "output"
+	rpcMethodOutputCursor = "output.cursor"
+	rpcMethodOutputRead   = "output.read"
+	rpcMethodOutputClose  = "output.close"
+	rpcMethodBlobRead     = "blob.read"
+	rpcMethodBlobClose    = "blob.close"
+	rpcMethodRotateOutput = "output.rotate"
+	rpcMethodPruneOutput  = "output.prune"
+	rpcMethodList         = "list"
 )
 
 type nameParams struct {
@@ -49,7 +69,9 @@ type nameParams struct {
 type createParams struct {
 	Name                 string   `json:"name"`
 	Dir                  string   `json:"dir"`
-	Command              string   `json:"command"`
+	Path                 string   `json:"path,omitempty"`
+	Args                 []string `json:"args,omitempty"`
+	ShellCommand         string   `json:"shellCommand,omitempty"`
 	Cols                 int      `json:"cols"`
 	Rows                 int      `json:"rows"`
 	Env                  []string `json:"env"`
@@ -58,7 +80,6 @@ type createParams struct {
 
 type inputParams struct {
 	Name string `json:"name"`
-	Data []byte `json:"data"`
 }
 
 type resizeParams struct {
@@ -67,40 +88,61 @@ type resizeParams struct {
 	Rows int    `json:"rows"`
 }
 
-type recoverParams struct {
+type signalParams struct {
 	Name   string `json:"name"`
-	Offset int64  `json:"offset"`
-	End    int64  `json:"end"`
+	Signal int    `json:"signal"`
+}
+
+type outputParams struct {
+	Name   string `json:"name"`
+	Cursor Cursor `json:"cursor"`
+}
+
+type chunkReadParams struct {
+	MaxBytes int `json:"maxBytes"`
+}
+
+type outputReadResult struct {
+	Cursor Cursor `json:"cursor"`
+	EOF    bool   `json:"eof,omitempty"`
+}
+
+type blobOpenResult struct {
+	Size   int    `json:"size"`
+	Cursor Cursor `json:"cursor,omitempty"`
+}
+
+type blobReadResult struct {
+	EOF bool `json:"eof,omitempty"`
+}
+
+type pruneOutputParams struct {
+	Name   string `json:"name"`
+	Before Cursor `json:"before"`
+}
+
+type cursorResult struct {
+	Cursor Cursor `json:"cursor"`
+}
+
+type sizeResult struct {
+	Columns int `json:"columns"`
+	Rows    int `json:"rows"`
 }
 
 type createResult struct {
-	Created int64 `json:"created"`
+	Info SessionInfo `json:"info"`
 }
 
 type versionResult struct {
-	Version    string `json:"version"`
-	TagVersion string `json:"tagVersion,omitempty"`
+	Version      string         `json:"version"`
+	TagVersion   string         `json:"tagVersion,omitempty"`
+	Capabilities []string       `json:"capabilities"`
+	Limits       ProtocolLimits `json:"limits"`
 }
 
 type listResult struct {
-	Sessions []string `json:"sessions"`
-}
-
-type dataResult struct {
-	Data []byte `json:"data"`
-}
-
-type checkpointResult struct {
-	Replay []byte `json:"replay"`
-	Offset int64  `json:"offset"`
-}
-
-type spoolPathResult struct {
-	Path string `json:"path"`
-}
-
-type spoolSizeResult struct {
-	Size int64 `json:"size"`
+	Sessions []SessionInfo `json:"sessions"`
 }
 
 type metadataResult struct {
@@ -108,20 +150,32 @@ type metadataResult struct {
 	Directory string `json:"directory"`
 }
 
-type removeResult struct {
-	Exit *ExitError `json:"exit"`
-}
-
 type request struct {
-	ID     int64           `json:"id"`
-	Method string          `json:"method"`
-	Params json.RawMessage `json:"params,omitempty"`
+	Wire         int             `json:"wire"`
+	ID           int64           `json:"id"`
+	Method       string          `json:"method"`
+	Params       json.RawMessage `json:"params,omitempty"`
+	PayloadBytes int             `json:"payloadBytes,omitempty"`
+	payload      []byte
 }
 
 type response struct {
-	ID     int64           `json:"id"`
-	Result json.RawMessage `json:"result,omitempty"`
-	Error  *rpcError       `json:"error,omitempty"`
+	Wire         int             `json:"wire"`
+	ID           int64           `json:"id"`
+	Result       json.RawMessage `json:"result,omitempty"`
+	Error        *rpcError       `json:"error,omitempty"`
+	PayloadBytes int             `json:"payloadBytes,omitempty"`
+}
+
+// ProtocolLimits are the framing limits advertised by VersionInfo.
+type ProtocolLimits struct {
+	MaxHeaderBytes  int `json:"maxHeaderBytes"`
+	MaxPayloadBytes int `json:"maxPayloadBytes"`
+	MaxChunkBytes   int `json:"maxChunkBytes"`
+}
+
+var currentProtocolLimits = ProtocolLimits{
+	MaxHeaderBytes: maxRPCFrame, MaxPayloadBytes: maxRPCPayload, MaxChunkBytes: maxRPCChunk,
 }
 
 type rpcError struct {
@@ -143,6 +197,18 @@ func rpcCode(err error) string {
 		return "session_closed"
 	case errors.Is(err, ErrInvalidSessionName):
 		return "invalid_name"
+	case errors.Is(err, ErrInvalidSignal):
+		return "invalid_signal"
+	case errors.Is(err, os.ErrProcessDone):
+		return "process_done"
+	case errors.Is(err, ErrInvalidCursor):
+		return "invalid_cursor"
+	case errors.Is(err, ErrCursorExpired):
+		return "cursor_expired"
+	case errors.Is(err, ErrFrameTooLarge):
+		return "frame_too_large"
+	case errors.Is(err, ErrProtocolMismatch):
+		return "protocol_mismatch"
 	default:
 		return "internal"
 	}
@@ -166,6 +232,18 @@ func decodeRPCError(rpcErr *rpcError) error {
 		sentinel = ErrSessionClosed
 	case "invalid_name":
 		sentinel = ErrInvalidSessionName
+	case "invalid_signal":
+		sentinel = ErrInvalidSignal
+	case "process_done":
+		sentinel = os.ErrProcessDone
+	case "invalid_cursor":
+		sentinel = ErrInvalidCursor
+	case "cursor_expired":
+		sentinel = ErrCursorExpired
+	case "frame_too_large":
+		sentinel = ErrFrameTooLarge
+	case "protocol_mismatch":
+		sentinel = ErrProtocolMismatch
 	}
 	if sentinel != nil {
 		return fmt.Errorf("%w: %s", sentinel, rpcErr.Message)
@@ -174,9 +252,46 @@ func decodeRPCError(rpcErr *rpcError) error {
 }
 
 func writeResponse(writer *bufio.Writer, id int64, result any, err error) error {
-	value := response{ID: id}
+	encoded, marshalErr := encodeResponse(id, result, 0, err)
+	if marshalErr != nil {
+		return marshalErr
+	}
+	if _, err := writer.Write(append(encoded, '\n')); err != nil {
+		return err
+	}
+	return writer.Flush()
+}
+
+// writeRawResponse writes one bounded JSON metadata line followed immediately
+// by the exact raw payload length declared in result. It keeps control frames
+// inspectable without base64-expanding terminal data or allocating a second
+// encoded copy of every chunk.
+func writeRawResponse(writer *bufio.Writer, id int64, result any, data []byte, err error) error {
+	if len(data) > maxRPCChunk {
+		return ErrFrameTooLarge
+	}
 	if err != nil {
-		value.Error = &rpcError{Code: rpcCode(err), Message: err.Error()}
+		data = nil
+	}
+	encoded, marshalErr := encodeResponse(id, result, len(data), err)
+	if marshalErr != nil {
+		return marshalErr
+	}
+	if _, err := writer.Write(append(encoded, '\n')); err != nil {
+		return err
+	}
+	if len(data) > 0 {
+		if _, err := writer.Write(data); err != nil {
+			return err
+		}
+	}
+	return writer.Flush()
+}
+
+func encodeResponse(id int64, result any, payloadBytes int, err error) ([]byte, error) {
+	value := response{Wire: wireVersion, ID: id, PayloadBytes: payloadBytes}
+	if err != nil {
+		value.Error = newRPCError(err)
 	} else if result != nil {
 		encoded, marshalErr := json.Marshal(result)
 		if marshalErr != nil {
@@ -187,12 +302,51 @@ func writeResponse(writer *bufio.Writer, id int64, result any, err error) error 
 	}
 	encoded, marshalErr := json.Marshal(value)
 	if marshalErr != nil {
-		return marshalErr
+		return nil, marshalErr
 	}
-	if _, err := writer.Write(append(encoded, '\n')); err != nil {
-		return err
+	if len(encoded)+1 > maxRPCFrame {
+		value = response{Wire: wireVersion, ID: id, Error: newRPCError(ErrFrameTooLarge)}
+		encoded, marshalErr = json.Marshal(value)
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
 	}
-	return writer.Flush()
+	return encoded, nil
+}
+
+func readRequest(reader *bufio.Reader) (request, error) {
+	line, err := readLine(reader, maxRPCFrame)
+	if err != nil {
+		return request{}, err
+	}
+	var req request
+	if err := json.Unmarshal(line, &req); err != nil {
+		return request{}, fmt.Errorf("invalid request: %w", err)
+	}
+	if req.Wire != wireVersion {
+		return request{}, fmt.Errorf("%w: wire %d", ErrProtocolMismatch, req.Wire)
+	}
+	if req.ID <= 0 || req.Method == "" {
+		return request{}, errors.New("invalid request envelope")
+	}
+	if req.PayloadBytes < 0 || req.PayloadBytes > maxRPCPayload {
+		return request{}, ErrFrameTooLarge
+	}
+	if req.PayloadBytes > 0 {
+		req.payload = make([]byte, req.PayloadBytes)
+		if _, err := io.ReadFull(reader, req.payload); err != nil {
+			return request{}, fmt.Errorf("read request payload: %w", err)
+		}
+	}
+	return req, nil
+}
+
+func newRPCError(err error) *rpcError {
+	message := err.Error()
+	if len(message) > maxRPCErrorMessage {
+		message = message[:maxRPCErrorMessage]
+	}
+	return &rpcError{Code: rpcCode(err), Message: message}
 }
 
 func readLine(reader *bufio.Reader, limit int) ([]byte, error) {
@@ -201,7 +355,7 @@ func readLine(reader *bufio.Reader, limit int) ([]byte, error) {
 		chunk, err := reader.ReadSlice('\n')
 		line = append(line, chunk...)
 		if len(line) > limit {
-			return nil, errors.New("rpc message too large")
+			return nil, ErrFrameTooLarge
 		}
 		if err == nil {
 			return line, nil
@@ -221,9 +375,7 @@ func decode[T any](raw json.RawMessage) (T, error) {
 	return value, nil
 }
 
-// Ping reports whether a ghostline server is accepting connections on
-// socketPath.
-func Ping(socketPath string) bool {
+func socketReady(socketPath string) bool {
 	connection, err := net.DialTimeout("unix", socketPath, 100*time.Millisecond)
 	if err != nil {
 		return false

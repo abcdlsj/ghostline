@@ -21,9 +21,15 @@ import (
 const commandPrefix = byte(0x02) // Ctrl-B
 
 type window struct {
-	session   ghostline.Session
-	watcher   *ghostline.SpoolWatcher
-	responder *ghostline.QueryResponder
+	session *ghostline.Session
+
+	streamMu   sync.Mutex
+	reader     *ghostline.OutputReader
+	readCancel context.CancelFunc
+	readDone   chan struct{}
+
+	responderMu sync.Mutex
+	responder   *ghostline.QueryResponder
 }
 
 type minimux struct {
@@ -41,6 +47,7 @@ type minimux struct {
 	active atomic.Pointer[window]
 	output sync.Mutex
 	done   chan *window
+	errors chan error
 	closed chan struct{}
 }
 
@@ -93,6 +100,7 @@ func run(initialCommand string) error {
 		current: -1,
 		size:    size,
 		done:    make(chan *window),
+		errors:  make(chan error, 1),
 		closed:  make(chan struct{}),
 	}
 	defer app.shutdown()
@@ -134,6 +142,8 @@ func run(initialCommand string) error {
 			if quit {
 				return nil
 			}
+		case err := <-app.errors:
+			return err
 		case received := <-signals:
 			if received != syscall.SIGWINCH {
 				return nil
@@ -162,27 +172,30 @@ func readInput(reader io.Reader, output chan<- []byte, failures chan<- error) {
 
 func (m *minimux) createWindow(command string) error {
 	m.nextID++
+	process := ghostline.ProcessSpec{Directory: m.dir}
+	if command != "" {
+		process = ghostline.Shell(command)
+		process.Directory = m.dir
+	}
 	session, err := m.hub.Start(context.Background(), ghostline.SessionOptions{
-		Name:      fmt.Sprintf("window-%d", m.nextID),
-		Directory: m.dir,
-		Command:   command,
-		Size:      m.size,
+		Name:    fmt.Sprintf("window-%d", m.nextID),
+		Process: process,
+		Size:    m.size,
 	})
 	if err != nil {
 		return err
 	}
 	w := &window{session: session, responder: ghostline.NewQueryResponder()}
 	w.responder.Resize(m.size.Columns, m.size.Rows)
-	w.watcher, err = session.WatchOutput(ghostline.WatchOptions{
-		OnOutput: func(data []byte) { m.handleOutput(w, data) },
-	})
+	start, err := m.prepareOutput(w, ghostline.Cursor{})
 	if err != nil {
-		_ = session.Close()
+		_ = session.Delete(context.Background())
 		return err
 	}
+	start()
 	m.windows = append(m.windows, w)
 	go func() {
-		<-session.Done()
+		_ = session.Wait(context.Background())
 		select {
 		case m.done <- w:
 		case <-m.closed:
@@ -191,17 +204,94 @@ func (m *minimux) createWindow(command string) error {
 	return nil
 }
 
-func (m *minimux) handleOutput(w *window, data []byte) {
+func (m *minimux) prepareOutput(w *window, cursor ghostline.Cursor) (func(), error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	reader, err := w.session.Output(ctx, cursor)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	ready := make(chan struct{})
+	done := make(chan struct{})
+	w.streamMu.Lock()
+	w.reader = reader
+	w.readCancel = cancel
+	w.readDone = done
+	w.streamMu.Unlock()
+	go func() {
+		defer close(done)
+		select {
+		case <-ready:
+		case <-ctx.Done():
+			return
+		}
+		buffer := make([]byte, 32*1024)
+		for {
+			count, readErr := reader.Read(buffer)
+			if count > 0 {
+				data := append([]byte(nil), buffer[:count]...)
+				if err := m.handleOutput(w, data); err != nil {
+					m.reportError(err)
+					return
+				}
+			}
+			if readErr != nil {
+				if !errors.Is(readErr, io.EOF) &&
+					!errors.Is(readErr, io.ErrClosedPipe) &&
+					!errors.Is(readErr, context.Canceled) {
+					m.reportError(fmt.Errorf("read %s output: %w", w.session.Name(), readErr))
+				}
+				return
+			}
+		}
+	}()
+	var once sync.Once
+	return func() { once.Do(func() { close(ready) }) }, nil
+}
+
+func (m *minimux) stopOutput(w *window) error {
+	w.streamMu.Lock()
+	reader, cancel, done := w.reader, w.readCancel, w.readDone
+	w.reader, w.readCancel, w.readDone = nil, nil, nil
+	w.streamMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	var err error
+	if reader != nil {
+		err = reader.Close()
+	}
+	if done != nil {
+		<-done
+	}
+	return err
+}
+
+func (m *minimux) reportError(err error) {
+	select {
+	case m.errors <- err:
+	case <-m.closed:
+	default:
+	}
+}
+
+func (m *minimux) handleOutput(w *window, data []byte) error {
 	m.output.Lock()
 	if m.active.Load() == w {
-		_, _ = m.stdout.Write(data)
+		_, err := m.stdout.Write(data)
 		m.output.Unlock()
-		return
+		return err
 	}
 	m.output.Unlock()
-	for _, reply := range w.responder.Feed(data) {
-		_ = w.session.Input(context.Background(), reply)
+	w.responderMu.Lock()
+	replies := w.responder.Feed(data)
+	w.responderMu.Unlock()
+	for _, reply := range replies {
+		if err := w.session.WriteInput(context.Background(), reply); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func (m *minimux) switchTo(index int) error {
@@ -210,8 +300,9 @@ func (m *minimux) switchTo(index int) error {
 	}
 	index = (index + len(m.windows)) % len(m.windows)
 	next := m.windows[index]
-	next.watcher.Pause()
-	defer next.watcher.Resume()
+	if err := m.stopOutput(next); err != nil {
+		return err
+	}
 	if err := next.session.Resize(context.Background(), m.size); err != nil {
 		return err
 	}
@@ -219,17 +310,19 @@ func (m *minimux) switchTo(index int) error {
 	if err != nil {
 		return err
 	}
-	if err := next.watcher.SkipTo(checkpoint.Offset); err != nil {
+	start, err := m.prepareOutput(next, checkpoint.Cursor)
+	if err != nil {
 		return err
 	}
 
 	m.output.Lock()
 	m.active.Store(next)
 	m.current = index
-	_, _ = fmt.Fprintf(m.stdout, "\x1b]0;minimux:%s\x07", next.session.Name())
-	_, _ = m.stdout.Write(checkpoint.Replay)
+	_, titleErr := fmt.Fprintf(m.stdout, "\x1b]0;minimux:%s\x07", next.session.Name())
+	_, replayErr := m.stdout.Write(checkpoint.Replay)
 	m.output.Unlock()
-	return nil
+	start()
+	return errors.Join(titleErr, replayErr)
 }
 
 func (m *minimux) handleInput(data []byte) (bool, error) {
@@ -238,7 +331,7 @@ func (m *minimux) handleInput(data []byte) (bool, error) {
 		if len(plain) == 0 || m.current < 0 {
 			return nil
 		}
-		err := m.windows[m.current].session.Input(context.Background(), plain)
+		err := m.windows[m.current].session.WriteInput(context.Background(), plain)
 		plain = plain[:0]
 		return err
 	}
@@ -304,11 +397,10 @@ func (m *minimux) removeWindow(target *window) (bool, error) {
 		m.active.Store(nil)
 	}
 	m.output.Unlock()
-	target.watcher.Close()
-	if err := target.session.Close(); err != nil {
+	if err := m.stopOutput(target); err != nil {
 		return false, err
 	}
-	if err := target.session.Remove(); err != nil {
+	if err := target.session.Delete(context.Background()); err != nil {
 		return false, err
 	}
 	m.windows = append(m.windows[:index], m.windows[index+1:]...)
@@ -329,9 +421,17 @@ func (m *minimux) resize() error {
 	}
 	m.size = size
 	for _, w := range m.windows {
+		w.responderMu.Lock()
 		w.responder.Resize(size.Columns, size.Rows)
-		if err := w.session.Resize(context.Background(), m.size); err != nil && w.session.Alive() {
-			return err
+		w.responderMu.Unlock()
+		if err := w.session.Resize(context.Background(), m.size); err != nil {
+			status, statusErr := w.session.Status(context.Background())
+			if statusErr != nil {
+				return errors.Join(err, statusErr)
+			}
+			if status.Alive {
+				return err
+			}
 		}
 	}
 	return nil
@@ -355,7 +455,7 @@ func (m *minimux) shutdown() {
 	_, _ = m.stdout.Write([]byte("\x1b[0m\x1b[?25h\r\n"))
 	m.output.Unlock()
 	for _, w := range m.windows {
-		w.watcher.Close()
+		_ = m.stopOutput(w)
 	}
 	_ = m.hub.Close()
 }

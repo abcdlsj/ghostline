@@ -66,10 +66,13 @@ type sessionMeta struct {
 	PID                  int       `json:"pid"`
 	Alive                bool      `json:"alive"`
 	VTScrollbackMaxBytes uint64    `json:"vtScrollbackMaxBytes,omitempty"`
+	OutputDirectory      string    `json:"outputDirectory"`
+	OutputGeneration     uint64    `json:"outputGeneration"`
 	Exit                 *exitMeta `json:"exit,omitempty"`
 }
 
 type adminListResult struct {
+	Version  string        `json:"version"`
 	Sessions []sessionMeta `json:"sessions"`
 }
 
@@ -284,15 +287,19 @@ func (c *adminClient) call(ctx context.Context, method string, params any, resul
 	return nil
 }
 
-func sessionMetaOf(state *sessionState) sessionMeta {
+func sessionMetaOf(state *sessionState) (sessionMeta, error) {
 	state.operationMu.RLock()
 	defer state.operationMu.RUnlock()
 	return sessionMetaLocked(state)
 }
 
-func sessionMetaLocked(state *sessionState) sessionMeta {
+func sessionMetaLocked(state *sessionState) (sessionMeta, error) {
 	state.outputMu.Lock()
 	defer state.outputMu.Unlock()
+	if err := state.output.terminalError(); err != nil {
+		return sessionMeta{}, err
+	}
+	outputDirectory, outputGeneration := state.output.metadata()
 	meta := sessionMeta{
 		Name:                 state.name,
 		Cols:                 state.size.Columns,
@@ -301,6 +308,8 @@ func sessionMetaLocked(state *sessionState) sessionMeta {
 		PID:                  state.pid,
 		Alive:                true,
 		VTScrollbackMaxBytes: state.scrollbackMaxBytes,
+		OutputDirectory:      outputDirectory,
+		OutputGeneration:     outputGeneration,
 	}
 	select {
 	case <-state.done:
@@ -312,7 +321,7 @@ func sessionMetaLocked(state *sessionState) sessionMeta {
 		meta.Exit = exitMetaOf(state.waitErr)
 		state.waitMu.Unlock()
 	}
-	return meta
+	return meta, nil
 }
 
 func exitMetaOf(err error) *exitMeta {
@@ -358,10 +367,8 @@ func cancelAdminOnContext(ctx context.Context, connection *net.UnixConn) func() 
 	return func() { close(done) }
 }
 
-// Adopt migrates every session from the server listening on adminSocket into
-// h. The old server pauses a complete batch, the new server prepares every
-// state locally, and only then does either side change ownership.
-func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
+// adoptSessions migrates every source session into h as one transaction.
+func adoptSessions(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 	if h == nil {
 		return 0, errors.New("adopt target hub is nil")
 	}
@@ -400,15 +407,9 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 	if err := client.call(ctx, adminMethodList, nil, &listed); err != nil {
 		return 0, err
 	}
-	// Ghostline releases through protocol 0.5.0 used native snapshot encoding
-	// during migration. Those releases can retain an invalid wide-cell pair
-	// after a no-reflow shrink, and the source server aborts its pending
-	// adoption as soon as native encoding returns GHOSTTY_INVALID_VALUE. Detect
-	// that bounded compatibility window before preparing the first session so
-	// the destination can replay the stable spool without asking the old server
-	// to encode the known-bad native state.
-	legacySpoolReplay := legacySpoolReplayRequired(ctx, adminSocket)
-
+	if listed.Version != ProtocolVersion {
+		return 0, fmt.Errorf("rolling upgrade protocol %q is not %q", listed.Version, ProtocolVersion)
+	}
 	prepared := make([]*sessionState, 0, len(listed.Sessions))
 	preparedNames := make([]string, 0, len(listed.Sessions))
 	committed := false
@@ -443,24 +444,6 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 			}
 			master = os.NewFile(uintptr(masterFD), "adopted-master")
 		}
-		if legacySpoolReplay {
-			state, err := adoptStateFromSpool(
-				ctx,
-				adopted.Name,
-				master,
-				Size{Columns: adopted.Cols, Rows: adopted.Rows},
-				h.spoolPath(adopted.Name),
-				time.Unix(adopted.CreatedAt, 0),
-				adopted.PID,
-				adopted.Exit.error(),
-				resolveVTScrollbackMaxBytes(adopted.VTScrollbackMaxBytes, h.defaultVTScrollbackMaxBytes),
-			)
-			if err != nil {
-				return 0, fmt.Errorf("replay legacy spool for %s: %w", meta.Name, err)
-			}
-			prepared = append(prepared, state)
-			continue
-		}
 		var snapshotResult adminSnapshotResult
 		if err := client.call(ctx, adminMethodSnapshot, adoptParams{Name: adopted.Name}, &snapshotResult); err != nil {
 			closeFileQuietly(master)
@@ -476,7 +459,8 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 			master,
 			snapshot,
 			Size{Columns: adopted.Cols, Rows: adopted.Rows},
-			h.spoolPath(adopted.Name),
+			adopted.OutputDirectory,
+			adopted.OutputGeneration,
 			time.Unix(adopted.CreatedAt, 0),
 			adopted.PID,
 			adopted.Exit.error(),
@@ -522,39 +506,12 @@ func Adopt(ctx context.Context, adminSocket string, h *Hub) (int, error) {
 	return len(prepared), nil
 }
 
-// legacySpoolReplayRequired enables the temporary migration bridge for source
-// servers that predate the wide-cell resize fix. Keep this an explicit
-// allowlist: once a source advertises a newer protocol, native snapshots are
-// authoritative again and this compatibility path is unreachable.
-func legacySpoolReplayRequired(ctx context.Context, adminSocket string) bool {
-	publicSocket := strings.TrimSuffix(adminSocket, ".admin")
-	if publicSocket == adminSocket {
-		return false
-	}
-	versionContext, cancel := context.WithTimeout(ctx, adminTimeout)
-	defer cancel()
-	version, err := NewClient(publicSocket).Version(versionContext)
-	if err != nil {
-		return false
-	}
-	return legacySpoolReplayVersion(version)
-}
-
-func legacySpoolReplayVersion(version string) bool {
-	switch version {
-	case "0.4.0", "0.5.0":
-		return true
-	default:
-		return false
-	}
-}
-
 func waitOldServerGone(ctx context.Context, adminSocket string) error {
 	publicSocket := strings.TrimSuffix(adminSocket, ".admin")
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if !Ping(publicSocket) {
+		if !socketReady(publicSocket) {
 			return nil
 		}
 		select {
@@ -565,8 +522,8 @@ func waitOldServerGone(ctx context.Context, adminSocket string) error {
 	}
 }
 
-// Server.Adopt migrates sessions into this server. Call it before Serve so
-// the target never accepts a client while its session map is being rebuilt.
+// Adopt migrates sessions into this server. Call it before Serve so the target
+// never accepts a client while its session map is being rebuilt.
 func (s *Server) Adopt(ctx context.Context, adminSocket string) (int, error) {
-	return Adopt(ctx, adminSocket, s.hub)
+	return adoptSessions(ctx, adminSocket, s.hub)
 }

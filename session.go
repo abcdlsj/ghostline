@@ -1,70 +1,162 @@
 package ghostline
 
 import (
-	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
-	"path/filepath"
-	"strconv"
+	"syscall"
 	"time"
 )
 
-// Session is a stable handle to one session, local or remote.
-type Session interface {
-	// Name returns the session's unique name.
-	Name() string
-	// CreatedAt returns when the child process started.
-	CreatedAt() time.Time
-	// Done is closed after the child exits and all output is consumed.
-	Done() <-chan struct{}
-	// Wait waits for the child and returns its exit error. Context
-	// cancellation stops waiting but does not terminate the child.
-	Wait(ctx context.Context) error
-	// Alive reports whether the session is currently running.
-	Alive() bool
-	// Status distinguishes a running session from a stopped one and reports
-	// the exit reason when stopped.
-	Status(ctx context.Context) (Status, error)
-	// Input writes bytes to the PTY verbatim.
-	Input(ctx context.Context, data []byte) error
-	// Resize updates the real PTY and the emulated grid.
-	Resize(ctx context.Context, size Size) error
-	// Snapshot returns a full VT replay of the visible grid and scrollback.
-	Snapshot(ctx context.Context) ([]byte, error)
-	// Checkpoint captures a replay and its exact spool boundary atomically.
-	Checkpoint(ctx context.Context) (Checkpoint, error)
-	// Recover reads the raw spool range [offset, end).
-	Recover(ctx context.Context, offset, end int64) ([]byte, error)
-	// SpoolPath returns the append-only raw output spool path.
-	SpoolPath() string
-	// SpoolSize returns the current raw output spool size.
-	SpoolSize(ctx context.Context) (int64, error)
-	// WatchOutput subscribes to raw output and starts the watcher.
-	WatchOutput(options WatchOptions) (*SpoolWatcher, error)
-	// Close terminates the session. The record stays visible until Remove.
-	Close() error
-	// Remove deletes the session record. Spool files stay on disk.
-	Remove() error
-	// TruncateSpool compacts the live spool in place.
-	TruncateSpool(ctx context.Context) error
-	// ArchiveSpool compresses the spool and prunes old archives.
-	ArchiveSpool(ctx context.Context) error
-	// RemoveSpool deletes the spool and its archives.
-	RemoveSpool()
+// Session is a concrete handle to one local or daemon-owned terminal session.
+// Immutable identity is cached in the handle. Every method that can perform
+// process, storage, or network I/O accepts a context and returns an error.
+type Session struct {
+	backend   sessionBackend
+	name      string
+	createdAt time.Time
 }
 
-// MetadataProvider is implemented by sessions that can report OS-level
-// foreground process metadata. It is kept separate from Session so existing
-// Session implementations and test doubles continue to compile.
-type MetadataProvider interface {
-	// Metadata reports OS-level foreground process metadata when the hub was
-	// created with ProbeForeground enabled. When probing is disabled it
-	// returns zero values; otherwise it may return an error when the
-	// foreground process cannot be resolved.
-	Metadata(ctx context.Context) (SessionMetadata, error)
+// SessionInfo is immutable session identity returned by List.
+type SessionInfo struct {
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// Name returns the session's unique name without performing I/O.
+func (s *Session) Name() string { return s.name }
+
+// CreatedAt returns when the child process started without performing I/O.
+func (s *Session) CreatedAt() time.Time { return s.createdAt }
+
+// Info returns the session's immutable identity without performing I/O.
+func (s *Session) Info() SessionInfo {
+	return SessionInfo{Name: s.name, CreatedAt: s.createdAt}
+}
+
+// Wait waits for the child and returns its exit error. A fatal output storage
+// error is joined with the exit error. Canceling ctx stops waiting but does
+// not terminate the child.
+func (s *Session) Wait(ctx context.Context) error { return s.backend.wait(ctx) }
+
+// Status reports whether the session is running and, when stopped, why. A
+// fatal session runtime or storage failure is returned as an error.
+func (s *Session) Status(ctx context.Context) (Status, error) {
+	return s.backend.status(ctx)
+}
+
+// Metadata reports the foreground process metadata when probing is enabled.
+func (s *Session) Metadata(ctx context.Context) (SessionMetadata, error) {
+	return s.backend.metadata(ctx)
+}
+
+// Size returns the current PTY grid size.
+func (s *Session) Size(ctx context.Context) (Size, error) {
+	return s.backend.size(ctx)
+}
+
+// Signal sends signal to the session's process group. signal must be a
+// non-zero syscall.Signal, such as os.Interrupt or syscall.SIGTERM.
+func (s *Session) Signal(ctx context.Context, signal os.Signal) error {
+	native, err := normalizeSignal(signal)
+	if err != nil {
+		return err
+	}
+	return s.backend.signal(ctx, native)
+}
+
+// WriteInput writes bytes to the PTY verbatim.
+func (s *Session) WriteInput(ctx context.Context, data []byte) error {
+	return s.backend.writeInput(ctx, data)
+}
+
+// Resize updates the real PTY and the emulated grid.
+func (s *Session) Resize(ctx context.Context, size Size) error {
+	return s.backend.resize(ctx, size)
+}
+
+// Replay renders the visible grid and scrollback as terminal bytes.
+func (s *Session) Replay(ctx context.Context) ([]byte, error) {
+	return s.backend.replay(ctx)
+}
+
+// Checkpoint atomically captures a replay and its output position.
+func (s *Session) Checkpoint(ctx context.Context) (Checkpoint, error) {
+	return s.backend.checkpoint(ctx)
+}
+
+// Output streams raw PTY output beginning at from. The zero Cursor starts at
+// the earliest retained byte. The caller must close the returned reader.
+func (s *Session) Output(ctx context.Context, from Cursor) (*OutputReader, error) {
+	return s.backend.output(ctx, from)
+}
+
+// OutputCursor returns the current end of retained raw output without
+// capturing a VT replay. Bytes may be appended immediately after it returns.
+// Use Checkpoint when the cursor must be atomically paired with a replay.
+func (s *Session) OutputCursor(ctx context.Context) (Cursor, error) {
+	return s.backend.outputCursor(ctx)
+}
+
+// RotateOutput completes the active output segment and returns the boundary
+// cursor at the beginning of the new generation.
+func (s *Session) RotateOutput(ctx context.Context) (Cursor, error) {
+	return s.backend.rotateOutput(ctx)
+}
+
+// PruneOutput removes immutable generations strictly before before. before
+// must be a generation-boundary cursor returned by RotateOutput.
+func (s *Session) PruneOutput(ctx context.Context, before Cursor) error {
+	return s.backend.pruneOutput(ctx, before)
+}
+
+// Terminate ends the process tree but keeps the session record and output.
+func (s *Session) Terminate(ctx context.Context) error {
+	return s.backend.terminate(ctx)
+}
+
+// Delete ends the process tree and removes the session record and output
+// storage. Callers that need retained output must archive it before Delete.
+func (s *Session) Delete(ctx context.Context) error {
+	return s.backend.delete(ctx)
+}
+
+func newSession(backend sessionBackend, info SessionInfo) *Session {
+	return &Session{backend: backend, name: info.Name, createdAt: info.CreatedAt}
+}
+
+// sessionBackend is implemented by the in-process and daemon transports. It
+// stays private so adding implementation capabilities cannot break users or
+// their test doubles.
+type sessionBackend interface {
+	wait(context.Context) error
+	status(context.Context) (Status, error)
+	metadata(context.Context) (SessionMetadata, error)
+	size(context.Context) (Size, error)
+	signal(context.Context, syscall.Signal) error
+	writeInput(context.Context, []byte) error
+	resize(context.Context, Size) error
+	replay(context.Context) ([]byte, error)
+	checkpoint(context.Context) (Checkpoint, error)
+	output(context.Context, Cursor) (*OutputReader, error)
+	outputCursor(context.Context) (Cursor, error)
+	rotateOutput(context.Context) (Cursor, error)
+	pruneOutput(context.Context, Cursor) error
+	terminate(context.Context) error
+	delete(context.Context) error
+}
+
+func normalizeSignal(signal os.Signal) (syscall.Signal, error) {
+	if signal == nil {
+		return 0, ErrInvalidSignal
+	}
+	native, ok := signal.(syscall.Signal)
+	if !ok || native <= 0 {
+		return 0, fmt.Errorf("%w: %T", ErrInvalidSignal, signal)
+	}
+	return native, nil
 }
 
 // Status describes whether a session is running and, when stopped, why.
@@ -88,23 +180,8 @@ type SessionMetadata struct {
 type Checkpoint struct {
 	// Replay is a full VT replay of the visible grid and scrollback.
 	Replay []byte
-	// Offset is the raw spool byte position covered by Replay.
-	Offset int64
-}
-
-// WatchOptions configures an output subscription.
-type WatchOptions struct {
-	// Offset is the first spool byte to deliver.
-	Offset int64
-	// MaxBytes invokes OnOverflow after the watcher passes the limit. Zero
-	// uses the watcher default.
-	MaxBytes int64
-	// OnOutput receives borrowed bytes; copy them to retain after return.
-	OnOutput func([]byte)
-	// OnTruncate runs when the spool is compacted in place.
-	OnTruncate func()
-	// OnOverflow runs when Offset passes MaxBytes.
-	OnOverflow func()
+	// Cursor is the first raw output byte not covered by Replay.
+	Cursor Cursor
 }
 
 // localSession runs a session inside the embedding process.
@@ -113,22 +190,19 @@ type localSession struct {
 	state *sessionState
 }
 
-func (l *localSession) Name() string          { return l.state.name }
-func (l *localSession) CreatedAt() time.Time  { return l.state.createdAt }
-func (l *localSession) Done() <-chan struct{} { return l.state.done }
-
-func (l *localSession) Wait(ctx context.Context) error {
+func (l *localSession) wait(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-l.state.done:
+		outputErr := l.state.output.terminalError()
 		l.state.waitMu.Lock()
 		defer l.state.waitMu.Unlock()
-		return convertExit(l.state.waitErr)
+		return errors.Join(outputErr, convertExit(l.state.waitErr))
 	}
 }
 
-func (l *localSession) Alive() bool {
+func (l *localSession) alive() bool {
 	if !l.current() {
 		return false
 	}
@@ -140,8 +214,14 @@ func (l *localSession) Alive() bool {
 	}
 }
 
-func (l *localSession) Status(context.Context) (Status, error) {
-	if l.Alive() {
+func (l *localSession) status(ctx context.Context) (Status, error) {
+	if err := ctx.Err(); err != nil {
+		return Status{}, err
+	}
+	if err := l.state.output.terminalError(); err != nil {
+		return Status{}, err
+	}
+	if l.alive() {
 		return Status{Alive: true}, nil
 	}
 	l.state.waitMu.Lock()
@@ -150,7 +230,7 @@ func (l *localSession) Status(context.Context) (Status, error) {
 	return Status{Exit: exit}, nil
 }
 
-func (l *localSession) Metadata(ctx context.Context) (SessionMetadata, error) {
+func (l *localSession) metadata(ctx context.Context) (SessionMetadata, error) {
 	if !l.hub.probeForeground {
 		return SessionMetadata{}, nil
 	}
@@ -174,7 +254,49 @@ func (l *localSession) Metadata(ctx context.Context) (SessionMetadata, error) {
 	return probeForegroundFD(ctx, fd)
 }
 
-func (l *localSession) Input(ctx context.Context, data []byte) error {
+func (l *localSession) size(ctx context.Context) (Size, error) {
+	l.hub.lifecycleMu.RLock()
+	defer l.hub.lifecycleMu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return Size{}, err
+	}
+	if !l.current() {
+		return Size{}, ErrSessionClosed
+	}
+	l.state.operationMu.RLock()
+	defer l.state.operationMu.RUnlock()
+	return l.state.size, nil
+}
+
+func (l *localSession) signal(ctx context.Context, signal syscall.Signal) error {
+	l.hub.lifecycleMu.RLock()
+	defer l.hub.lifecycleMu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !l.current() {
+		return ErrSessionClosed
+	}
+	l.state.operationMu.RLock()
+	defer l.state.operationMu.RUnlock()
+	select {
+	case <-l.state.done:
+		return os.ErrProcessDone
+	default:
+	}
+	if l.state.pid <= 0 {
+		return os.ErrProcessDone
+	}
+	if err := syscall.Kill(-l.state.pid, signal); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return fmt.Errorf("signal session process group: %w", err)
+	}
+	return nil
+}
+
+func (l *localSession) writeInput(ctx context.Context, data []byte) error {
 	l.hub.lifecycleMu.RLock()
 	defer l.hub.lifecycleMu.RUnlock()
 	if err := ctx.Err(); err != nil {
@@ -209,15 +331,12 @@ func writeFull(w io.Writer, data []byte) error {
 		if n == 0 {
 			return io.ErrShortWrite
 		}
-		if n < len(data) {
-			log.Printf("ghostline: short pty write %d/%d, retrying", n, len(data))
-		}
 		data = data[n:]
 	}
 	return nil
 }
 
-func (l *localSession) Resize(ctx context.Context, size Size) error {
+func (l *localSession) resize(ctx context.Context, size Size) error {
 	l.hub.lifecycleMu.RLock()
 	defer l.hub.lifecycleMu.RUnlock()
 	if err := ctx.Err(); err != nil {
@@ -247,7 +366,7 @@ func (l *localSession) Resize(ctx context.Context, size Size) error {
 	return nil
 }
 
-func (l *localSession) Snapshot(ctx context.Context) ([]byte, error) {
+func (l *localSession) replay(ctx context.Context) ([]byte, error) {
 	l.hub.lifecycleMu.RLock()
 	defer l.hub.lifecycleMu.RUnlock()
 	if err := ctx.Err(); err != nil {
@@ -263,7 +382,7 @@ func (l *localSession) Snapshot(ctx context.Context) ([]byte, error) {
 	return captureLocked(l.state)
 }
 
-func (l *localSession) Checkpoint(ctx context.Context) (Checkpoint, error) {
+func (l *localSession) checkpoint(ctx context.Context) (Checkpoint, error) {
 	l.hub.lifecycleMu.RLock()
 	defer l.hub.lifecycleMu.RUnlock()
 	if err := ctx.Err(); err != nil {
@@ -280,110 +399,79 @@ func (l *localSession) Checkpoint(ctx context.Context) (Checkpoint, error) {
 	if err != nil {
 		return Checkpoint{}, err
 	}
-	info, err := os.Stat(l.state.path)
+	cursor, err := l.state.output.cursor()
 	if err != nil {
-		return Checkpoint{}, fmt.Errorf("stat spool: %w", err)
+		return Checkpoint{}, err
 	}
-	return Checkpoint{Replay: replay, Offset: info.Size()}, nil
+	return Checkpoint{Replay: replay, Cursor: cursor}, nil
 }
 
-func (l *localSession) Recover(ctx context.Context, offset, end int64) ([]byte, error) {
-	l.hub.lifecycleMu.RLock()
-	defer l.hub.lifecycleMu.RUnlock()
+func (l *localSession) output(ctx context.Context, from Cursor) (*OutputReader, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return readSpool(l.state.path, offset, end)
+	return l.state.output.reader(ctx, from)
 }
 
-func (l *localSession) SpoolPath() string { return l.state.path }
-
-func (l *localSession) SpoolSize(ctx context.Context) (int64, error) {
+func (l *localSession) outputCursor(ctx context.Context) (Cursor, error) {
 	l.hub.lifecycleMu.RLock()
 	defer l.hub.lifecycleMu.RUnlock()
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return Cursor{}, err
 	}
-	return spoolSize(l.state.path)
-}
-
-func (l *localSession) WatchOutput(options WatchOptions) (*SpoolWatcher, error) {
-	l.hub.lifecycleMu.RLock()
-	defer l.hub.lifecycleMu.RUnlock()
 	if !l.current() {
-		return nil, ErrSessionClosed
+		return Cursor{}, ErrSessionClosed
 	}
-	watcher, err := NewSpoolWatcher(
-		l.state.path,
-		options.Offset,
-		options.OnOutput,
-		options.OnTruncate,
-		options.OnOverflow,
-	)
-	if err != nil {
-		return nil, err
-	}
-	watcher.SetMaxBytes(options.MaxBytes)
-	l.state.watcherMu.Lock()
-	l.state.watchers = append(l.state.watchers, watcher)
-	l.state.watcherMu.Unlock()
-	watcher.Start()
-	return watcher, nil
+	return l.state.output.cursor()
 }
 
-func (l *localSession) Close() error {
+func (l *localSession) rotateOutput(ctx context.Context) (Cursor, error) {
 	l.hub.lifecycleMu.RLock()
 	defer l.hub.lifecycleMu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return Cursor{}, err
+	}
+	l.state.operationMu.RLock()
+	defer l.state.operationMu.RUnlock()
+	l.state.outputMu.Lock()
+	defer l.state.outputMu.Unlock()
+	return l.state.output.rotate()
+}
+
+func (l *localSession) pruneOutput(ctx context.Context, before Cursor) error {
+	l.hub.lifecycleMu.RLock()
+	defer l.hub.lifecycleMu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return l.state.output.prune(before)
+}
+
+func (l *localSession) terminate(ctx context.Context) error {
+	l.hub.lifecycleMu.RLock()
+	defer l.hub.lifecycleMu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !l.current() {
 		return nil
 	}
 	return terminate(l.state)
 }
 
-func (l *localSession) Remove() error {
+func (l *localSession) delete(ctx context.Context) error {
 	l.hub.lifecycleMu.RLock()
 	defer l.hub.lifecycleMu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !l.current() {
 		return nil
 	}
 	l.hub.remove(l.state.name)
-	return terminate(l.state)
-}
-
-func (l *localSession) TruncateSpool(ctx context.Context) error {
-	l.hub.lifecycleMu.RLock()
-	defer l.hub.lifecycleMu.RUnlock()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	l.state.operationMu.RLock()
-	defer l.state.operationMu.RUnlock()
-	l.state.outputMu.Lock()
-	defer l.state.outputMu.Unlock()
-	return truncateSpool(l.state.path)
-}
-
-func (l *localSession) ArchiveSpool(ctx context.Context) error {
-	l.hub.lifecycleMu.RLock()
-	defer l.hub.lifecycleMu.RUnlock()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	l.state.operationMu.RLock()
-	defer l.state.operationMu.RUnlock()
-	l.state.outputMu.Lock()
-	defer l.state.outputMu.Unlock()
-	return archiveSpool(l.state.path)
-}
-
-func (l *localSession) RemoveSpool() {
-	l.hub.lifecycleMu.RLock()
-	defer l.hub.lifecycleMu.RUnlock()
-	l.state.operationMu.RLock()
-	defer l.state.operationMu.RUnlock()
-	l.state.outputMu.Lock()
-	defer l.state.outputMu.Unlock()
-	removeSpool(l.state.path)
+	err := terminate(l.state)
+	l.state.output.discard()
+	return err
 }
 
 func (l *localSession) current() bool {
@@ -401,119 +489,4 @@ func captureLocked(state *sessionState) ([]byte, error) {
 	result = append(result, "\x1b[3J\x1b[2J\x1b[H"...)
 	result = append(result, snapshot...)
 	return result, nil
-}
-
-func readSpool(path string, offset, end int64) ([]byte, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open spool: %w", err)
-	}
-	defer closeQuietly(file)
-	info, err := file.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if offset < 0 {
-		offset = 0
-	}
-	if offset > info.Size() {
-		return nil, fmt.Errorf("spool offset %d beyond size %d", offset, info.Size())
-	}
-	if end > info.Size() {
-		end = info.Size()
-	}
-	if end < offset {
-		end = offset
-	}
-	if _, err := file.Seek(offset, io.SeekStart); err != nil {
-		return nil, err
-	}
-	data := make([]byte, end-offset)
-	if _, err := io.ReadFull(file, data); err != nil {
-		return nil, err
-	}
-	return data, nil
-}
-
-func spoolSize(path string) (int64, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return 0, err
-	}
-	return info.Size(), nil
-}
-
-func truncateSpool(path string) error {
-	if err := os.Truncate(path, 0); err != nil {
-		return fmt.Errorf("truncate spool: %w", err)
-	}
-	return nil
-}
-
-func archiveSpool(path string) error {
-	info, err := os.Stat(path)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if info.Size() == 0 {
-		return nil
-	}
-	archive := path + "." + strconv.FormatInt(time.Now().UnixNano(), 10) + ".gz"
-	source, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer closeQuietly(source)
-	destination, err := os.OpenFile(archive, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	writer := gzip.NewWriter(destination)
-	if _, err := io.Copy(writer, source); err != nil {
-		_ = writer.Close()
-		_ = destination.Close()
-		removeQuietly(archive)
-		return err
-	}
-	if err := writer.Close(); err != nil {
-		_ = destination.Close()
-		removeQuietly(archive)
-		return err
-	}
-	if err := destination.Close(); err != nil {
-		return err
-	}
-	return pruneArchives(path)
-}
-
-func pruneArchives(path string) error {
-	matches, err := filepath.Glob(path + ".*.gz")
-	if err != nil {
-		return err
-	}
-	for len(matches) > 3 {
-		oldest := 0
-		for index := 1; index < len(matches); index++ {
-			if matches[index] < matches[oldest] {
-				oldest = index
-			}
-		}
-		removeQuietly(matches[oldest])
-		matches = append(matches[:oldest], matches[oldest+1:]...)
-	}
-	return nil
-}
-
-func removeSpool(path string) {
-	removeQuietly(path)
-	matches, err := filepath.Glob(path + ".*.gz")
-	if err != nil {
-		return
-	}
-	for _, match := range matches {
-		removeQuietly(match)
-	}
 }

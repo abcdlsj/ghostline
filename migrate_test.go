@@ -1,9 +1,7 @@
 package ghostline
 
 import (
-	"bufio"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -11,7 +9,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sync/atomic"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -172,6 +171,42 @@ func TestAdminTransportReadsCoalescedFDHandshake(t *testing.T) {
 	}
 }
 
+func TestAdoptRejectsDifferentProtocolBeforePreparingSessions(t *testing.T) {
+	socketDir, err := os.MkdirTemp("/tmp", "ghostline-version-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(socketDir)
+	socket := filepath.Join(socketDir, "old.admin")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		connection, acceptErr := listener.AcceptUnix()
+		if acceptErr != nil {
+			return
+		}
+		defer connection.Close()
+		transport := newAdminTransport(connection)
+		var req adminRequest
+		if transport.read(&req) != nil {
+			return
+		}
+		result, _ := json.Marshal(adminListResult{Version: "0.9.0"})
+		_ = transport.write(adminResponse{ID: req.ID, Result: result}, -1)
+	}()
+	hub, err := New(Options{OutputDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.Close()
+	if _, err := adoptSessions(context.Background(), socket, hub); err == nil || !strings.Contains(err.Error(), ProtocolVersion) {
+		t.Fatalf("Adopt error = %v, want protocol mismatch", err)
+	}
+}
+
 func startAdminServerWithSnapshot(t *testing.T, socket string, meta sessionMeta, fd *os.File, snapshot []byte, replyToExit bool) {
 	t.Helper()
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
@@ -193,7 +228,7 @@ func startAdminServerWithSnapshot(t *testing.T, socket string, meta sessionMeta,
 			}
 			switch request.Method {
 			case adminMethodList:
-				raw, _ := json.Marshal(adminListResult{Sessions: []sessionMeta{meta}})
+				raw, _ := json.Marshal(adminListResult{Version: ProtocolVersion, Sessions: []sessionMeta{meta}})
 				_ = transport.write(adminResponse{ID: request.ID, Result: raw}, -1)
 			case adminMethodAdopt:
 				raw, _ := json.Marshal(meta)
@@ -223,185 +258,15 @@ func startAdminServerWithSnapshot(t *testing.T, socket string, meta sessionMeta,
 	}()
 }
 
-func TestLegacySpoolReplayVersionAllowlist(t *testing.T) {
-	for version, want := range map[string]bool{
-		"0.3.10": false,
-		"0.4.0":  true,
-		"0.5.0":  true,
-		"0.6.0":  false,
-		"":       false,
-	} {
-		if got := legacySpoolReplayVersion(version); got != want {
-			t.Fatalf("legacySpoolReplayVersion(%q) = %t, want %t", version, got, want)
-		}
-	}
-}
-
-func TestAdoptStateFromSpoolReplaysArchivesBeforeLiveSpool(t *testing.T) {
-	outputDir := t.TempDir()
-	path := filepath.Join(outputDir, "warren_spool.out")
-	archive, err := os.OpenFile(path+".100.gz", os.O_CREATE|os.O_WRONLY, 0o600)
+func attachMetaOutput(t *testing.T, meta *sessionMeta, root string) {
+	t.Helper()
+	output, err := createOutputLog(root, meta.Name)
 	if err != nil {
-		t.Fatalf("create archive: %v", err)
+		t.Fatalf("create output log: %v", err)
 	}
-	writer := gzip.NewWriter(archive)
-	if _, err := writer.Write([]byte("archived\r\n")); err != nil {
-		t.Fatalf("write archive: %v", err)
-	}
-	if err := writer.Close(); err != nil {
-		t.Fatalf("close archive: %v", err)
-	}
-	if err := archive.Close(); err != nil {
-		t.Fatalf("close archive file: %v", err)
-	}
-	if err := os.WriteFile(path, []byte("live"), 0o600); err != nil {
-		t.Fatalf("write live spool: %v", err)
-	}
-
-	state, err := adoptStateFromSpool(
-		context.Background(),
-		"warren_spool",
-		nil,
-		Size{Columns: 80, Rows: 24},
-		path,
-		time.Now(),
-		4242,
-		nil,
-		DefaultVTScrollbackMaxBytes,
-	)
-	if err != nil {
-		t.Fatalf("adoptStateFromSpool: %v", err)
-	}
-	defer state.close()
-
-	snapshot, err := state.vt.Snapshot()
-	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
-	if !bytes.Contains(snapshot, []byte("archived")) || !bytes.Contains(snapshot, []byte("live")) {
-		t.Fatalf("spool replay lost content: %q", snapshot)
-	}
-}
-
-func TestAdoptUsesSpoolForLegacySourceVersion(t *testing.T) {
-	ctx := context.Background()
-	outputDir := t.TempDir()
-	socketDir, err := os.MkdirTemp("/tmp", "ghostline-legacy-")
-	if err != nil {
-		t.Fatalf("create socket dir: %v", err)
-	}
-	defer os.RemoveAll(socketDir)
-	publicSocket := filepath.Join(socketDir, "old.sock")
-	adminSocket := publicSocket + ".admin"
-	name := "warren_legacy_spool"
-	spoolPath := filepath.Join(outputDir, name+spoolSuffix)
-	if err := os.WriteFile(spoolPath, []byte("\x1b[5;10Hlegacy"), 0o600); err != nil {
-		t.Fatalf("write spool: %v", err)
-	}
-	meta := sessionMeta{
-		Name:      name,
-		Cols:      80,
-		Rows:      24,
-		CreatedAt: time.Now().Unix(),
-		PID:       4242,
-		Alive:     false,
-		Exit:      &exitMeta{Code: 0},
-	}
-
-	publicListener, err := net.ListenUnix("unix", &net.UnixAddr{Name: publicSocket, Net: "unix"})
-	if err != nil {
-		t.Fatalf("listen public socket: %v", err)
-	}
-	publicDone := make(chan struct{})
-	go func() {
-		defer close(publicDone)
-		for {
-			connection, acceptErr := publicListener.AcceptUnix()
-			if acceptErr != nil {
-				return
-			}
-			go func() {
-				defer connection.Close()
-				requestReader := bufio.NewReader(connection)
-				var request request
-				if err := json.NewDecoder(requestReader).Decode(&request); err != nil {
-					return
-				}
-				result, _ := json.Marshal(versionResult{Version: "0.5.0"})
-				_ = json.NewEncoder(connection).Encode(response{ID: request.ID, Result: result})
-			}()
-		}
-	}()
-	defer func() {
-		_ = publicListener.Close()
-		<-publicDone
-	}()
-
-	adminListener, err := net.ListenUnix("unix", &net.UnixAddr{Name: adminSocket, Net: "unix"})
-	if err != nil {
-		t.Fatalf("listen admin socket: %v", err)
-	}
-	defer adminListener.Close()
-	var snapshotCalls atomic.Int32
-	go func() {
-		connection, acceptErr := adminListener.AcceptUnix()
-		if acceptErr != nil {
-			return
-		}
-		defer connection.Close()
-		transport := newAdminTransport(connection)
-		for {
-			var adminRequest adminRequest
-			if err := transport.read(&adminRequest); err != nil {
-				return
-			}
-			switch adminRequest.Method {
-			case adminMethodList:
-				raw, _ := json.Marshal(adminListResult{Sessions: []sessionMeta{meta}})
-				_ = transport.write(adminResponse{ID: adminRequest.ID, Result: raw}, -1)
-			case adminMethodAdopt:
-				raw, _ := json.Marshal(meta)
-				_ = transport.write(adminResponse{ID: adminRequest.ID, Result: raw}, -1)
-			case adminMethodSnapshot:
-				snapshotCalls.Add(1)
-				_ = transport.write(adminResponse{ID: adminRequest.ID, Error: "unexpected snapshot request"}, -1)
-			case adminMethodCommit:
-				raw, _ := json.Marshal(adminBatchResult{Committed: 1})
-				_ = transport.write(adminResponse{ID: adminRequest.ID, Result: raw}, -1)
-			case adminMethodExit:
-				_ = publicListener.Close()
-				_ = transport.write(adminResponse{ID: adminRequest.ID, Result: json.RawMessage("{}")}, -1)
-				return
-			}
-		}
-	}()
-
-	hub, err := New(Options{OutputDir: outputDir})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer hub.Close()
-	adopted, err := Adopt(ctx, adminSocket, hub)
-	if err != nil {
-		t.Fatalf("Adopt: %v", err)
-	}
-	if adopted != 1 {
-		t.Fatalf("adopted = %d, want 1", adopted)
-	}
-	if got := snapshotCalls.Load(); got != 0 {
-		t.Fatalf("legacy source received %d native snapshot requests", got)
-	}
-	session, ok := hub.Session(name)
-	if !ok {
-		t.Fatalf("adopted session %q missing", name)
-	}
-	snapshot, err := session.Snapshot(ctx)
-	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
-	if !bytes.Contains(snapshot, []byte("legacy")) {
-		t.Fatalf("spool replay lost content: %q", snapshot)
-	}
+	meta.OutputDirectory, meta.OutputGeneration = output.metadata()
+	output.close(nil)
+	t.Cleanup(func() { _ = os.RemoveAll(meta.OutputDirectory) })
 }
 
 func TestRollingAdoptRestoresSnapshot(t *testing.T) {
@@ -413,13 +278,9 @@ func TestRollingAdoptRestoresSnapshot(t *testing.T) {
 	}
 	defer os.RemoveAll(socketDir)
 
-	spoolPath := filepath.Join(outputDir, "warren_snapshot.out")
-	if err := os.WriteFile(spoolPath, []byte("truncated spool"), 0o600); err != nil {
-		t.Fatalf("WriteFile spool: %v", err)
-	}
-	vt, err := NewVTTerminal(80, 24)
+	vt, err := newVTTerminal(80, 24)
 	if err != nil {
-		t.Fatalf("NewVTTerminal: %v", err)
+		t.Fatalf("newVTTerminal: %v", err)
 	}
 	vt.Feed([]byte("\x1b[5;10Hhello"))
 	nativeSnapshot, err := vt.EncodeState()
@@ -437,6 +298,7 @@ func TestRollingAdoptRestoresSnapshot(t *testing.T) {
 		VTScrollbackMaxBytes: 3 << 20,
 		Exit:                 &exitMeta{Code: 0},
 	}
+	attachMetaOutput(t, &meta, outputDir)
 	adminSocket := filepath.Join(socketDir, "old.admin")
 	startAdminServerWithSnapshot(t, adminSocket, meta, nil, nativeSnapshot, true)
 
@@ -448,21 +310,21 @@ func TestRollingAdoptRestoresSnapshot(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	defer hub.Close()
-	adopted, err := Adopt(ctx, adminSocket, hub)
+	adopted, err := adoptSessions(ctx, adminSocket, hub)
 	if err != nil {
 		t.Fatalf("Adopt: %v", err)
 	}
 	if adopted != 1 {
 		t.Fatalf("adopted = %d, want 1", adopted)
 	}
-	session, ok := hub.Session("warren_snapshot")
-	if !ok {
+	session, err := hub.Get(ctx, "warren_snapshot")
+	if err != nil {
 		t.Fatal("adopted session missing")
 	}
-	if got := session.(*localSession).state.scrollbackMaxBytes; got != 3<<20 {
+	if got := session.backend.(*localSession).state.scrollbackMaxBytes; got != 3<<20 {
 		t.Fatalf("adopted scrollback = %d, want %d", got, 3<<20)
 	}
-	snapshot, err := session.Snapshot(ctx)
+	snapshot, err := session.Replay(ctx)
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
@@ -484,10 +346,6 @@ func TestAdoptIgnoresRetirementErrorAfterCommit(t *testing.T) {
 	defer os.RemoveAll(socketDir)
 
 	name := "retirement_error"
-	spoolPath := filepath.Join(outputDir, name+".out")
-	if err := os.WriteFile(spoolPath, []byte("retirement output"), 0o600); err != nil {
-		t.Fatalf("WriteFile spool: %v", err)
-	}
 	meta := sessionMeta{
 		Name:      name,
 		Cols:      80,
@@ -497,13 +355,14 @@ func TestAdoptIgnoresRetirementErrorAfterCommit(t *testing.T) {
 		Alive:     false,
 		Exit:      &exitMeta{Code: 0},
 	}
+	attachMetaOutput(t, &meta, outputDir)
 	adminSocket := filepath.Join(socketDir, "old.admin")
 	// The source confirms commit, then closes the admin connection without a
 	// retirement response. The adopted state itself still comes from the
-	// snapshot, not from the output spool.
-	vt, err := NewVTTerminal(80, 24)
+	// snapshot, not by replaying raw output.
+	vt, err := newVTTerminal(80, 24)
 	if err != nil {
-		t.Fatalf("NewVTTerminal: %v", err)
+		t.Fatalf("newVTTerminal: %v", err)
 	}
 	nativeSnapshot, err := vt.EncodeState()
 	vt.Close()
@@ -517,14 +376,14 @@ func TestAdoptIgnoresRetirementErrorAfterCommit(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	defer hub.Close()
-	adopted, err := Adopt(ctx, adminSocket, hub)
+	adopted, err := adoptSessions(ctx, adminSocket, hub)
 	if err != nil {
 		t.Fatalf("Adopt returned an error after commit: %v", err)
 	}
 	if adopted != 1 {
 		t.Fatalf("adopted = %d, want 1", adopted)
 	}
-	if _, ok := hub.Session(name); !ok {
+	if _, err := hub.Get(ctx, name); err != nil {
 		t.Fatalf("adopted session %q missing after retirement error", name)
 	}
 }
@@ -554,22 +413,22 @@ func startMigrateServer(t *testing.T, outputDir, tag string) (*Server, string) {
 	})
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if Ping(socket) && Ping(socket+".admin") {
+		if socketReady(socket) && socketReady(socket+".admin") {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if !Ping(socket) || !Ping(socket+".admin") {
+	if !socketReady(socket) || !socketReady(socket+".admin") {
 		t.Fatalf("server %s not ready", tag)
 	}
 	return server, socket
 }
 
-func waitSessionOutput(t *testing.T, session Session, needle string) {
+func waitSessionOutput(t *testing.T, session *Session, needle string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		snapshot, err := session.Snapshot(context.Background())
+		snapshot, err := session.Replay(context.Background())
 		if err == nil && bytes.Contains(snapshot, []byte(needle)) {
 			return
 		}
@@ -586,17 +445,25 @@ func TestRollingAdoptKeepsChildRunning(t *testing.T) {
 	outputDir := t.TempDir()
 
 	oldServer, oldSocket := startMigrateServer(t, outputDir, "old")
-	session, err := oldServer.hub.Start(ctx, SessionOptions{Name: "mig", Command: "sh"})
+	session, err := oldServer.hub.Start(ctx, SessionOptions{Name: "mig", Process: ProcessSpec{Path: "sh"}})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if err := session.Input(ctx, []byte("echo before-migrate\r")); err != nil {
+	if err := session.WriteInput(ctx, []byte("echo before-migrate\r")); err != nil {
 		t.Fatalf("Input before migrate: %v", err)
 	}
 	waitSessionOutput(t, session, "before-migrate")
+	if err := session.WriteInput(ctx, []byte("trap 'printf \"migrated-%s\\r\\n\" signal' USR1; printf 'migrated-%s\\r\\n' ready\r")); err != nil {
+		t.Fatalf("install signal trap: %v", err)
+	}
+	waitSessionOutput(t, session, "migrated-ready")
+	checkpoint, err := session.Checkpoint(ctx)
+	if err != nil {
+		t.Fatalf("Checkpoint before migrate: %v", err)
+	}
 
 	newServer, _ := startMigrateServer(t, outputDir, "new")
-	adopted, err := Adopt(ctx, oldSocket+".admin", newServer.hub)
+	adopted, err := adoptSessions(ctx, oldSocket+".admin", newServer.hub)
 	if err != nil {
 		t.Fatalf("Adopt: %v", err)
 	}
@@ -604,32 +471,56 @@ func TestRollingAdoptKeepsChildRunning(t *testing.T) {
 		t.Fatalf("adopted = %d, want 1", adopted)
 	}
 	deadline := time.Now().Add(3 * time.Second)
-	for Ping(oldSocket) && time.Now().Before(deadline) {
+	for socketReady(oldSocket) && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	if Ping(oldSocket) {
+	if socketReady(oldSocket) {
 		t.Fatal("old server still serving after adoption")
 	}
 
-	adoptedSession, ok := newServer.hub.Session("mig")
-	if !ok {
+	adoptedSession, err := newServer.hub.Get(ctx, "mig")
+	if err != nil {
 		t.Fatal("adopted session missing on new server")
 	}
-	if !adoptedSession.Alive() {
+	status, err := adoptedSession.Status(ctx)
+	if err != nil {
+		t.Fatalf("Status after migrate: %v", err)
+	}
+	if !status.Alive {
 		t.Fatal("child died during migration")
 	}
-	if err := adoptedSession.Input(ctx, []byte("echo after-migrate\r")); err != nil {
+	if err := adoptedSession.Signal(ctx, syscall.SIGUSR1); err != nil {
+		t.Fatalf("Signal after migrate: %v", err)
+	}
+	waitSessionOutput(t, adoptedSession, "migrated-signal")
+	readerCtx, cancelReader := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelReader()
+	reader, err := adoptedSession.Output(readerCtx, checkpoint.Cursor)
+	if err != nil {
+		t.Fatalf("Output after migrate: %v", err)
+	}
+	defer reader.Close()
+	if err := adoptedSession.WriteInput(ctx, []byte("echo after-migrate\r")); err != nil {
 		t.Fatalf("Input after migrate: %v", err)
 	}
 	waitSessionOutput(t, adoptedSession, "after-migrate")
 
 	// The adopted session must still render the pre-migration history.
-	snapshot, err := adoptedSession.Snapshot(ctx)
+	snapshot, err := adoptedSession.Replay(ctx)
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
 	if !bytes.Contains(snapshot, []byte("before-migrate")) {
 		t.Fatalf("snapshot lost pre-migration history: %q", snapshot)
+	}
+	buffer := make([]byte, 256)
+	var raw []byte
+	for !bytes.Contains(raw, []byte("after-migrate")) {
+		n, readErr := reader.Read(buffer)
+		raw = append(raw, buffer[:n]...)
+		if readErr != nil {
+			t.Fatalf("read migrated output: %v", readErr)
+		}
 	}
 }
 
@@ -637,7 +528,7 @@ func TestRollingAdoptPreservesStoppedExit(t *testing.T) {
 	ctx := context.Background()
 	outputDir := t.TempDir()
 	oldServer, oldSocket := startMigrateServer(t, outputDir, "stopped")
-	stopped, err := oldServer.hub.Start(ctx, SessionOptions{Name: "stopped", Command: "exit 7"})
+	stopped, err := oldServer.hub.Start(ctx, SessionOptions{Name: "stopped", Process: Shell("exit 7")})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -647,11 +538,11 @@ func TestRollingAdoptPreservesStoppedExit(t *testing.T) {
 	}
 
 	newServer, _ := startMigrateServer(t, outputDir, "stopped-new")
-	if adopted, err := Adopt(ctx, oldSocket+".admin", newServer.hub); err != nil || adopted != 1 {
+	if adopted, err := adoptSessions(ctx, oldSocket+".admin", newServer.hub); err != nil || adopted != 1 {
 		t.Fatalf("Adopt = (%d, %v), want (1, nil)", adopted, err)
 	}
-	adoptedSession, ok := newServer.hub.Session("stopped")
-	if !ok {
+	adoptedSession, err := newServer.hub.Get(ctx, "stopped")
+	if err != nil {
 		t.Fatal("stopped session missing after adoption")
 	}
 	var transferred *ExitError
@@ -664,18 +555,18 @@ func TestMigratedChildReportsUnknownExit(t *testing.T) {
 	ctx := context.Background()
 	outputDir := t.TempDir()
 	oldServer, oldSocket := startMigrateServer(t, outputDir, "unknown")
-	if _, err := oldServer.hub.Start(ctx, SessionOptions{Name: "unknown", Command: "sh"}); err != nil {
+	if _, err := oldServer.hub.Start(ctx, SessionOptions{Name: "unknown", Process: ProcessSpec{Path: "sh"}}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	newServer, _ := startMigrateServer(t, outputDir, "unknown-new")
-	if adopted, err := Adopt(ctx, oldSocket+".admin", newServer.hub); err != nil || adopted != 1 {
+	if adopted, err := adoptSessions(ctx, oldSocket+".admin", newServer.hub); err != nil || adopted != 1 {
 		t.Fatalf("Adopt = (%d, %v), want (1, nil)", adopted, err)
 	}
-	adoptedSession, ok := newServer.hub.Session("unknown")
-	if !ok {
+	adoptedSession, err := newServer.hub.Get(ctx, "unknown")
+	if err != nil {
 		t.Fatal("session missing after adoption")
 	}
-	if err := adoptedSession.Input(ctx, []byte("exit 9\r")); err != nil {
+	if err := adoptedSession.WriteInput(ctx, []byte("exit 9\r")); err != nil {
 		t.Fatalf("Input: %v", err)
 	}
 	var exit *ExitError
@@ -700,28 +591,30 @@ func TestAdoptRollsBackPreparedSessions(t *testing.T) {
 	outputDir := t.TempDir()
 	oldServer, oldSocket := startMigrateServer(t, outputDir, "rollback")
 	for _, name := range []string{"first", "second"} {
-		if _, err := oldServer.hub.Start(ctx, SessionOptions{Name: name, Command: "sh"}); err != nil {
+		if _, err := oldServer.hub.Start(ctx, SessionOptions{Name: name, Process: ProcessSpec{Path: "sh"}}); err != nil {
 			t.Fatalf("Start %s: %v", name, err)
 		}
 	}
-	// Keep the old process's open descriptor alive but make the destination
-	// unable to rebuild one spool. The first state is prepared before the
-	// second one fails, so this exercises the whole abort path.
-	if err := os.Remove(filepath.Join(outputDir, "second.out")); err != nil {
-		t.Fatalf("remove second spool: %v", err)
+	// Keep the source's active descriptor alive but make the destination
+	// unable to open the second session's active segment. The first state is
+	// prepared before the second one fails, exercising the whole abort path.
+	second := oldServer.hub.session("second")
+	secondDirectory, secondGeneration := second.output.metadata()
+	if err := os.Remove(outputSegmentPath(secondDirectory, secondGeneration)); err != nil {
+		t.Fatalf("remove second output segment: %v", err)
 	}
 	target, _ := startMigrateServer(t, t.TempDir(), "rollback-new")
-	if _, err := Adopt(ctx, oldSocket+".admin", target.hub); err == nil {
-		t.Fatal("Adopt succeeded despite missing spool")
+	if _, err := adoptSessions(ctx, oldSocket+".admin", target.hub); err == nil {
+		t.Fatal("Adopt succeeded despite missing output segment")
 	}
-	if !Ping(oldSocket) {
+	if !socketReady(oldSocket) {
 		t.Fatal("old server stopped after failed adoption")
 	}
-	first, ok := oldServer.hub.Session("first")
-	if !ok {
+	first, err := oldServer.hub.Get(ctx, "first")
+	if err != nil {
 		t.Fatal("first session disappeared after rollback")
 	}
-	if err := first.Input(ctx, []byte("echo rollback-ok\r")); err != nil {
+	if err := first.WriteInput(ctx, []byte("echo rollback-ok\r")); err != nil {
 		t.Fatalf("Input after rollback: %v", err)
 	}
 	waitSessionOutput(t, first, "rollback-ok")
@@ -733,13 +626,13 @@ func TestAdoptHonorsCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	started := time.Now()
-	if _, err := Adopt(ctx, oldSocket+".admin", target.hub); !errors.Is(err, context.Canceled) {
+	if _, err := adoptSessions(ctx, oldSocket+".admin", target.hub); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Adopt error = %v, want context canceled", err)
 	}
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("canceled Adopt took %s", elapsed)
 	}
-	if !Ping(oldSocket) {
+	if !socketReady(oldSocket) {
 		t.Fatal("old server stopped after canceled adoption")
 	}
 }
@@ -750,7 +643,7 @@ func TestMigrationAbortKeepsServing(t *testing.T) {
 	ctx := context.Background()
 	outputDir := t.TempDir()
 	oldServer, oldSocket := startMigrateServer(t, outputDir, "abort")
-	session, err := oldServer.hub.Start(ctx, SessionOptions{Name: "keep", Command: "sh"})
+	session, err := oldServer.hub.Start(ctx, SessionOptions{Name: "keep", Process: ProcessSpec{Path: "sh"}})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -767,11 +660,11 @@ func TestMigrationAbortKeepsServing(t *testing.T) {
 	if err := state.finishMigration(ticket, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := session.Input(ctx, []byte("echo still-alive\r")); err != nil {
+	if err := session.WriteInput(ctx, []byte("echo still-alive\r")); err != nil {
 		t.Fatalf("Input after abort: %v", err)
 	}
 	waitSessionOutput(t, session, "still-alive")
-	if Ping(oldSocket) == false {
+	if !socketReady(oldSocket) {
 		t.Fatal("old server stopped after aborted migration")
 	}
 }

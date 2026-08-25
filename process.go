@@ -1,15 +1,11 @@
 package ghostline
 
 import (
-	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,7 +17,6 @@ import (
 )
 
 const (
-	spoolSuffix          = ".out"
 	builtinTerm          = "xterm-256color"
 	migrationDrainWindow = 50 * time.Millisecond
 	migrationDrainBudget = 8 << 20
@@ -29,14 +24,13 @@ const (
 
 type sessionState struct {
 	name               string
-	path               string
 	command            *exec.Cmd
 	pid                int
 	masterFD           int
 	size               Size
 	master             *os.File
-	spool              *os.File
-	vt                 *VTTerminal
+	output             *outputLog
+	vt                 *vtTerminal
 	scrollbackMaxBytes uint64
 	createdAt          time.Time
 
@@ -47,8 +41,6 @@ type sessionState struct {
 	outputMu    sync.Mutex
 	waitMu      sync.Mutex
 	waitErr     error
-	watcherMu   sync.Mutex
-	watchers    []*SpoolWatcher
 	closeOnce   sync.Once
 	done        chan struct{}
 	reaped      chan struct{}
@@ -117,37 +109,36 @@ func (t *migrationTicket) markStopped() {
 	t.stoppedOnce.Do(func() { close(t.stopped) })
 }
 
-func startSession(ctx context.Context, options SessionOptions, size Size, path string, defaultTerm string, scrollbackMaxBytes uint64) (*sessionState, error) {
+func startSession(ctx context.Context, options SessionOptions, size Size, outputDir string, defaultTerm string, scrollbackMaxBytes uint64) (*sessionState, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	vt, err := NewVTTerminalWithOptions(size.Columns, size.Rows, VTTerminalOptions{
+	vt, err := newVTTerminalWithOptions(size.Columns, size.Rows, vtTerminalOptions{
 		ScrollbackMaxBytes: scrollbackMaxBytes,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create vt: %w", err)
 	}
-	spool, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_APPEND|os.O_WRONLY, 0o600)
+	output, err := createOutputLog(outputDir, options.Name)
 	if err != nil {
 		vt.Close()
-		return nil, fmt.Errorf("open spool: %w", err)
+		return nil, err
 	}
-	command := ptyCommand(options.Directory, options.Command, options.Environment, defaultTerm)
+	command := ptyCommand(options.Process, defaultTerm)
 	master, err := pty.StartWithSize(command, &pty.Winsize{Cols: uint16(size.Columns), Rows: uint16(size.Rows)})
 	if err != nil {
-		closeQuietly(spool)
+		output.discard()
 		vt.Close()
 		return nil, fmt.Errorf("start pty: %w", err)
 	}
 	return &sessionState{
 		name:               options.Name,
-		path:               path,
 		command:            command,
 		pid:                command.Process.Pid,
 		masterFD:           int(master.Fd()),
 		size:               size,
 		master:             master,
-		spool:              spool,
+		output:             output,
 		vt:                 vt,
 		scrollbackMaxBytes: scrollbackMaxBytes,
 		createdAt:          time.Now(),
@@ -158,7 +149,7 @@ func startSession(ctx context.Context, options SessionOptions, size Size, path s
 
 func copyOutput(state *sessionState) {
 	defer close(state.done)
-	defer closeQuietly(state.spool)
+	defer state.output.close(nil)
 	defer func() {
 		// A committed migration closes the old duplicate explicitly after the
 		// receiver has its fd; aborted and ordinary exits close it here.
@@ -194,7 +185,7 @@ func copyOutput(state *sessionState) {
 		return
 	}
 	if state.command != nil {
-		waitErr := state.command.Wait()
+		waitErr := waitSessionCommand(state)
 		state.waitMu.Lock()
 		state.waitErr = waitErr
 		state.waitMu.Unlock()
@@ -238,9 +229,14 @@ func copyOutputLoop(state *sessionState, buffer []byte) bool {
 		if read > 0 {
 			chunk := buffer[:read]
 			state.outputMu.Lock()
-			_, _ = state.spool.Write(chunk)
-			state.vt.Feed(chunk)
+			appendErr := state.output.append(chunk)
+			if appendErr == nil {
+				state.vt.Feed(chunk)
+			}
 			state.outputMu.Unlock()
+			if appendErr != nil {
+				return false
+			}
 		}
 		if readErr != nil {
 			return false
@@ -301,13 +297,45 @@ func drainOutput(state *sessionState, buffer []byte) error {
 			drained += read
 			chunk := buffer[:read]
 			state.outputMu.Lock()
-			_, _ = state.spool.Write(chunk)
-			state.vt.Feed(chunk)
+			appendErr := state.output.append(chunk)
+			if appendErr == nil {
+				state.vt.Feed(chunk)
+			}
 			state.outputMu.Unlock()
+			if appendErr != nil {
+				return appendErr
+			}
 		}
 		if readErr != nil {
 			return readErr
 		}
+	}
+}
+
+// waitSessionCommand treats output persistence failure as fatal. Continuing
+// to run after raw PTY bytes can no longer be recorded would make replay and
+// checkpoints lie about the session history.
+func waitSessionCommand(state *sessionState) error {
+	outputErr := state.output.terminalError()
+	if outputErr == nil {
+		return state.command.Wait()
+	}
+	closeQuietly(state.master)
+	wait := make(chan error, 1)
+	go func() { wait <- state.command.Wait() }()
+	if state.command.Process != nil {
+		_ = syscall.Kill(-state.command.Process.Pid, syscall.SIGHUP)
+	}
+	timer := time.NewTimer(terminateGrace)
+	defer timer.Stop()
+	select {
+	case err := <-wait:
+		return err
+	case <-timer.C:
+		if state.command.Process != nil {
+			_ = syscall.Kill(-state.command.Process.Pid, syscall.SIGKILL)
+		}
+		return <-wait
 	}
 }
 
@@ -393,8 +421,8 @@ func (s *sessionState) finishMigration(ticket *migrationTicket, commit bool) err
 // adoptState builds a session around a PTY master transferred from another
 // server process. The child keeps running; only the owner of the master
 // changes. The emulator state is restored from the encoded snapshot.
-func adoptState(name string, master *os.File, snapshot []byte, size Size, path string, createdAt time.Time, pid int, exit *ExitError, scrollbackMaxBytes uint64) (*sessionState, error) {
-	vt, err := NewVTTerminalWithOptions(size.Columns, size.Rows, VTTerminalOptions{
+func adoptState(name string, master *os.File, snapshot []byte, size Size, outputDirectory string, outputGeneration uint64, createdAt time.Time, pid int, exit *ExitError, scrollbackMaxBytes uint64) (*sessionState, error) {
+	vt, err := newVTTerminalWithOptions(size.Columns, size.Rows, vtTerminalOptions{
 		ScrollbackMaxBytes: scrollbackMaxBytes,
 	})
 	if err != nil {
@@ -406,71 +434,19 @@ func adoptState(name string, master *os.File, snapshot []byte, size Size, path s
 		closeFileQuietly(master)
 		return nil, fmt.Errorf("restore vt state: %w", err)
 	}
-	spool, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	output, err := adoptOutputLog(outputDirectory, outputGeneration)
 	if err != nil {
-		vt.Close()
-		closeFileQuietly(master)
-		return nil, fmt.Errorf("open spool: %w", err)
-	}
-	state := &sessionState{
-		name:               name,
-		path:               path,
-		pid:                pid,
-		masterFD:           -1,
-		size:               size,
-		master:             master,
-		spool:              spool,
-		vt:                 vt,
-		scrollbackMaxBytes: scrollbackMaxBytes,
-		createdAt:          createdAt,
-		done:               make(chan struct{}),
-		reaped:             make(chan struct{}),
-	}
-	if master == nil {
-		if exit == nil {
-			exit = &ExitError{Code: -1, Unknown: true}
-		}
-		state.waitErr = exit
-		close(state.done)
-		close(state.reaped)
-	} else {
-		state.masterFD = int(master.Fd())
-	}
-	return state, nil
-}
-
-// adoptStateFromSpool rebuilds a session's emulator by replaying the source
-// server's archived and live PTY output while the source migration ticket is
-// still paused. It is intentionally used only for the bounded compatibility
-// window in Adopt; current servers transfer authoritative native snapshots.
-func adoptStateFromSpool(ctx context.Context, name string, master *os.File, size Size, path string, createdAt time.Time, pid int, exit *ExitError, scrollbackMaxBytes uint64) (*sessionState, error) {
-	vt, err := NewVTTerminalWithOptions(size.Columns, size.Rows, VTTerminalOptions{
-		ScrollbackMaxBytes: scrollbackMaxBytes,
-	})
-	if err != nil {
-		closeFileQuietly(master)
-		return nil, fmt.Errorf("create vt: %w", err)
-	}
-	if err := replaySpool(ctx, vt, path); err != nil {
 		vt.Close()
 		closeFileQuietly(master)
 		return nil, err
 	}
-
-	spool, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		vt.Close()
-		closeFileQuietly(master)
-		return nil, fmt.Errorf("open spool: %w", err)
-	}
 	state := &sessionState{
 		name:               name,
-		path:               path,
 		pid:                pid,
 		masterFD:           -1,
 		size:               size,
 		master:             master,
-		spool:              spool,
+		output:             output,
 		vt:                 vt,
 		scrollbackMaxBytes: scrollbackMaxBytes,
 		createdAt:          createdAt,
@@ -482,92 +458,18 @@ func adoptStateFromSpool(ctx context.Context, name string, master *os.File, size
 			exit = &ExitError{Code: -1, Unknown: true}
 		}
 		state.waitErr = exit
+		state.output.close(nil)
 		close(state.done)
 		close(state.reaped)
 	} else {
 		state.masterFD = int(master.Fd())
 	}
 	return state, nil
-}
-
-func replaySpool(ctx context.Context, vt *VTTerminal, path string) error {
-	archives, err := filepath.Glob(path + ".*.gz")
-	if err != nil {
-		return fmt.Errorf("find spool archives: %w", err)
-	}
-	sort.Strings(archives)
-	paths := make([]struct {
-		path       string
-		compressed bool
-	}, 0, len(archives)+1)
-	for _, archive := range archives {
-		paths = append(paths, struct {
-			path       string
-			compressed bool
-		}{path: archive, compressed: true})
-	}
-	if _, err := os.Stat(path); err != nil {
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("stat spool: %w", err)
-		}
-		if len(paths) == 0 {
-			return fmt.Errorf("stat spool: %w", err)
-		}
-	} else {
-		paths = append(paths, struct {
-			path       string
-			compressed bool
-		}{path: path})
-	}
-
-	for _, item := range paths {
-		if err := replaySpoolFile(ctx, vt, item.path, item.compressed); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func replaySpoolFile(ctx context.Context, vt *VTTerminal, path string, compressed bool) error {
-	file, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open spool replay %s: %w", path, err)
-	}
-	defer closeQuietly(file)
-
-	var reader io.Reader = file
-	var compressedReader *gzip.Reader
-	if compressed {
-		compressedReader, err = gzip.NewReader(file)
-		if err != nil {
-			return fmt.Errorf("open compressed spool replay %s: %w", path, err)
-		}
-		defer compressedReader.Close()
-		reader = compressedReader
-	}
-
-	buffer := make([]byte, 256*1024)
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		read, readErr := reader.Read(buffer)
-		if read > 0 {
-			vt.Feed(buffer[:read])
-		}
-		if readErr == io.EOF {
-			return nil
-		}
-		if readErr != nil {
-			return fmt.Errorf("replay spool %s: %w", path, readErr)
-		}
-	}
 }
 
 func terminate(state *sessionState) error {
 	state.operationMu.Lock()
 	defer state.operationMu.Unlock()
-	state.closeWatchers()
 	select {
 	case <-state.done:
 		state.close()
@@ -619,34 +521,27 @@ func (s *sessionState) close() {
 		if s.master != nil {
 			closeQuietly(s.master)
 		}
-		closeQuietly(s.spool)
+		s.output.close(nil)
 		s.vt.Close()
 	})
 }
 
-func (s *sessionState) closeWatchers() {
-	s.watcherMu.Lock()
-	watchers := s.watchers
-	s.watchers = nil
-	s.watcherMu.Unlock()
-	for _, watcher := range watchers {
-		watcher.Close()
-	}
-}
-
-func ptyCommand(directory, command string, environment []string, defaultTerm string) *exec.Cmd {
+func ptyCommand(process ProcessSpec, defaultTerm string) *exec.Cmd {
 	var cmd *exec.Cmd
-	if strings.TrimSpace(command) == "" {
+	switch {
+	case process.ShellCommand != "":
+		cmd = exec.Command("sh", "-lc", process.ShellCommand)
+	case process.Path != "":
+		cmd = exec.Command(process.Path, process.Args...)
+	default:
 		shell := os.Getenv("SHELL")
 		if shell == "" {
 			shell = "sh"
 		}
 		cmd = exec.Command(shell)
-	} else {
-		cmd = exec.Command("sh", "-lc", command)
 	}
-	cmd.Dir = directory
-	cmd.Env = ptyEnvironment(environment, defaultTerm)
+	cmd.Dir = process.Directory
+	cmd.Env = ptyEnvironment(process.Environment, defaultTerm)
 	return cmd
 }
 

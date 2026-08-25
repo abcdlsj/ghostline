@@ -6,8 +6,62 @@ on:
   pull_request:
 
 jobs:
-  test:
-    runs-on: macos-14
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # GitHub retired the macos-13 hosted image. Build and link with the
+          # 13.0 deployment target on the oldest available Intel image.
+          - runner: macos-14
+            arch: x86_64
+            fuzz: false
+          - runner: macos-14-arm64
+            arch: arm64
+            fuzz: true
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: test "$(uname -m)" = "${{ matrix.arch }}"
+      - run: test "$(go env CGO_ENABLED)" = 1
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: lipo third_party/lib/libghostty-vt.a -verify_arch x86_64 arm64
+      - run: shasum -a 256 -c third_party/SHA256SUMS
+      - run: go test -c -o /tmp/ghostline.test .
+      - run: xcrun vtool -show-build /tmp/ghostline.test | grep -q 'minos 13.0'
+      - run: go test -run '^$' -fuzz '^FuzzParseCursorRoundTrip$' -fuzztime 3s
+        if: matrix.fuzz
+      - run: go test -run '^$' -fuzz '^FuzzRPCResponseDecoding$' -fuzztime 3s
+        if: matrix.fuzz
+      - run: go test -run '^$' -fuzz '^FuzzQueryResponderNeverPanics$' -fuzztime 3s
+        if: matrix.fuzz
+      - run: go test -run '^$' -fuzz '^FuzzVTStateRestore$' -fuzztime 3s
+        if: matrix.fuzz
+      - run: go test -race ./...
+        working-directory: examples/minimux
+
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            artifact: third_party/lib/linux_amd64/libghostty-vt.a
+            arch: x86_64
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            artifact: third_party/lib/linux_arm64/libghostty-vt.a
+            arch: aarch64
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -16,9 +70,16 @@ jobs:
           cache-dependency-path: |
             go.sum
             examples/minimux/go.sum
-      - run: test -z "$(gofmt -l .)"
-      - run: go vet ./...
+      - run: test "$(uname -m)" = "${{ matrix.arch }}"
+      - run: test "$(go env CGO_ENABLED)" = 1
+      - run: test -s "${{ matrix.artifact }}"
+      - run: shasum -a 256 -c third_party/SHA256SUMS
       - run: go test -race ./...
+      - run: go test -c -o /tmp/ghostline.test .
+      - run: >-
+          docker run --rm --platform "${{ matrix.platform }}"
+          -v /tmp/ghostline.test:/ghostline.test:ro
+          --entrypoint /ghostline.test ubuntu:20.04
       - run: go test -race ./...
         working-directory: examples/minimux
 
@@ -36,3 +97,23 @@ jobs:
       - run: CGO_ENABLED=0 go build ./...
       - run: CGO_ENABLED=0 go build ./...
         working-directory: examples/minimux
+      - run: CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build ./...
+      - run: CGO_ENABLED=0 GOOS=freebsd GOARCH=amd64 go build ./...
+
+  performance:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Run bounded benchmarks
+        run: go test -run '^$' -bench . -benchmem -benchtime=200ms -count=3 ./... | tee ghostline-bench.txt
+      - name: Upload benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghostline-bench
+          path: ghostline-bench.txt
+          if-no-files-found: error

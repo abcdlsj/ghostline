@@ -7,28 +7,28 @@ import (
 	"testing"
 )
 
-func newTestVTTerminalSize(t *testing.T, cols, rows int, options VTTerminalOptions) *VTTerminal {
+func newTestVTTerminalSize(t *testing.T, cols, rows int, options vtTerminalOptions) *vtTerminal {
 	t.Helper()
-	vt, err := NewVTTerminalWithOptions(cols, rows, options)
+	vt, err := newVTTerminalWithOptions(cols, rows, options)
 	if errors.Is(err, ErrUnavailable) {
-		t.Skip("libghostty-vt requires cgo")
+		t.Skip("libghostty-vt is unavailable for this build")
 	}
 	if err != nil {
-		t.Fatalf("NewVTTerminalWithOptions: %v", err)
+		t.Fatalf("newVTTerminalWithOptions: %v", err)
 	}
 	return vt
 }
 
-func newTestVTTerminal(t *testing.T, options VTTerminalOptions) *VTTerminal {
+func newTestVTTerminal(t *testing.T, options vtTerminalOptions) *vtTerminal {
 	return newTestVTTerminalSize(t, 80, 24, options)
 }
 
 func TestVTTerminalOptionsResolveDefaults(t *testing.T) {
-	if got := (VTTerminalOptions{}).resolvedScrollbackMaxBytes(); got != DefaultVTScrollbackMaxBytes {
+	if got := (vtTerminalOptions{}).resolvedScrollbackMaxBytes(); got != DefaultVTScrollbackMaxBytes {
 		t.Fatalf("default scrollback = %d, want %d", got, DefaultVTScrollbackMaxBytes)
 	}
 	const configuredLimit = 4 << 20
-	if got := (VTTerminalOptions{
+	if got := (vtTerminalOptions{
 		ScrollbackMaxBytes: configuredLimit,
 	}).resolvedScrollbackMaxBytes(); got != configuredLimit {
 		t.Fatalf("configured scrollback = %d, want %d", got, configuredLimit)
@@ -36,11 +36,11 @@ func TestVTTerminalOptionsResolveDefaults(t *testing.T) {
 }
 
 func TestVTTerminalOptionsBoundRenderedHistory(t *testing.T) {
-	small := newTestVTTerminal(t, VTTerminalOptions{
+	small := newTestVTTerminal(t, vtTerminalOptions{
 		ScrollbackMaxBytes: 1,
 	})
 	defer small.Close()
-	large := newTestVTTerminal(t, VTTerminalOptions{
+	large := newTestVTTerminal(t, vtTerminalOptions{
 		ScrollbackMaxBytes: 16 << 20,
 	})
 	defer large.Close()
@@ -75,7 +75,7 @@ func TestVTTerminalOptionsBoundRenderedHistory(t *testing.T) {
 // GHOSTTY_INVALID_VALUE because continuation tracking was disabled; with
 // tracking enabled before the feed, both encode and restore must succeed.
 func TestEncodeStateSupportsUnfinishedContinuation(t *testing.T) {
-	vt := newTestVTTerminal(t, VTTerminalOptions{})
+	vt := newTestVTTerminal(t, vtTerminalOptions{})
 	defer vt.Close()
 
 	// A partial CSI sequence leaves the VT parser off ground.
@@ -88,7 +88,7 @@ func TestEncodeStateSupportsUnfinishedContinuation(t *testing.T) {
 		t.Fatal("EncodeState returned an empty snapshot")
 	}
 
-	restored := newTestVTTerminal(t, VTTerminalOptions{})
+	restored := newTestVTTerminal(t, vtTerminalOptions{})
 	defer restored.Close()
 	if err := restored.RestoreState(encoded); err != nil {
 		t.Fatalf("RestoreState of unfinished continuation: %v", err)
@@ -96,7 +96,7 @@ func TestEncodeStateSupportsUnfinishedContinuation(t *testing.T) {
 }
 
 func TestVTTerminalResizeKeepsSnapshotEncodableAfterWideBoundary(t *testing.T) {
-	vt := newTestVTTerminalSize(t, 138, 42, VTTerminalOptions{})
+	vt := newTestVTTerminalSize(t, 138, 42, vtTerminalOptions{})
 	defer vt.Close()
 
 	// The wide character occupies columns 123-124. Shrinking to 123 columns
@@ -110,7 +110,7 @@ func TestVTTerminalResizeKeepsSnapshotEncodableAfterWideBoundary(t *testing.T) {
 }
 
 func TestVTTerminalResizeRepairsInactiveAlternateBoundary(t *testing.T) {
-	vt := newTestVTTerminalSize(t, 138, 42, VTTerminalOptions{})
+	vt := newTestVTTerminalSize(t, 138, 42, vtTerminalOptions{})
 	defer vt.Close()
 
 	// Leave the malformed wide pair on the inactive alternate screen while
@@ -133,7 +133,7 @@ func TestVTTerminalResizeRepairsInactiveAlternateBoundary(t *testing.T) {
 }
 
 func TestVTTerminalResizeKeepsNoReflowPrimaryEncodable(t *testing.T) {
-	vt := newTestVTTerminalSize(t, 138, 42, VTTerminalOptions{})
+	vt := newTestVTTerminalSize(t, 138, 42, vtTerminalOptions{})
 	defer vt.Close()
 
 	vt.Feed([]byte("\x1b[?7l\x1b[7;123H\xe5\x86\x99"))
@@ -142,4 +142,33 @@ func TestVTTerminalResizeKeepsNoReflowPrimaryEncodable(t *testing.T) {
 	if _, err := vt.EncodeState(); err != nil {
 		t.Fatalf("EncodeState after no-reflow primary resize: %v", err)
 	}
+}
+
+func FuzzVTStateRestore(f *testing.F) {
+	terminal, err := newVTTerminal(80, 24)
+	if errors.Is(err, ErrUnavailable) {
+		f.Skip()
+	}
+	if err != nil {
+		f.Fatal(err)
+	}
+	terminal.Feed([]byte("seed\r\n"))
+	seed, err := terminal.EncodeState()
+	terminal.Close()
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(seed)
+	f.Add([]byte("not-a-snapshot"))
+	f.Fuzz(func(t *testing.T, state []byte) {
+		if len(state) > 1<<20 {
+			t.Skip()
+		}
+		terminal, err := newVTTerminal(80, 24)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer terminal.Close()
+		_ = terminal.RestoreState(state)
+	})
 }

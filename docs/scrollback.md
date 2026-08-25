@@ -1,103 +1,63 @@
-# Scrollback and Output Retention
+# Scrollback and output retention
 
-ghostline keeps two different forms of terminal history. They have different
-owners, units, and recovery behavior.
+ghostline keeps rendered terminal history and raw PTY output for different
+purposes. They must not share one retention knob.
 
-## Retention Layers
+| Layer | Contents | Default | Owner |
+| --- | --- | ---: | --- |
+| VT scrollback | Rendered cells, styles, wraps, and terminal modes | 2 MiB logical budget | ghostline mechanism; caller configures budget |
+| Raw output generations | Original PTY bytes and escape sequences | No automatic cap | caller retention policy |
 
-| Layer | Contents | Default in this repository | Purpose |
-| --- | --- | --- | --- |
-| VT scrollback | Rendered cells, styles, wraps, and terminal state | 2 MiB logical bytes per terminal | Build a screen snapshot with recent visible history |
-| Raw spool | Original PTY output bytes, including escape sequences | No automatic cap in the core Hub | Exact replay, checkpoints, and consumer-defined recovery |
-| Spool watcher threshold | A callback threshold for a watched spool | 64 MiB when `WatchOptions.MaxBytes` is zero | Tell the consumer that it should compact or rotate |
-| Warren live spool | Raw PTY output retained on disk | 8 MiB | Bound the raw recovery window before archive/truncate and reanchor |
-| Warren output ring | Recent raw output retained in memory | 8 MiB | Serve fast reconnects before falling back to spool recovery |
+## VT scrollback
 
-The core library does not truncate a spool when the watcher threshold is
-crossed. The `OnOverflow` callback decides what to do. Warren sets its live
-spool cap to 8 MiB, archives the current spool, truncates it, and reanchors
-clients with a screen snapshot.
+`Options.VTScrollbackMaxBytes` sets the Hub default.
+`SessionOptions.VTScrollbackMaxBytes` overrides it for one session. A zero
+value inherits the 2 MiB package default.
 
-A VT snapshot cannot restore history that the VT emulator has already pruned.
-The raw spool can still contain that output, but recovering it requires replaying
-the raw bytes or serving them through an explicit history path. Increasing the
-spool cap alone does not increase the history carried by a snapshot.
+libghostty applies the limit at its internal page granularity, so the value is
+a logical budget, not an exact heap ceiling. Increasing it makes `Replay`,
+`Checkpoint`, migration snapshots, and session memory larger. Daemon Replay
+and Checkpoint data is chunked on the wire, but the public methods still return
+the complete replay as `[]byte`; chunking does not remove its total memory or
+encoding cost.
 
-## Configuration
+## Raw output generations
 
-The default is suitable for an interactive terminal while keeping reanchor and
-rolling-upgrade snapshots bounded:
+Each session owns one active segment and zero or more immutable completed
+segments. A `Cursor` identifies a generation and byte offset without exposing
+those fields as public API.
 
-```go
-hub, err := ghostline.New(ghostline.Options{
-	OutputDir:            "/var/lib/my-app/terminals",
-	VTScrollbackMaxBytes: 2 << 20,
-})
-```
+`RotateOutput` atomically completes the active generation and publishes a new
+generation-boundary cursor. Readers cross completed generations in order.
+`PruneOutput` removes generations strictly before such a boundary.
 
-An individual session can override the Hub default. Zero means inherit the Hub
-setting, and a direct `NewVTTerminalWithOptions` call uses the package default
-when its option is zero.
+An already-open reader pins its current file descriptor and may drain it after
+pruning. A new reader at a pruned generation receives `ErrCursorExpired`.
+This distinction avoids corrupting in-flight consumers while making retention
+state explicit to reconnecting consumers.
 
-```go
-session, err := hub.Start(ctx, ghostline.SessionOptions{
-	Name:                 "build-shell",
-	VTScrollbackMaxBytes: 4 << 20,
-})
-```
+The core does not gzip, archive, count, or schedule retention. An application
+can rotate by size or time, copy completed segments into its own archive, wait
+for consumer acknowledgements, and then prune. Those choices depend on the
+application's durability and storage promises and do not belong in the
+terminal runtime.
 
-The standalone server accepts the same default through
-`--vt-scrollback-max-bytes`. The client-to-server create request also carries
-the per-session value.
+## Checkpoint relationship
 
-libghostty enforces the byte budget at page granularity. The configured value
-is therefore an estimate: the actual retained allocation can be larger, and a
-page is roughly 400 KiB in the current implementation. A larger limit also
-increases the work and payload size of snapshots.
+`Checkpoint` captures a terminal replay and the current raw-output cursor
+under the same output lock. The replay represents terminal state through that
+cursor. It does not guarantee that every historic raw byte is still present,
+and raw segments cannot reconstruct VT history already discarded from the
+emulator without replaying from a complete earlier anchor.
 
-## Other Defaults
+For reattachment, stop the old reader, create a checkpoint, open a new reader
+at its cursor, write the replay, and then start the reader. This order avoids
+both duplicate bytes and a gap between rendered state and live output.
 
-The following are common documented defaults. They are configurable and can
-change across versions; they are included as reference points rather than
-protocol guarantees.
+## Practical policy
 
-| Runtime or terminal | Default history | Unit |
-| --- | ---: | --- |
-| tmux | 2,000 | lines per window |
-| GNU Screen | 100 | lines per window |
-| Zellij | 10,000 | lines |
-| Alacritty | 10,000 | lines |
-| WezTerm | 3,500 | lines |
-| kitty | 2,000 | lines |
-
-The kernel PTY and common PTY libraries such as `creack/pty` and `node-pty`
-do not provide user-visible scrollback. They transport bytes; the terminal
-emulator or multiplexer owns history.
-
-tmux documents its default through `history-limit`; GNU Screen documents its
-default through `defscrollback`. The other terminal applications expose
-equivalent line-count settings in their configuration files. These line-based
-buffers are not directly comparable to ghostline's rendered byte budget.
-
-## Recommended Values
-
-For an interactive Desktop session, use:
-
-- VT scrollback: 2 MiB by default, with 1-4 MiB as a practical range.
-- Warren live spool: 8 MiB as the raw recovery window.
-- Larger VT limits only for log-heavy sessions that need more history after a
-  snapshot reanchor; benchmark snapshot latency and per-session memory first.
-
-Do not make the VT budget equal to the raw spool by default. The spool is an
-exact byte stream, while a snapshot is rendered terminal state and may be much
-more expensive to encode. The output protocol can split a large snapshot into
-8 MiB frames, but splitting does not remove the memory or latency cost.
-
-References:
-
-- [tmux manual](https://man7.org/linux/man-pages/man1/tmux.1.html)
-- [GNU Screen manual](https://www.gnu.org/software/screen/manual/screen.html)
-- [Zellij configuration](https://zellij.dev/documentation/options.html)
-- [Alacritty configuration](https://alacritty.org/config-alacritty.html)
-- [WezTerm scrollback](https://wezterm.org/config/lua/config/scrollback_lines.html)
-- [kitty configuration](https://sw.kovidgoyal.net/kitty/conf/)
+Start with the 2 MiB VT budget for interactive sessions. Measure checkpoint
+latency and memory before increasing it. Choose raw-output rotation and pruning
+from explicit requirements such as reconnect window, archive cost, and the
+slowest consumer cursor. Do not equate a raw-byte budget with a rendered-cell
+budget.

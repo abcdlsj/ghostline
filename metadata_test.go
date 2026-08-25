@@ -17,18 +17,13 @@ func TestMetadataDisabledByDefault(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = hub.Close() })
 	session, err := hub.Start(context.Background(), ghostline.SessionOptions{
-		Name:      "metadata-off",
-		Directory: t.TempDir(),
-		Command:   "sh",
+		Name:    "metadata-off",
+		Process: ghostline.ProcessSpec{Path: "sh", Directory: t.TempDir()},
 	})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	provider, ok := session.(ghostline.MetadataProvider)
-	if !ok {
-		t.Fatal("session does not implement MetadataProvider")
-	}
-	metadata, err := provider.Metadata(context.Background())
+	metadata, err := session.Metadata(context.Background())
 	if err != nil {
 		t.Fatalf("Metadata: %v", err)
 	}
@@ -48,9 +43,8 @@ func TestMetadataEnabledReportsForegroundProcess(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = hub.Close() })
 	session, err := hub.Start(context.Background(), ghostline.SessionOptions{
-		Name:      "metadata-on",
-		Directory: directory,
-		Command:   "sh",
+		Name:    "metadata-on",
+		Process: ghostline.ProcessSpec{Path: "sh", Directory: directory},
 	})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -65,25 +59,20 @@ func TestRemoteMetadataEnabledReportsForegroundProcess(t *testing.T) {
 	})
 	directory := t.TempDir()
 	session, err := client.Start(context.Background(), ghostline.SessionOptions{
-		Name:      "metadata-remote",
-		Directory: directory,
-		Command:   "sh",
+		Name:    "metadata-remote",
+		Process: ghostline.ProcessSpec{Path: "sh", Directory: directory},
 	})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	t.Cleanup(func() { _ = session.Close() })
+	t.Cleanup(func() { _ = session.Terminate(context.Background()) })
 	waitForForegroundMetadata(t, session, directory, "sleep")
 }
 
-func waitForForegroundMetadata(t *testing.T, session ghostline.Session, directory, processNeedle string) {
+func waitForForegroundMetadata(t *testing.T, session *ghostline.Session, directory, processNeedle string) {
 	t.Helper()
-	provider, ok := session.(ghostline.MetadataProvider)
-	if !ok {
-		t.Fatal("session does not implement MetadataProvider")
-	}
 	ctx := context.Background()
-	if err := session.Input(ctx, []byte("cd "+directory+" && exec sleep 30\r")); err != nil {
+	if err := session.WriteInput(ctx, []byte("cd "+directory+" && exec sleep 30\r")); err != nil {
 		t.Fatalf("Input: %v", err)
 	}
 	deadline := time.Now().Add(10 * time.Second)
@@ -94,7 +83,7 @@ func waitForForegroundMetadata(t *testing.T, session ghostline.Session, director
 		t.Fatalf("EvalSymlinks: %v", err)
 	}
 	for time.Now().Before(deadline) {
-		metadata, err := provider.Metadata(ctx)
+		metadata, err := session.Metadata(ctx)
 		last, lastErr = metadata, err
 		if err == nil && strings.Contains(metadata.Process, processNeedle) {
 			if gotDirectory, resolveErr := filepath.EvalSymlinks(metadata.Directory); resolveErr == nil && gotDirectory == wantDirectory {

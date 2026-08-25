@@ -2,7 +2,6 @@ package ghostline
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,7 +10,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,8 +28,10 @@ func NewClient(socketPath string) *Client {
 	return &Client{socket: socketPath}
 }
 
-// ConnectOptions configures how Connect starts a missing server.
-type ConnectOptions struct {
+// ManagedClientOptions configures how ConnectManaged starts a missing server.
+// Use NewClient when process lifecycle is owned by the caller or a service
+// manager.
+type ManagedClientOptions struct {
 	// Socket is the Unix socket path the server listens on.
 	Socket string
 	// Spawn is the command used to start the server when the socket is
@@ -40,13 +40,16 @@ type ConnectOptions struct {
 	Spawn []string
 	// Env overrides the spawned server's environment.
 	Env []string
-	// ReadyTimeout bounds how long Connect waits for the socket. Zero uses 5s.
+	// ReadyTimeout bounds how long ConnectManaged waits for the socket. Zero
+	// uses 5s.
 	ReadyTimeout time.Duration
-	// Log receives the spawned server's stdout and stderr. Empty discards it.
+	// Log receives serialized writes from the spawned server's stdout and
+	// stderr. Empty discards them after retaining bounded diagnostics.
 	Log io.Writer
 }
 
 type clientLifecycle struct {
+	mu           sync.Mutex
 	spawn        []string
 	env          []string
 	readyTimeout time.Duration
@@ -55,30 +58,53 @@ type clientLifecycle struct {
 	wait         chan error
 }
 
-// lockedBuffer is the small bridge between os/exec's output copier and the
-// readiness loop. A process can write its first diagnostic at the same time
-// that waitReady formats it, so the buffer needs the same quiet discipline as
-// the socket it is describing.
-type lockedBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
+type synchronizedWriter struct {
+	mu     sync.Mutex
+	writer io.Writer
 }
 
-func (b *lockedBuffer) Write(data []byte) (int, error) {
+func (w *synchronizedWriter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.writer.Write(data)
+}
+
+const maxDaemonDiagnostics = 64 << 10
+
+// diagnosticBuffer retains only the most recent daemon startup diagnostics.
+// A broken spawn command must not turn stderr into unbounded client memory.
+type diagnosticBuffer struct {
+	mu   sync.Mutex
+	data []byte
+}
+
+func (b *diagnosticBuffer) Write(data []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.buf.Write(data)
+	written := len(data)
+	if len(data) >= maxDaemonDiagnostics {
+		b.data = append(b.data[:0], data[len(data)-maxDaemonDiagnostics:]...)
+		return written, nil
+	}
+	overflow := len(b.data) + len(data) - maxDaemonDiagnostics
+	if overflow > 0 {
+		copy(b.data, b.data[overflow:])
+		b.data = b.data[:len(b.data)-overflow]
+	}
+	b.data = append(b.data, data...)
+	return written, nil
 }
 
-func (b *lockedBuffer) String() string {
+func (b *diagnosticBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.buf.String()
+	return string(b.data)
 }
 
-// Connect returns a client, spawning the server when the socket is missing.
-// The returned client owns the spawned process; Close stops it.
-func Connect(ctx context.Context, options ConnectOptions) (*Client, error) {
+// ConnectManaged returns a client, spawning the server when the socket is
+// missing. The returned client owns the spawned process; Close stops it.
+// This lifecycle behavior is intentionally separate from plain NewClient.
+func ConnectManaged(ctx context.Context, options ManagedClientOptions) (*Client, error) {
 	if options.Socket == "" {
 		return nil, errors.New("ghostline: socket path required")
 	}
@@ -91,7 +117,7 @@ func Connect(ctx context.Context, options ConnectOptions) (*Client, error) {
 			log:          options.Log,
 		},
 	}
-	if Ping(options.Socket) {
+	if socketReady(options.Socket) {
 		return client, nil
 	}
 	if err := client.spawnAndWait(ctx); err != nil {
@@ -106,7 +132,12 @@ func (c *Client) Socket() string { return c.socket }
 // PID returns the process ID of the server spawned by this client, or zero
 // when the client attached to an existing server.
 func (c *Client) PID() int {
-	if c.lifecycle == nil || c.lifecycle.cmd == nil || c.lifecycle.cmd.Process == nil {
+	if c.lifecycle == nil {
+		return 0
+	}
+	c.lifecycle.mu.Lock()
+	defer c.lifecycle.mu.Unlock()
+	if c.lifecycle.cmd == nil || c.lifecycle.cmd.Process == nil {
 		return 0
 	}
 	return c.lifecycle.cmd.Process.Pid
@@ -114,7 +145,7 @@ func (c *Client) PID() int {
 
 // Ensure starts the server if it is missing and waits until it is ready.
 func (c *Client) Ensure(ctx context.Context) error {
-	if Ping(c.socket) {
+	if socketReady(c.socket) {
 		return nil
 	}
 	if c.lifecycle == nil {
@@ -126,17 +157,38 @@ func (c *Client) Ensure(ctx context.Context) error {
 // Close stops the server that this client spawned. Clients that connected to
 // an existing server have nothing to stop.
 func (c *Client) Close() error {
-	if c.lifecycle == nil || c.lifecycle.cmd == nil {
+	if c.lifecycle == nil {
+		return nil
+	}
+	c.lifecycle.mu.Lock()
+	defer c.lifecycle.mu.Unlock()
+	if c.lifecycle.cmd == nil {
 		return nil
 	}
 	process := c.lifecycle.cmd.Process
 	if process == nil {
 		return nil
 	}
-	_ = process.Signal(syscall.SIGTERM)
-	err := <-c.lifecycle.wait
+	signalErr := process.Signal(syscall.SIGTERM)
+	if signalErr != nil && !errors.Is(signalErr, os.ErrProcessDone) {
+		return fmt.Errorf("stop managed ghostline server: %w", signalErr)
+	}
+	waitErr := <-c.lifecycle.wait
 	c.lifecycle.cmd = nil
-	return err
+	c.lifecycle.wait = nil
+	if signalErr == nil && exitedBySignal(waitErr, syscall.SIGTERM) {
+		waitErr = nil
+	}
+	return errors.Join(signalErr, waitErr)
+}
+
+func exitedBySignal(err error, signal syscall.Signal) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return false
+	}
+	status, ok := exitErr.Sys().(syscall.WaitStatus)
+	return ok && status.Signaled() && status.Signal() == signal
 }
 
 // Check verifies that the server socket accepts connections.
@@ -149,17 +201,21 @@ func (c *Client) Check(ctx context.Context) error {
 	return nil
 }
 
-// VersionInfo describes the protocol and release tag reported by a server.
-// Older servers may leave TagVersion empty because the field was added after
-// protocol versioning; callers can still use ProtocolVersion for compatibility
-// checks.
+// VersionInfo describes the protocol and release tag reported by a v1 server.
 type VersionInfo struct {
+	// ProtocolVersion is the server's RPC protocol identifier.
 	ProtocolVersion string
-	TagVersion      string
+	// TagVersion is the server module's release tag, or empty for a
+	// development build or local replacement.
+	TagVersion string
+	// Capabilities contains stable feature names understood by the server.
+	// Clients must ignore names they do not recognize.
+	Capabilities []string
+	// Limits contains the server's enforced wire framing limits.
+	Limits ProtocolLimits
 }
 
-// VersionInfo returns the server's RPC protocol version and release tag. An
-// error means the server predates version reporting or is unreachable.
+// VersionInfo returns the server's RPC protocol version and release tag.
 func (c *Client) VersionInfo(ctx context.Context) (VersionInfo, error) {
 	var result versionResult
 	if err := c.call(ctx, rpcMethodVersion, nil, &result); err != nil {
@@ -168,6 +224,8 @@ func (c *Client) VersionInfo(ctx context.Context) (VersionInfo, error) {
 	return VersionInfo{
 		ProtocolVersion: result.Version,
 		TagVersion:      result.TagVersion,
+		Capabilities:    append([]string(nil), result.Capabilities...),
+		Limits:          result.Limits,
 	}, nil
 }
 
@@ -201,7 +259,7 @@ func (c *Client) callRetryable(ctx context.Context, method string, params, resul
 	if err == nil || c.lifecycle == nil || !isTransportError(err) {
 		return err
 	}
-	if Ping(c.socket) {
+	if socketReady(c.socket) {
 		return err
 	}
 	if spawnErr := c.spawnAndWait(ctx); spawnErr != nil {
@@ -211,6 +269,10 @@ func (c *Client) callRetryable(ctx context.Context, method string, params, resul
 }
 
 func (c *Client) callOnce(ctx context.Context, method string, params, result any) error {
+	return c.callOncePayload(ctx, method, params, nil, result)
+}
+
+func (c *Client) callOncePayload(ctx context.Context, method string, params any, payload []byte, result any) error {
 	connection, err := dial(ctx, c.socket)
 	if err != nil {
 		return contextErr(ctx, fmt.Errorf("connect ghostline server: %w", err))
@@ -235,18 +297,21 @@ func (c *Client) callOnce(ctx context.Context, method string, params, result any
 		req.Params = encoded
 	}
 	writer := bufio.NewWriter(connection)
-	if err := json.NewEncoder(writer).Encode(req); err != nil {
-		return contextErr(ctx, err)
-	}
-	if err := writer.Flush(); err != nil {
+	if err := writeRequestPayload(writer, req, payload); err != nil {
 		return contextErr(ctx, err)
 	}
 	var resp response
-	if err := json.NewDecoder(bufio.NewReader(connection)).Decode(&resp); err != nil {
+	if err := readResponse(bufio.NewReader(connection), &resp); err != nil {
 		return contextErr(ctx, err)
+	}
+	if resp.ID != req.ID {
+		return contextErr(ctx, errors.New("ghostline: mismatched RPC response ID"))
 	}
 	if resp.Error != nil {
 		return contextErr(ctx, decodeRPCError(resp.Error))
+	}
+	if resp.PayloadBytes != 0 {
+		return contextErr(ctx, errors.New("ghostline: unexpected RPC response payload"))
 	}
 	if result != nil && len(resp.Result) > 0 {
 		return contextErr(ctx, json.Unmarshal(resp.Result, result))
@@ -254,8 +319,64 @@ func (c *Client) callOnce(ctx context.Context, method string, params, result any
 	return nil
 }
 
+func writeRequest(writer *bufio.Writer, req request) error {
+	return writeRequestPayload(writer, req, nil)
+}
+
+func writeRequestPayload(writer *bufio.Writer, req request, payload []byte) error {
+	if len(payload) > maxRPCPayload {
+		return ErrFrameTooLarge
+	}
+	req.Wire = wireVersion
+	req.PayloadBytes = len(payload)
+	encoded, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	if len(encoded)+1 > maxRPCFrame {
+		return ErrFrameTooLarge
+	}
+	if _, err := writer.Write(append(encoded, '\n')); err != nil {
+		return err
+	}
+	if len(payload) > 0 {
+		if _, err := writer.Write(payload); err != nil {
+			return err
+		}
+	}
+	return writer.Flush()
+}
+
+func readResponse(reader *bufio.Reader, resp *response) error {
+	line, err := readLine(reader, maxRPCFrame)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(line, resp); err != nil {
+		return err
+	}
+	if resp.Wire != wireVersion {
+		return fmt.Errorf("%w: wire %d", ErrProtocolMismatch, resp.Wire)
+	}
+	if resp.ID <= 0 && resp.ID != -1 {
+		return errors.New("ghostline: invalid RPC response ID")
+	}
+	if resp.PayloadBytes < 0 || resp.PayloadBytes > maxRPCPayload {
+		return ErrFrameTooLarge
+	}
+	if resp.Error != nil && (len(resp.Result) != 0 || resp.PayloadBytes != 0) {
+		return errors.New("ghostline: invalid RPC error response")
+	}
+	return nil
+}
+
 func (c *Client) spawnAndWait(ctx context.Context) error {
 	lifecycle := c.lifecycle
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	if socketReady(c.socket) {
+		return nil
+	}
 	spawn := lifecycle.spawn
 	if len(spawn) == 0 {
 		spawn = []string{"ghostline", "serve", "--socket", c.socket}
@@ -270,14 +391,13 @@ func (c *Client) spawnAndWait(ctx context.Context) error {
 	command := exec.Command(args[0], args[1:]...)
 	command.Env = mergeEnvironment(os.Environ(), lifecycle.env)
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	var output lockedBuffer
+	var output diagnosticBuffer
+	var sink io.Writer = &output
 	if lifecycle.log != nil {
-		command.Stdout = io.MultiWriter(lifecycle.log, &output)
-		command.Stderr = io.MultiWriter(lifecycle.log, &output)
-	} else {
-		command.Stdout = &output
-		command.Stderr = &output
+		sink = &synchronizedWriter{writer: io.MultiWriter(lifecycle.log, &output)}
 	}
+	command.Stdout = sink
+	command.Stderr = sink
 	if err := command.Start(); err != nil {
 		return fmt.Errorf("spawn ghostline server: %w", err)
 	}
@@ -304,7 +424,7 @@ func (c *Client) spawnAndWait(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) waitReady(ctx context.Context, output *lockedBuffer, wait <-chan error) (error, bool) {
+func (c *Client) waitReady(ctx context.Context, output *diagnosticBuffer, wait <-chan error) (error, bool) {
 	timeout := c.lifecycle.readyTimeout
 	if timeout <= 0 {
 		timeout = 5 * time.Second
@@ -319,7 +439,7 @@ func (c *Client) waitReady(ctx context.Context, output *lockedBuffer, wait <-cha
 			return c.readyAfterExit(waitErr, output)
 		default:
 		}
-		if Ping(c.socket) {
+		if socketReady(c.socket) {
 			return nil, false
 		}
 		select {
@@ -338,8 +458,8 @@ func (c *Client) waitReady(ctx context.Context, output *lockedBuffer, wait <-cha
 	}
 }
 
-func (c *Client) readyAfterExit(waitErr error, output *lockedBuffer) (error, bool) {
-	if Ping(c.socket) {
+func (c *Client) readyAfterExit(waitErr error, output *diagnosticBuffer) (error, bool) {
+	if socketReady(c.socket) {
 		return nil, true
 	}
 	return fmt.Errorf(
@@ -376,65 +496,48 @@ func contextErr(ctx context.Context, err error) error {
 }
 
 // Start creates a session on the server and returns its remote handle.
-func (c *Client) Start(ctx context.Context, options SessionOptions) (Session, error) {
+func (c *Client) Start(ctx context.Context, options SessionOptions) (*Session, error) {
 	var result createResult
 	err := c.callRetryable(ctx, rpcMethodCreate, createParams{
 		Name:                 options.Name,
-		Dir:                  options.Directory,
-		Command:              options.Command,
+		Dir:                  options.Process.Directory,
+		Path:                 options.Process.Path,
+		Args:                 options.Process.Args,
+		ShellCommand:         options.Process.ShellCommand,
 		Cols:                 options.Size.Columns,
 		Rows:                 options.Size.Rows,
-		Env:                  options.Environment,
+		Env:                  options.Process.Environment,
 		VTScrollbackMaxBytes: options.VTScrollbackMaxBytes,
 	}, &result)
 	if err != nil {
 		return nil, err
 	}
-	return &remoteSession{
-		client:    c,
-		name:      options.Name,
-		createdAt: time.Unix(result.Created, 0),
-	}, nil
+	backend := &remoteSession{client: c, name: options.Name}
+	return newSession(backend, result.Info), nil
 }
 
-// List returns the names of all sessions known to the server.
-func (c *Client) List(ctx context.Context) ([]string, error) {
-	var result listResult
-	if err := c.callRetryable(ctx, rpcMethodList, nil, &result); err != nil {
+// Get returns a daemon-owned session handle or ErrSessionNotFound.
+func (c *Client) Get(ctx context.Context, name string) (*Session, error) {
+	var result createResult
+	if err := c.callRetryable(ctx, rpcMethodCreated, nameParams{Name: name}, &result); err != nil {
 		return nil, err
 	}
-	sort.Strings(result.Sessions)
-	return result.Sessions, nil
+	backend := &remoteSession{client: c, name: name}
+	return newSession(backend, result.Info), nil
 }
 
-// Session returns a handle for a session known to the server, mirroring
-// Hub.Session. The handle is lazy; operations fail with the server's error if
-// the session disappears.
-func (c *Client) Session(name string) (Session, bool) {
-	sessions, err := c.List(context.Background())
-	if err != nil {
-		return nil, false
+// List returns daemon-owned sessions in the server's stable order.
+func (c *Client) List(ctx context.Context) ([]*Session, error) {
+	var listed listResult
+	if err := c.callRetryable(ctx, rpcMethodList, nil, &listed); err != nil {
+		return nil, err
 	}
-	for _, existing := range sessions {
-		if existing == name {
-			return &remoteSession{client: c, name: name}, true
-		}
+	result := make([]*Session, 0, len(listed.Sessions))
+	for _, info := range listed.Sessions {
+		backend := &remoteSession{client: c, name: info.Name}
+		result = append(result, newSession(backend, info))
 	}
-	return nil, false
-}
-
-// Sessions returns handles for all sessions known to the server, ordered by
-// name, mirroring Hub.Sessions.
-func (c *Client) Sessions() []Session {
-	sessions, err := c.List(context.Background())
-	if err != nil {
-		return nil
-	}
-	result := make([]Session, 0, len(sessions))
-	for _, name := range sessions {
-		result = append(result, &remoteSession{client: c, name: name})
-	}
-	return result
+	return result, nil
 }
 
 func (c *Client) status(ctx context.Context, name string) (Status, error) {
@@ -455,31 +558,8 @@ func (c *Client) wait(ctx context.Context, name string) (Status, error) {
 
 // remoteSession is the RPC backend behind a remote Session handle.
 type remoteSession struct {
-	client    *Client
-	name      string
-	createdAt time.Time
-
-	closed        atomic.Bool
-	doneOnce      sync.Once
-	doneCloseOnce sync.Once
-	done          chan struct{}
-	exit          atomic.Pointer[ExitError]
-	createdAtOnce sync.Once
-}
-
-func (r *remoteSession) Name() string { return r.name }
-
-func (r *remoteSession) CreatedAt() time.Time {
-	r.createdAtOnce.Do(func() {
-		if !r.createdAt.IsZero() {
-			return
-		}
-		var result createResult
-		if err := r.call(context.Background(), rpcMethodCreated, nameParams{Name: r.name}, &result); err == nil {
-			r.createdAt = time.Unix(result.Created, 0)
-		}
-	})
-	return r.createdAt
+	client *Client
+	name   string
 }
 
 func (r *remoteSession) call(ctx context.Context, method string, params, result any) error {
@@ -490,68 +570,26 @@ func (r *remoteSession) callRetryable(ctx context.Context, method string, params
 	return r.client.callRetryable(ctx, method, params, result)
 }
 
-func (r *remoteSession) Done() <-chan struct{} {
-	r.doneOnce.Do(func() {
-		r.done = make(chan struct{})
-		go func() {
-			for {
-				status, err := r.client.wait(context.Background(), r.name)
-				if err == nil {
-					if status.Exit != nil {
-						r.exit.Store(status.Exit)
-					}
-					r.closeDone()
-					return
-				}
-				if errors.Is(err, ErrSessionNotFound) {
-					r.closeDone()
-					return
-				}
-				time.Sleep(100 * time.Millisecond)
-			}
-		}()
-	})
-	return r.done
+func (r *remoteSession) callPayload(ctx context.Context, method string, params any, payload []byte, result any) error {
+	return r.client.callOncePayload(ctx, method, params, payload, result)
 }
 
-func (r *remoteSession) Wait(ctx context.Context) error {
+func (r *remoteSession) wait(ctx context.Context) error {
 	status, err := r.client.wait(ctx, r.name)
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
-		if errors.Is(err, ErrSessionNotFound) {
-			if exit := r.exit.Load(); exit != nil {
-				return exit
-			}
-			return ErrSessionClosed
-		}
 		return err
 	}
 	if status.Exit != nil {
-		r.exit.Store(status.Exit)
 		return status.Exit
 	}
 	return nil
 }
 
-func (r *remoteSession) Alive() bool {
-	status, err := r.Status(context.Background())
-	return err == nil && status.Alive
+func (r *remoteSession) status(ctx context.Context) (Status, error) {
+	return r.client.status(ctx, r.name)
 }
 
-func (r *remoteSession) Status(ctx context.Context) (Status, error) {
-	status, err := r.client.status(ctx, r.name)
-	if err != nil {
-		return Status{}, err
-	}
-	if status.Exit != nil {
-		r.exit.Store(status.Exit)
-	}
-	return status, nil
-}
-
-func (r *remoteSession) Metadata(ctx context.Context) (SessionMetadata, error) {
+func (r *remoteSession) metadata(ctx context.Context) (SessionMetadata, error) {
 	var result metadataResult
 	if err := r.callRetryable(ctx, rpcMethodMetadata, nameParams{Name: r.name}, &result); err != nil {
 		return SessionMetadata{}, err
@@ -559,116 +597,324 @@ func (r *remoteSession) Metadata(ctx context.Context) (SessionMetadata, error) {
 	return SessionMetadata{Process: result.Process, Directory: result.Directory}, nil
 }
 
-func (r *remoteSession) Input(ctx context.Context, data []byte) error {
-	return r.call(ctx, rpcMethodInput, inputParams{Name: r.name, Data: data}, nil)
+func (r *remoteSession) size(ctx context.Context) (Size, error) {
+	var result sizeResult
+	if err := r.callRetryable(ctx, rpcMethodSize, nameParams{Name: r.name}, &result); err != nil {
+		return Size{}, err
+	}
+	return Size{Columns: result.Columns, Rows: result.Rows}, nil
 }
 
-func (r *remoteSession) Resize(ctx context.Context, size Size) error {
+func (r *remoteSession) signal(ctx context.Context, signal syscall.Signal) error {
+	return r.call(ctx, rpcMethodSignal, signalParams{Name: r.name, Signal: int(signal)}, nil)
+}
+
+func (r *remoteSession) writeInput(ctx context.Context, data []byte) error {
+	return r.callPayload(ctx, rpcMethodWriteInput, inputParams{Name: r.name}, data, nil)
+}
+
+func (r *remoteSession) resize(ctx context.Context, size Size) error {
 	return r.call(ctx, rpcMethodResize, resizeParams{
 		Name: r.name, Cols: size.Columns, Rows: size.Rows,
 	}, nil)
 }
 
-func (r *remoteSession) Snapshot(ctx context.Context) ([]byte, error) {
-	var result dataResult
-	if err := r.callRetryable(ctx, rpcMethodSnapshot, nameParams{Name: r.name}, &result); err != nil {
-		return nil, err
-	}
-	return result.Data, nil
-}
-
-func (r *remoteSession) Checkpoint(ctx context.Context) (Checkpoint, error) {
-	var result checkpointResult
-	if err := r.callRetryable(ctx, rpcMethodCheckpoint, nameParams{Name: r.name}, &result); err != nil {
-		return Checkpoint{}, err
-	}
-	return Checkpoint(result), nil
-}
-
-func (r *remoteSession) Recover(ctx context.Context, offset, end int64) ([]byte, error) {
-	var result dataResult
-	if err := r.callRetryable(ctx, rpcMethodRecover, recoverParams{
-		Name: r.name, Offset: offset, End: end,
-	}, &result); err != nil {
-		return nil, err
-	}
-	return result.Data, nil
-}
-
-func (r *remoteSession) SpoolPath() string {
-	var result spoolPathResult
-	if err := r.callRetryable(context.Background(), rpcMethodSpoolPath, nameParams{Name: r.name}, &result); err != nil {
-		return ""
-	}
-	return result.Path
-}
-
-func (r *remoteSession) SpoolSize(ctx context.Context) (int64, error) {
-	var result spoolSizeResult
-	if err := r.callRetryable(ctx, rpcMethodSpoolSize, nameParams{Name: r.name}, &result); err != nil {
-		return 0, err
-	}
-	return result.Size, nil
-}
-
-func (r *remoteSession) WatchOutput(options WatchOptions) (*SpoolWatcher, error) {
-	watcher, err := NewSpoolWatcher(
-		r.SpoolPath(),
-		options.Offset,
-		options.OnOutput,
-		options.OnTruncate,
-		options.OnOverflow,
-	)
+func (r *remoteSession) replay(ctx context.Context) ([]byte, error) {
+	data, _, err := r.client.readBlobRetryable(ctx, rpcMethodReplay, nameParams{Name: r.name})
 	if err != nil {
 		return nil, err
 	}
-	watcher.SetMaxBytes(options.MaxBytes)
-	watcher.Start()
-	return watcher, nil
+	return data, nil
 }
 
-func (r *remoteSession) Close() error {
-	if r.closed.Load() {
-		return nil
+func (r *remoteSession) checkpoint(ctx context.Context) (Checkpoint, error) {
+	replay, cursor, err := r.client.readBlobRetryable(ctx, rpcMethodCheckpoint, nameParams{Name: r.name})
+	if err != nil {
+		return Checkpoint{}, err
 	}
-	return r.call(context.Background(), rpcMethodClose, nameParams{Name: r.name}, nil)
+	return Checkpoint{Replay: replay, Cursor: cursor}, nil
 }
 
-func (r *remoteSession) Remove() error {
-	if r.closed.Load() {
-		return nil
+func (c *Client) readBlobRetryable(ctx context.Context, method string, params any) ([]byte, Cursor, error) {
+	data, cursor, err := c.readBlobOnce(ctx, method, params)
+	if err == nil || c.lifecycle == nil || !isTransportError(err) {
+		return data, cursor, err
 	}
-	var result removeResult
-	if err := r.call(context.Background(), rpcMethodRemove, nameParams{Name: r.name}, &result); err != nil {
-		return err
+	if socketReady(c.socket) {
+		return nil, Cursor{}, err
 	}
-	if result.Exit != nil {
-		r.exit.Store(result.Exit)
+	if spawnErr := c.spawnAndWait(ctx); spawnErr != nil {
+		return nil, Cursor{}, fmt.Errorf("%v (recovery: %w)", err, spawnErr)
 	}
-	r.closed.Store(true)
-	r.closeDone()
-	return nil
+	return c.readBlobOnce(ctx, method, params)
 }
 
-func (r *remoteSession) closeDone() {
-	r.doneOnce.Do(func() {
-		if r.done == nil {
-			r.done = make(chan struct{})
+func (c *Client) readBlobOnce(ctx context.Context, method string, params any) ([]byte, Cursor, error) {
+	connection, err := dial(ctx, c.socket)
+	if err != nil {
+		return nil, Cursor{}, contextErr(ctx, fmt.Errorf("connect ghostline server: %w", err))
+	}
+	defer closeQuietly(connection)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			closeQuietly(connection)
+		case <-done:
 		}
-	})
-	r.doneCloseOnce.Do(func() {
+	}()
+
+	req := request{ID: 1, Method: method}
+	if params != nil {
+		req.Params, err = json.Marshal(params)
+		if err != nil {
+			return nil, Cursor{}, err
+		}
+	}
+	reader := bufio.NewReader(connection)
+	writer := bufio.NewWriter(connection)
+	if err := writeRequest(writer, req); err != nil {
+		return nil, Cursor{}, contextErr(ctx, err)
+	}
+	var resp response
+	if err := readResponse(reader, &resp); err != nil {
+		return nil, Cursor{}, contextErr(ctx, err)
+	}
+	if resp.ID != req.ID {
+		return nil, Cursor{}, errors.New("ghostline: mismatched blob-open response ID")
+	}
+	if resp.Error != nil {
+		return nil, Cursor{}, contextErr(ctx, decodeRPCError(resp.Error))
+	}
+	if resp.PayloadBytes != 0 {
+		return nil, Cursor{}, errors.New("ghostline: unexpected blob-open payload")
+	}
+	var opened blobOpenResult
+	if err := json.Unmarshal(resp.Result, &opened); err != nil {
+		return nil, Cursor{}, err
+	}
+	if opened.Size < 0 {
+		return nil, Cursor{}, errors.New("ghostline: server returned invalid blob size")
+	}
+	capacity := opened.Size
+	if capacity > maxRPCFrame {
+		capacity = maxRPCFrame
+	}
+	data := make([]byte, 0, capacity)
+	for {
+		encoded, err := json.Marshal(chunkReadParams{MaxBytes: maxRPCChunk})
+		if err != nil {
+			return nil, Cursor{}, err
+		}
+		next := request{ID: 1, Method: rpcMethodBlobRead, Params: encoded}
+		if err := writeRequest(writer, next); err != nil {
+			return nil, Cursor{}, contextErr(ctx, err)
+		}
+		resp = response{}
+		if err := readResponse(reader, &resp); err != nil {
+			return nil, Cursor{}, contextErr(ctx, err)
+		}
+		if resp.ID != next.ID {
+			return nil, Cursor{}, errors.New("ghostline: mismatched blob response ID")
+		}
+		if resp.Error != nil {
+			return nil, Cursor{}, contextErr(ctx, decodeRPCError(resp.Error))
+		}
+		var chunk blobReadResult
+		if err := json.Unmarshal(resp.Result, &chunk); err != nil {
+			return nil, Cursor{}, err
+		}
+		chunkBytes := resp.PayloadBytes
+		if chunkBytes > maxRPCChunk || len(data) > opened.Size-chunkBytes {
+			return nil, Cursor{}, errors.New("ghostline: server returned invalid blob chunk")
+		}
+		start := len(data)
+		data = append(data, make([]byte, chunkBytes)...)
+		if _, err := io.ReadFull(reader, data[start:]); err != nil {
+			return nil, Cursor{}, contextErr(ctx, err)
+		}
+		if chunk.EOF {
+			if len(data) != opened.Size {
+				return nil, Cursor{}, errors.New("ghostline: server returned incomplete blob")
+			}
+			return data, opened.Cursor, nil
+		}
+		if chunkBytes == 0 {
+			return nil, Cursor{}, io.ErrNoProgress
+		}
+	}
+}
+
+func (r *remoteSession) output(ctx context.Context, from Cursor) (*OutputReader, error) {
+	source, err := r.client.openOutput(ctx, r.name, from)
+	if err != nil {
+		return nil, err
+	}
+	return newOutputReader(source), nil
+}
+
+func (r *remoteSession) outputCursor(ctx context.Context) (Cursor, error) {
+	var result cursorResult
+	if err := r.callRetryable(ctx, rpcMethodOutputCursor, nameParams{Name: r.name}, &result); err != nil {
+		return Cursor{}, err
+	}
+	return result.Cursor, nil
+}
+
+func (r *remoteSession) rotateOutput(ctx context.Context) (Cursor, error) {
+	var result cursorResult
+	if err := r.call(ctx, rpcMethodRotateOutput, nameParams{Name: r.name}, &result); err != nil {
+		return Cursor{}, err
+	}
+	return result.Cursor, nil
+}
+
+func (r *remoteSession) pruneOutput(ctx context.Context, before Cursor) error {
+	return r.call(ctx, rpcMethodPruneOutput, pruneOutputParams{Name: r.name, Before: before}, nil)
+}
+
+func (r *remoteSession) terminate(ctx context.Context) error {
+	return r.call(ctx, rpcMethodTerminate, nameParams{Name: r.name}, nil)
+}
+
+func (r *remoteSession) delete(ctx context.Context) error {
+	return r.call(ctx, rpcMethodDelete, nameParams{Name: r.name}, nil)
+}
+
+type remoteOutputSource struct {
+	ctx       context.Context
+	conn      net.Conn
+	reader    *bufio.Reader
+	writer    *bufio.Writer
+	mu        sync.Mutex
+	cursor    Cursor
+	closed    atomic.Bool
+	closeOnce sync.Once
+	done      chan struct{}
+}
+
+func (c *Client) openOutput(ctx context.Context, name string, from Cursor) (*remoteOutputSource, error) {
+	connection, err := dial(ctx, c.socket)
+	if err != nil {
+		return nil, contextErr(ctx, fmt.Errorf("connect ghostline server: %w", err))
+	}
+	source := &remoteOutputSource{
+		ctx:    ctx,
+		conn:   connection,
+		reader: bufio.NewReader(connection),
+		writer: bufio.NewWriter(connection),
+		done:   make(chan struct{}),
+	}
+	req := request{ID: 1, Method: rpcMethodOutput}
+	req.Params, err = json.Marshal(outputParams{Name: name, Cursor: from})
+	if err != nil {
+		_ = source.Close()
+		return nil, err
+	}
+	if err := writeRequest(source.writer, req); err != nil {
+		_ = source.Close()
+		return nil, contextErr(ctx, err)
+	}
+	var resp response
+	if err := readResponse(source.reader, &resp); err != nil {
+		_ = source.Close()
+		return nil, contextErr(ctx, err)
+	}
+	if resp.ID != req.ID {
+		_ = source.Close()
+		return nil, errors.New("ghostline: mismatched output-open response ID")
+	}
+	if resp.Error != nil {
+		_ = source.Close()
+		return nil, decodeRPCError(resp.Error)
+	}
+	if resp.PayloadBytes != 0 {
+		_ = source.Close()
+		return nil, errors.New("ghostline: unexpected output-open payload")
+	}
+	var opened cursorResult
+	if err := json.Unmarshal(resp.Result, &opened); err != nil {
+		_ = source.Close()
+		return nil, err
+	}
+	source.cursor = opened.Cursor
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = source.Close()
+		case <-source.done:
+		}
+	}()
+	return source, nil
+}
+
+func (r *remoteOutputSource) Read(buffer []byte) (int, error) {
+	if len(buffer) == 0 {
+		return 0, nil
+	}
+	if r.closed.Load() {
+		return 0, io.ErrClosedPipe
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed.Load() {
+		return 0, io.ErrClosedPipe
+	}
+	maxBytes := len(buffer)
+	if maxBytes > maxRPCChunk {
+		maxBytes = maxRPCChunk
+	}
+	params, err := json.Marshal(chunkReadParams{MaxBytes: maxBytes})
+	if err != nil {
+		return 0, err
+	}
+	next := request{ID: 1, Method: rpcMethodOutputRead, Params: params}
+	if err := writeRequest(r.writer, next); err != nil {
+		return 0, contextErr(r.ctx, err)
+	}
+	var resp response
+	if err := readResponse(r.reader, &resp); err != nil {
+		return 0, contextErr(r.ctx, err)
+	}
+	if resp.ID != next.ID {
+		return 0, errors.New("ghostline: mismatched output response ID")
+	}
+	if resp.Error != nil {
+		return 0, decodeRPCError(resp.Error)
+	}
+	var result outputReadResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return 0, err
+	}
+	chunkBytes := resp.PayloadBytes
+	if chunkBytes > len(buffer) || chunkBytes > maxRPCChunk {
+		return 0, errors.New("ghostline: server returned oversized output chunk")
+	}
+	if _, err := io.ReadFull(r.reader, buffer[:chunkBytes]); err != nil {
+		return 0, contextErr(r.ctx, err)
+	}
+	r.cursor = result.Cursor
+	if chunkBytes != 0 {
+		return chunkBytes, nil
+	}
+	if result.EOF {
+		return 0, io.EOF
+	}
+	return 0, io.ErrNoProgress
+}
+
+func (r *remoteOutputSource) Cursor() Cursor {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.cursor
+}
+
+func (r *remoteOutputSource) Close() error {
+	r.closeOnce.Do(func() {
+		r.closed.Store(true)
 		close(r.done)
+		closeQuietly(r.conn)
 	})
-}
-
-func (r *remoteSession) TruncateSpool(ctx context.Context) error {
-	return r.call(ctx, rpcMethodTruncateSpool, nameParams{Name: r.name}, nil)
-}
-
-func (r *remoteSession) ArchiveSpool(ctx context.Context) error {
-	return r.call(ctx, rpcMethodArchiveSpool, nameParams{Name: r.name}, nil)
-}
-
-func (r *remoteSession) RemoveSpool() {
-	_ = r.call(context.Background(), rpcMethodRemoveSpool, nameParams{Name: r.name}, nil)
+	return nil
 }

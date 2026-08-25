@@ -4,25 +4,52 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/abcdlsj/ghostline"
 )
 
-func waitForSpool(t *testing.T, session ghostline.Session, needle string) {
+type fakeSignal struct{}
+
+func (fakeSignal) Signal()        {}
+func (fakeSignal) String() string { return "fake" }
+
+func TestSessionSignalValidationAndCancellation(t *testing.T) {
+	hub := newHub(t, ghostline.Options{})
+	session, err := hub.Start(context.Background(), ghostline.SessionOptions{
+		Name: "signal-validation", Process: ghostline.ProcessSpec{Path: "sleep", Args: []string{"30"}, Directory: t.TempDir()},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	for _, signal := range []os.Signal{nil, fakeSignal{}, syscall.Signal(0)} {
+		if err := session.Signal(context.Background(), signal); !errors.Is(err, ghostline.ErrInvalidSignal) {
+			t.Fatalf("Signal(%v) = %v, want ErrInvalidSignal", signal, err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := session.Signal(ctx, syscall.SIGCONT); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Signal canceled context = %v", err)
+	}
+}
+
+func waitForReplay(t *testing.T, session *ghostline.Session, needle string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		data, err := os.ReadFile(session.SpoolPath())
+		data, err := session.Replay(context.Background())
 		if err == nil && bytes.Contains(data, []byte(needle)) {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	data, _ := os.ReadFile(session.SpoolPath())
-	t.Fatalf("spool did not contain %q; got %q", needle, data)
+	data, _ := session.Replay(context.Background())
+	t.Fatalf("replay did not contain %q; got %q", needle, data)
 }
 
 func TestStartConfiguresSizeAndEnvironment(t *testing.T) {
@@ -30,74 +57,61 @@ func TestStartConfiguresSizeAndEnvironment(t *testing.T) {
 		DefaultSize: ghostline.Size{Columns: 90, Rows: 28},
 	})
 	session, err := hub.Start(context.Background(), ghostline.SessionOptions{
-		Name:        "configured",
-		Directory:   t.TempDir(),
-		Command:     "sh",
-		Environment: []string{"GHOSTLINE_TEST=value", "TERM=custom-term"},
-	})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	if err := session.Input(context.Background(), []byte("stty size; echo env=$GHOSTLINE_TEST term=$TERM\r")); err != nil {
-		t.Fatalf("Input: %v", err)
-	}
-	waitForSpool(t, session, "28 90")
-	waitForSpool(t, session, "env=value term=custom-term")
-}
-
-func TestSessionWatchOutputAndWait(t *testing.T) {
-	hub := newHub(t, ghostline.Options{})
-	session, err := hub.Start(context.Background(), ghostline.SessionOptions{
-		Name:      "watch",
-		Directory: t.TempDir(),
-		Command:   "printf 'watched-output\\r\\n'; exit 7",
-	})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	output := make(chan string, 1)
-	watcher, err := session.WatchOutput(ghostline.WatchOptions{
-		OnOutput: func(data []byte) {
-			select {
-			case output <- string(data):
-			default:
-			}
+		Name: "configured",
+		Process: ghostline.ProcessSpec{
+			Path: "sh", Directory: t.TempDir(),
+			Environment: []string{"GHOSTLINE_TEST=value", "TERM=custom-term"},
 		},
 	})
 	if err != nil {
-		t.Fatalf("WatchOutput: %v", err)
+		t.Fatalf("Start: %v", err)
 	}
-	defer watcher.Close()
+	if err := session.WriteInput(context.Background(), []byte("stty size; echo env=$GHOSTLINE_TEST term=$TERM\r")); err != nil {
+		t.Fatalf("Input: %v", err)
+	}
+	waitForReplay(t, session, "28 90")
+	waitForReplay(t, session, "env=value term=custom-term")
+}
 
-	select {
-	case got := <-output:
-		if !bytes.Contains([]byte(got), []byte("watched-output")) {
-			t.Fatalf("output = %q", got)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for output")
+func TestSessionOutputAndWait(t *testing.T) {
+	hub := newHub(t, ghostline.Options{})
+	session, err := hub.Start(context.Background(), ghostline.SessionOptions{
+		Name: "watch", Process: ghostline.Shell("printf 'watched-output\\r\\n'; exit 7"),
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
 	}
+	reader, err := session.Output(context.Background(), ghostline.Cursor{})
+	if err != nil {
+		t.Fatalf("Output: %v", err)
+	}
+	defer reader.Close()
 	waitErr := session.Wait(context.Background())
 	var exitErr *ghostline.ExitError
 	if !errors.As(waitErr, &exitErr) || exitErr.Code != 7 {
 		t.Fatalf("Wait error = %v, want exit code 7", waitErr)
 	}
+	output, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Contains(output, []byte("watched-output")) {
+		t.Fatalf("output = %q", output)
+	}
 }
 
-func TestSessionCheckpointMatchesSpoolBoundary(t *testing.T) {
+func TestSessionCheckpointMatchesOutputBoundary(t *testing.T) {
 	hub := newHub(t, ghostline.Options{})
 	session, err := hub.Start(context.Background(), ghostline.SessionOptions{
-		Name:      "checkpoint",
-		Directory: t.TempDir(),
-		Command:   "sh",
+		Name: "checkpoint", Process: ghostline.ProcessSpec{Path: "sh", Directory: t.TempDir()},
 	})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if err := session.Input(context.Background(), []byte("printf 'checkpoint-output\\r\\n'\r")); err != nil {
+	if err := session.WriteInput(context.Background(), []byte("printf 'checkpoint-output\\r\\n'\r")); err != nil {
 		t.Fatalf("Input: %v", err)
 	}
-	waitForSpool(t, session, "checkpoint-output")
+	waitForReplay(t, session, "checkpoint-output")
 	checkpoint, err := session.Checkpoint(context.Background())
 	if err != nil {
 		t.Fatalf("Checkpoint: %v", err)
@@ -105,21 +119,15 @@ func TestSessionCheckpointMatchesSpoolBoundary(t *testing.T) {
 	if !bytes.Contains(checkpoint.Replay, []byte("checkpoint-output")) {
 		t.Fatalf("replay missing output: %q", checkpoint.Replay)
 	}
-	size, err := session.SpoolSize(context.Background())
-	if err != nil {
-		t.Fatalf("SpoolSize: %v", err)
-	}
-	if checkpoint.Offset != size {
-		t.Fatalf("checkpoint offset = %d, spool size = %d", checkpoint.Offset, size)
+	if checkpoint.Cursor.String() == "" {
+		t.Fatal("checkpoint returned zero cursor")
 	}
 }
 
 func TestSessionWaitCancellationDoesNotTerminateChild(t *testing.T) {
 	hub := newHub(t, ghostline.Options{})
 	session, err := hub.Start(context.Background(), ghostline.SessionOptions{
-		Name:      "wait-cancel",
-		Directory: t.TempDir(),
-		Command:   "sleep 30",
+		Name: "wait-cancel", Process: ghostline.ProcessSpec{Path: "sleep", Args: []string{"30"}, Directory: t.TempDir()},
 	})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -129,14 +137,15 @@ func TestSessionWaitCancellationDoesNotTerminateChild(t *testing.T) {
 	if err := session.Wait(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Wait error = %v", err)
 	}
-	if !session.Alive() {
+	status, err := session.Status(context.Background())
+	if err != nil || !status.Alive {
 		t.Fatal("canceling Wait terminated the session")
 	}
 }
 
 func TestErrorsAreInspectable(t *testing.T) {
 	hub := newHub(t, ghostline.Options{})
-	options := ghostline.SessionOptions{Name: "duplicate", Directory: t.TempDir(), Command: "sleep 30"}
+	options := ghostline.SessionOptions{Name: "duplicate", Process: ghostline.ProcessSpec{Path: "sleep", Args: []string{"30"}, Directory: t.TempDir()}}
 	if _, err := hub.Start(context.Background(), options); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -171,9 +180,7 @@ func TestNewRejectsInvalidDefaultSize(t *testing.T) {
 func TestSessionResizeRejectsInvalidSizes(t *testing.T) {
 	hub := newHub(t, ghostline.Options{})
 	session, err := hub.Start(context.Background(), ghostline.SessionOptions{
-		Name:      "invalid-resize",
-		Directory: t.TempDir(),
-		Command:   "sleep 30",
+		Name: "invalid-resize", Process: ghostline.ProcessSpec{Path: "sleep", Args: []string{"30"}, Directory: t.TempDir()},
 	})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -193,45 +200,48 @@ func TestSessionResizeRejectsInvalidSizes(t *testing.T) {
 func TestSessionsIncludesStoppedAndIsOrdered(t *testing.T) {
 	hub := newHub(t, ghostline.Options{})
 	first, err := hub.Start(context.Background(), ghostline.SessionOptions{
-		Name:      "session-b",
-		Directory: t.TempDir(),
-		Command:   "sleep 30",
+		Name: "session-b", Process: ghostline.ProcessSpec{Path: "sleep", Args: []string{"30"}, Directory: t.TempDir()},
 	})
 	if err != nil {
 		t.Fatalf("Start first: %v", err)
 	}
 	second, err := hub.Start(context.Background(), ghostline.SessionOptions{
-		Name:      "session-a",
-		Directory: t.TempDir(),
-		Command:   "sleep 30",
+		Name: "session-a", Process: ghostline.ProcessSpec{Path: "sleep", Args: []string{"30"}, Directory: t.TempDir()},
 	})
 	if err != nil {
 		t.Fatalf("Start second: %v", err)
 	}
-	sessions := hub.Sessions()
+	sessions, err := hub.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
 	if len(sessions) != 2 || sessions[0].Name() != first.Name() || sessions[1].Name() != second.Name() {
 		t.Fatalf("Sessions ordering = %q, %q", sessions[0].Name(), sessions[1].Name())
 	}
-	if err := first.Close(); err != nil {
+	if err := first.Terminate(context.Background()); err != nil {
 		t.Fatalf("Close first: %v", err)
 	}
-	sessions = hub.Sessions()
+	sessions, err = hub.List(context.Background())
+	if err != nil {
+		t.Fatalf("List after Terminate: %v", err)
+	}
 	if len(sessions) != 2 {
 		t.Fatalf("Sessions after Close = %d, want 2", len(sessions))
 	}
-	if handle, ok := hub.Session(first.Name()); !ok {
+	if handle, err := hub.Get(context.Background(), first.Name()); err != nil {
 		t.Fatal("stopped session lookup failed")
-	} else if handle.Alive() {
-		t.Fatal("stopped session reported alive")
+	} else {
+		status, statusErr := handle.Status(context.Background())
+		if statusErr != nil || status.Alive {
+			t.Fatal("stopped session reported alive")
+		}
 	}
 }
 
 func TestSessionHandleAfterHubClose(t *testing.T) {
 	hub := newHub(t, ghostline.Options{})
 	session, err := hub.Start(context.Background(), ghostline.SessionOptions{
-		Name:      "after-close",
-		Directory: t.TempDir(),
-		Command:   "sleep 30",
+		Name: "after-close", Process: ghostline.ProcessSpec{Path: "sleep", Args: []string{"30"}, Directory: t.TempDir()},
 	})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -239,10 +249,11 @@ func TestSessionHandleAfterHubClose(t *testing.T) {
 	if err := hub.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if err := session.Input(context.Background(), []byte("x")); !errors.Is(err, ghostline.ErrSessionClosed) {
+	if err := session.WriteInput(context.Background(), []byte("x")); !errors.Is(err, ghostline.ErrSessionClosed) {
 		t.Fatalf("Input after hub close = %v", err)
 	}
-	if session.Alive() {
+	status, err := session.Status(context.Background())
+	if err != nil || status.Alive {
 		t.Fatal("session reported alive after hub close")
 	}
 }

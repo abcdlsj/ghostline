@@ -1,38 +1,53 @@
 # ghostline
 
-`ghostline` is an embeddable terminal engine for Go. It owns real
-pseudo-terminals, keeps sessions running independently of attached clients,
-stores raw output in append-only spools, and renders complete terminal replays
-with [libghostty-vt](https://github.com/ghostty-org/ghostty).
+`ghostline` is a local-first terminal session runtime for Go. It owns real
+pseudo-terminals, keeps child processes independent from clients, maintains a
+Ghostty-compatible terminal model, and exposes resumable raw output.
 
-It provides terminal mechanics rather than a transport or UI. Applications can
-build a local multiplexer, remote shell service, development agent, browser
-terminal, or their own session protocol on top.
+The package provides terminal mechanics. It is not a terminal UI, a remote
+shell protocol, a cross-host migration system, or a reboot-persistent process
+manager.
 
-## Capabilities
+## v1 capabilities
 
-- Process-owned PTY sessions with input, resize, and exit reporting
-- Ghostty-compatible VT state, scrollback, colors, alternate screens, and
-  synchronized output
-- Raw append-only output subscriptions with resumable byte offsets
-- Atomic checkpoints pairing a full VT replay with its exact spool boundary
-- Configurable VT scrollback budgets with a 2 MiB default
-- Detached-mode terminal query responses for TUIs
-- Rolling server upgrades that keep PTY children and emulator state alive,
-  including a bounded spool-replay bridge for pre-0.6.0 sources
-- Local `Hub` and Unix-socket `Server`/`Client` with one `Session` API
+- In-process sessions through `Hub`, or same-host process separation through
+  `Server` and `Client`.
+- One concrete `*Session` API for local and daemon-owned sessions.
+- Argv-first process startup. Shell evaluation is explicit through `Shell`.
+- Context-aware input, resize, wait, status, metadata, replay, output, and
+  lifecycle operations.
+- Immutable output segments addressed by opaque, comparable `Cursor` values.
+- Bounded `OutputReader` streams with cancellation and natural backpressure.
+- Atomic checkpoints that pair a VT replay with the first raw output byte not
+  represented by that replay.
+- Same-version, all-or-nothing daemon upgrades that adopt live PTY file
+  descriptors, VT state, and output generations.
 
-## Requirements
+v1 is intentionally incompatible with every v0 API and wire protocol. See
+[the v1 migration note](docs/v1-migration.md).
 
-- Go 1.25+
-- Unix-like system (macOS, Linux, BSD)
-- `libghostty-vt`; see [libghostty-vt](#libghostty-vt) below
+## Requirements and platform status
 
-## Quick start: local hub
+- Go 1.25 or newer.
+- macOS 13 or newer on amd64 or arm64, with CGo enabled.
+- Linux with glibc 2.31 or newer on amd64 or arm64, with CGo enabled.
+
+Both supported families statically embed `libghostty-vt`; applications do not
+need to install or deploy a Ghostty dynamic library. FreeBSD is compile-checked
+with CGo disabled but does not have a working VT runtime. Windows is not
+supported because ghostline requires Unix PTYs, Unix sockets, file-descriptor
+transfer, and process-group signals.
+
+The bundled libraries are built from pinned Ghostty commit
+`5851d98615187d85052e41042bcf66e0ccec11d4`. See
+[the third-party artifact manifest](third_party/README.md) for build commands,
+targets, checksums, and license information.
+
+## Local sessions
 
 ```go
 hub, err := ghostline.New(ghostline.Options{
-	OutputDir:   "/var/lib/my-app/terminals",
+	OutputDir:   "/var/lib/my-app/ghostline",
 	DefaultSize: ghostline.Size{Columns: 120, Rows: 36},
 })
 if err != nil {
@@ -41,116 +56,102 @@ if err != nil {
 defer hub.Close()
 
 session, err := hub.Start(ctx, ghostline.SessionOptions{
-	Name:        "build-shell",
-	Directory:   "/path/to/worktree",
-	Command:     "bash",
-	Environment: []string{"MY_APP=1"},
-})
-if err != nil {
-	return err
-}
-
-watcher, err := session.WatchOutput(ghostline.WatchOptions{
-	OnOutput: func(data []byte) {
-		_, _ = os.Stdout.Write(data)
+	Name: "build",
+	Process: ghostline.ProcessSpec{
+		Path:        "go",
+		Args:        []string{"test", "./..."},
+		Directory:   "/path/to/worktree",
+		Environment: []string{"CI=1"},
 	},
 })
 if err != nil {
 	return err
 }
-defer watcher.Close()
 
-_ = session.Input(ctx, []byte("go test ./...\r"))
-_ = session.Resize(ctx, ghostline.Size{Columns: 100, Rows: 30})
+output, err := session.Output(ctx, ghostline.Cursor{})
+if err != nil {
+	return err
+}
+defer output.Close()
+
+_, err = io.Copy(os.Stdout, output)
 ```
 
-`WatchOutput` starts at a raw spool offset. Its callback receives a borrowed
-slice that is valid only until the callback returns; copy it if it must be
-retained. File notifications are wake-up hints, not output records: each wake
-reads the spool from the current offset through EOF and delivers ordered byte
-chunks. Chunk boundaries do not correspond to file writes. A low-frequency
-heartbeat covers filesystems that miss or coalesce notifications without
-continuously polling every Session.
+A zero `ProcessSpec` starts `$SHELL`, falling back to `sh`. Use
+`ghostline.Shell("make test && make lint")` only when shell parsing is wanted.
+`Environment` overrides matching inherited variables. ghostline supplies
+`TERM=xterm-256color` when the resulting environment has no non-empty `TERM`.
 
-VT scrollback and raw spool retention are separate. Configure the default VT
-scrollback for a Hub with `Options.VTScrollbackMaxBytes`, or override it for a
-single session with `SessionOptions.VTScrollbackMaxBytes`. See
-[scrollback and output retention](docs/scrollback.md) for the retention model,
-recommended values, and comparisons with other terminal runtimes.
+## Output and checkpoints
 
-Child processes inherit the embedding process's environment;
-`SessionOptions.Environment` overrides individual `KEY=value` entries. When
-the resulting environment has no non-empty `TERM`, ghostline sets one from
-`Options.DefaultTerm`, defaulting to `xterm-256color`, so detached daemons
-start shells without a terminal type warning.
+`Output(ctx, cursor)` returns raw PTY bytes in order. A zero cursor starts at
+the earliest retained generation. Each `Read` returns at most the size of the
+caller's buffer; daemon reads request at most 64 KiB per round trip. Closing
+the reader or canceling its context unblocks a pending read.
 
-## Quick start: server and client
+`Cursor` fields are deliberately private. Store `Cursor.String()` or use its
+text/JSON marshaling methods. `ParseCursor` accepts the stable v1 text form.
+After retention removes a generation, opening a new reader at one of its
+cursors returns `ErrCursorExpired`. A reader that already pinned the segment
+may finish draining it.
 
-Run the standalone daemon:
+For a lossless window switch or client reattach:
+
+1. Stop and wait for the current output-reading goroutine.
+2. Call `Checkpoint(ctx)`.
+3. Open a new reader at `checkpoint.Cursor`.
+4. Write `checkpoint.Replay` to the destination.
+5. Start reading from the new reader.
+
+The checkpoint lock orders the VT replay and cursor atomically. Starting the
+new reader only after writing the replay prevents raw bytes from appearing
+before the reconstructed screen.
+
+## Output retention
+
+The core exposes mechanism, not retention policy:
+
+```go
+boundary, err := session.RotateOutput(ctx)
+if err != nil {
+	return err
+}
+// Archive or account for completed generations in application policy.
+if err := session.PruneOutput(ctx, boundary); err != nil {
+	return err
+}
+```
+
+Rotation completes the active generation and creates a new one. Pruning only
+accepts a generation-boundary cursor returned by rotation. The core does not
+compress segments, choose archive counts, or prune automatically. VT
+scrollback and raw output retention are independent; see
+[scrollback and output retention](docs/scrollback.md).
+
+## Daemon client
+
+Run the server:
 
 ```sh
 go run ./cmd/ghostline serve --socket /tmp/ghostline.sock
 ```
 
-Embed the server, or connect from another process:
+Use `NewClient` when the caller or a service manager owns that process:
 
 ```go
 client := ghostline.NewClient("/tmp/ghostline.sock")
 if err := client.Check(ctx); err != nil {
 	return err
 }
-
-session, err := client.Start(ctx, ghostline.SessionOptions{
-	Name:      "remote-shell",
-	Directory: "/srv/worktree",
-	Command:   "bash",
-})
-if err != nil {
-	return err
-}
 ```
 
-`Client.Start` returns a `Session` with the same methods as a local one,
-including `Wait`, `Checkpoint`, and `Recover`. Clients and the server must
-share the same filesystem because output watchers read the spool files
-directly.
-
-## Rolling server upgrades
-
-The server can be upgraded without ending sessions. Both processes must speak
-the admin-socket protocol, and the new server must use the same output
-directory as the old one. A fresh server adopts every session from the old one
-over its management socket, then serves in place of it:
-
-```sh
-ghostline serve --socket /tmp/ghostline-new.sock --adopt-from /tmp/ghostline.sock.admin
-```
-
-Adoption is all-or-nothing:
-
-- The old server pauses each session at a stable point, drains pending PTY
-  output into the spool and emulator, and transfers the master fd over
-  `SCM_RIGHTS` together with the encoded terminal snapshot.
-- The new server prepares every session before committing any of them. If any
-  session fails to prepare, the whole batch is aborted and the source server
-  keeps serving unchanged. The new emulator restores each session's snapshot,
-  including its grid, scrollback, cursor, and terminal modes.
-- After the batch commits, the new server binds its public socket and the old
-  server is asked to retire. Retirement confirmation is best-effort; once the
-  batch commits, the new server keeps serving the adopted sessions even if the
-  source endpoint closes without a response. Children never see a disconnect,
-  and spool offsets stay valid because the spool is never rewound.
-
-The embedding daemon coordinates the switch and retires the old process; see
-`docs/rfc/0002-serve-rolling-upgrade.md`.
-
-### Server bootstrap
-
-`Connect` starts the server when the socket is missing:
+Use the explicitly managed constructor when the client should spawn a missing
+server and lazily restore service after a transport failure:
 
 ```go
-client, err := ghostline.Connect(ctx, ghostline.ConnectOptions{
+client, err := ghostline.ConnectManaged(ctx, ghostline.ManagedClientOptions{
 	Socket: "/tmp/ghostline.sock",
+	Spawn:  []string{"ghostline", "serve", "--socket", "{socket}"},
 })
 if err != nil {
 	return err
@@ -158,136 +159,86 @@ if err != nil {
 defer client.Close()
 ```
 
-The default spawn command is `ghostline serve --socket <path>`. `Spawn` can
-override it, with `{socket}` replaced by the socket path; `Env` and `Log`
-configure the spawned process. `Ensure` pre-warms the server without an
-operation. A spawn that exits before becoming ready is reported immediately,
-including its output. Concurrent `Connect` calls are safe: the first server
-to bind wins, and the other clients attach to it without owning it.
+`ConnectManaged` keeps at most the latest 64 KiB of startup diagnostics.
+Read-only operations and `Start` may bootstrap and retry once after a transport
+failure. Input, resize, termination, deletion, rotation, and pruning are never
+retried because repeating them can change meaning. `Client.Close` stops only a
+server spawned by that client.
 
-Recovery is lazy and restricted: read-only calls and `Start` may respawn and
-retry once after a dead socket. `Input`, `Resize`, `Close`, `Remove`, and spool
-maintenance are never retried automatically. `Close` stops only the server
-this client spawned; connecting to an existing server is a no-op.
+`Hub` and `Client` expose matching `Start`, `Get`, and `List` methods. Daemon
+output, replay, and checkpoints travel over the socket; clients never open
+server-side output files.
 
-## Checkpoints
+## Lifecycle and durability
 
-For a lossless reattach or window switch, pause the watcher and use an atomic
-checkpoint:
+- `Wait` reports `*ExitError`. Canceling its context stops waiting, not the
+  child.
+- `Status` distinguishes process state from transport failure.
+- `Terminate` ends the process tree but retains the session record and output.
+- `Delete` ends the process tree and removes both the session record and its
+  output storage. Archive required output before deletion.
+- `Hub.Close` terminates all local sessions. `Server.Shutdown` does the same
+  for daemon-owned sessions.
+- Foreground process metadata is opt-in through `ProbeForeground`.
 
-```go
-watcher.Pause()
-checkpoint, err := session.Checkpoint(ctx)
-if err == nil {
-	err = watcher.SkipTo(checkpoint.Offset)
-}
-if err == nil {
-	_, err = client.Write(checkpoint.Replay)
-}
-watcher.Resume()
-```
+Sessions survive client detach and a successful same-version rolling daemon
+upgrade. They do not survive daemon crashes that lose PTY masters, host
+reboots, or cross-machine moves. Raw output is written to files, but those
+files cannot resurrect a dead process or reconstruct an unretained VT state.
 
-Bytes below `Checkpoint.Offset` are represented by `Checkpoint.Replay`; bytes
-written afterwards remain available to the resumed watcher.
+## Rolling daemon upgrades
 
-## minimux example
+`Server.Adopt` and `ghostline serve --adopt-from` transfer a complete batch
+from an existing server's `<socket>.admin` endpoint. Both sides must advertise
+exactly `ProtocolVersion == "1.0.0"`; protocol mismatch is rejected before any
+session is prepared. A successful batch transfers native VT state, live PTY
+file descriptors, output directories, and the active generation. There is no
+v0 replay bridge.
 
-`examples/minimux` is a small in-process terminal multiplexer built on the
-public `Hub` and `Session` APIs:
-
-```sh
-cd examples/minimux && go run .
-cd examples/minimux && go run . -- htop
-```
-
-It demonstrates multiple live windows, background TUI query responses,
-terminal resizing, output subscriptions, and atomic VT replay on window
-switches.
-
-| Key | Action |
-| --- | --- |
-| `Ctrl-B c` | Create a shell window |
-| `Ctrl-B n` | Switch to the next window |
-| `Ctrl-B p` | Switch to the previous window |
-| `Ctrl-B x` | Close the current window |
-| `Ctrl-B q` | Quit and terminate all windows |
-| `Ctrl-B Ctrl-B` | Send a literal `Ctrl-B` |
-
-## libghostty-vt
-
-The repository includes the Ghostty C headers and a prebuilt macOS arm64
-library. Other platforms must build libghostty-vt from Ghostty source with
-Zig 0.16.0 or newer:
-
-The bundled copy is built from [Ghostty commit `5851d986`](https://github.com/ghostty-org/ghostty/commit/5851d98615187d85052e41042bcf66e0ccec11d4)
-(`1.3.2-dev`) with Zig 0.16.0 and `ReleaseFast` optimization.
-
-```sh
-brew install zig@0.16
-git clone https://github.com/ghostty-org/ghostty
-cd ghostty
-/opt/homebrew/opt/zig@0.16/bin/zig build \
-  -Doptimize=ReleaseFast -Demit-lib-vt=true
-```
-
-Point the external linker and runtime loader at that build on platforms that do
-not use the bundled macOS arm64 library:
-
-```sh
-export GHOSTTY_VT_DIR="$HOME/Workspace/gh/ghostty/zig-out"
-export CGO_LDFLAGS="-L$GHOSTTY_VT_DIR/lib"
-export DYLD_LIBRARY_PATH="$GHOSTTY_VT_DIR/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" # macOS
-# export LD_LIBRARY_PATH="$GHOSTTY_VT_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"   # Linux
-```
-
-Builds with `CGO_ENABLED=0` compile, but `Hub.Check` and `Start` return
-`ErrUnavailable` because VT emulation requires libghostty-vt.
+See [RFC 0002](docs/rfc/0002-serve-rolling-upgrade.md) for ordering and failure
+semantics.
 
 ## Protocol and security
 
-The server speaks JSON-lines over a Unix socket and creates the socket with
-mode `0600`. The rolling-upgrade management socket (`<socket>.admin`) uses the
-same mode and is only ever connected to by a fresh server process, never by
-clients. The RPC enforces an idle deadline, a message size limit, and a
-concurrent connection cap. Both sockets are designed for same-machine,
-trusted callers; there is no authentication. Do not expose them to untrusted
-users.
+The daemon uses the v1 bounded JSON-envelope protocol over mode `0600` Unix
+sockets. Binary input/output is an exact-length raw payload after the JSON
+header; it is not JSON/base64. Headers and payloads are limited to 1 MiB, and
+raw output, Replay, and Checkpoint replay use 64 KiB pull-stream chunks. See
+[RFC 0004](docs/rfc/0004-wire-protocol.md) for framing, IDs, state, and
+extension rules. Use `errors.Is(err, ErrFrameTooLarge)` for a frame limit
+violation.
 
-## Lifecycle
+The public and admin sockets assume trusted same-user, same-host callers. They
+have no remote authentication or encryption. Do not expose them through a TCP
+proxy or to another trust domain.
 
-- `Start` rejects names that are already known; call `Remove` before reusing a
-  name.
-- `Close` terminates a session but keeps its record and spool for inspection.
-- `Remove` deletes the in-memory record; spool files stay on disk.
-- `Hub.Close` terminates every session.
-- `Session.Wait` returns an `ExitError` with the exit code or signal. A child
-  that exits after a rolling upgrade may report `ExitError.Unknown`, because
-  its new owner cannot recover the old process's wait status. Context
-  cancellation stops waiting but does not terminate the child.
-- `Status` distinguishes a stopped session from a remote network failure;
-  `Alive` is a best-effort convenience.
-- Sessions implement `MetadataProvider.Metadata`, reporting the OS-level
-  foreground process and working directory. It is opt-in: construct the
-  Hub/Server with `ProbeForeground: true` (or pass `--probe-foreground` to
-  `ghostline serve`). The probe resolves the PTY's foreground process group
-  with `TIOCGPGRP` and reads the process from `/proc` on Linux or `ps`/`lsof`
-  on macOS. Disabled by default; `Metadata` returns empty values without
-  probing.
-- Spool maintenance lives on `Session`: `Recover`, `TruncateSpool`,
-  `ArchiveSpool`, and `RemoveSpool`.
-- Use `errors.Is` with `ErrUnavailable`, `ErrClosed`, `ErrSessionExists`,
-  `ErrSessionNotFound`, `ErrSessionClosed`, and `ErrInvalidSessionName`; error
-  identity is preserved across the RPC boundary.
+## minimux example
 
-## Layout
+The independent module in `examples/minimux` demonstrates multiple windows,
+background terminal-query responses, output readers, and checkpoint-safe
+switching:
 
-- `hub.go` - session hub and start options
-- `session.go` - local and remote session API
-- `process.go` - PTY child lifecycle
-- `migrate.go` - rolling-upgrade admin protocol and session adoption
-- `spool.go` - append-only output watcher
-- `query.go` - detached-mode terminal query responder
-- `terminal.go` - libghostty-vt CGo wrapper
-- `rpc.go`, `client.go`, `server.go` - Unix-socket protocol
-- `cmd/ghostline` - standalone server command
-- `examples/minimux` - runnable terminal multiplexer example
+```sh
+cd examples/minimux
+go run .
+go run . -- htop
+```
+
+Keys are `Ctrl-B c` (create), `Ctrl-B n/p` (switch), `Ctrl-B x` (delete), and
+`Ctrl-B q` (quit).
+
+## libghostty-vt
+
+The repository includes headers, a macOS 13+ universal static archive, and
+Linux glibc 2.31+ static archives for amd64 and arm64. The package selects and
+links the matching archive through CGo. Builds with CGo disabled, or builds on
+an unsupported OS or architecture, compile with the unavailable backend;
+`Hub.Check` and `Start` then return `ErrUnavailable`.
+
+## Design documents
+
+- [RFC 0001: explicit managed client lifecycle](docs/rfc/0001-server-lifecycle.md)
+- [RFC 0002: same-version rolling daemon upgrade](docs/rfc/0002-serve-rolling-upgrade.md)
+- [RFC 0003: v1 architecture and ownership](docs/rfc/0003-v1-architecture.md)
+- [v1 migration note](docs/v1-migration.md)
+- [v1.0 release checklist and platform matrix](docs/release-checklist.md)
