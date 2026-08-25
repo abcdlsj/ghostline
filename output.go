@@ -137,11 +137,11 @@ func adoptOutputLog(directory string, generation uint64) (*outputLog, error) {
 }
 
 func openOutputLog(directory string, generation uint64, create bool) (*outputLog, error) {
+	path := outputSegmentPath(directory, generation)
 	flags := os.O_APPEND | os.O_WRONLY
 	if create {
 		flags |= os.O_CREATE | os.O_EXCL
 	}
-	path := outputSegmentPath(directory, generation)
 	active, err := os.OpenFile(path, flags, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open output segment: %w", err)

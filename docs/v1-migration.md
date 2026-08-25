@@ -45,8 +45,9 @@ reader goroutine and must stop it before creating a checkpoint:
 Warren may first roll an older v0 daemon into the final v0.8 compatibility
 bridge, then start v1 from its admin socket on the next restart. v1 accepts
 only `handoffVersion == "ghostline-v0-to-v1-1"` with source protocol `0.8.0`.
-It replays the v0 archived and live spool files into a new generation-one v1
-output log, restores the VT snapshot, and creates fresh opaque v1 cursors.
+It replays the v0 archived and live spool files into a fresh v1 VT model and a
+new generation-one v1 output log. It does not decode the v0 native snapshot
+envelope. The handoff creates fresh opaque v1 cursors.
 The v0 spool path, size, and format are migration metadata only; a v0 byte
 offset is never exposed as a v1 cursor.
 

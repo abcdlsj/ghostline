@@ -492,10 +492,10 @@ func adoptState(name string, master *os.File, snapshot []byte, size Size, output
 	return state, err
 }
 
-// adoptStateWithOutput builds a session around an already prepared output
-// log. The v0 handoff uses this form after rebuilding a fresh v1 generation
-// from the source spool; native v1 adoption opens an existing log through
-// adoptState above.
+// adoptStateWithOutput builds a native v1 session around an already prepared
+// output log and a decoded v1 VT snapshot. The v0 handoff uses
+// adoptStateWithTerminal instead because its snapshot envelope is not
+// compatible with v1.
 func adoptStateWithOutput(name string, master *os.File, snapshot []byte, size Size, output *outputLog, createdAt time.Time, pid int, exit *ExitError, scrollbackMaxBytes uint64) (*sessionState, error) {
 	vt, err := newVTTerminalWithOptions(size.Columns, size.Rows, vtTerminalOptions{
 		ScrollbackMaxBytes: scrollbackMaxBytes,
@@ -509,8 +509,13 @@ func adoptStateWithOutput(name string, master *os.File, snapshot []byte, size Si
 		closeFileQuietly(master)
 		return nil, fmt.Errorf("restore vt state: %w", err)
 	}
+	return adoptStateWithTerminal(name, master, vt, output, size, createdAt, pid, exit, scrollbackMaxBytes)
+}
+
+func adoptStateWithTerminal(name string, master *os.File, vt *vtTerminal, output *outputLog, size Size, createdAt time.Time, pid int, exit *ExitError, scrollbackMaxBytes uint64) (*sessionState, error) {
 	var migrationWakeReader, migrationWakeWriter *os.File
 	if master != nil {
+		var err error
 		migrationWakeReader, migrationWakeWriter, err = os.Pipe()
 		if err != nil {
 			output.discard()

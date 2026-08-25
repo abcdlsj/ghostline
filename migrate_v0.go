@@ -15,25 +15,34 @@ import (
 // archives and live spool. The v0 byte offset is intentionally not reused as
 // a v1 cursor: the destination starts at generation one and owns its cursor
 // namespace from the first rebuilt byte.
-func adoptV0State(ctx context.Context, outputRoot, name string, master *os.File, snapshot []byte, size Size, spoolPath string, createdAt time.Time, pid int, exit *ExitError, scrollbackMaxBytes uint64) (*sessionState, error) {
+func adoptV0State(ctx context.Context, outputRoot, name string, master *os.File, size Size, spoolPath string, createdAt time.Time, pid int, exit *ExitError, scrollbackMaxBytes uint64) (*sessionState, error) {
 	output, err := createOutputLog(outputRoot, name)
 	if err != nil {
 		closeFileQuietly(master)
 		return nil, err
 	}
-	if err := replayV0SpoolToOutput(ctx, output, spoolPath); err != nil {
+	vt, err := newVTTerminalWithOptions(size.Columns, size.Rows, vtTerminalOptions{
+		ScrollbackMaxBytes: scrollbackMaxBytes,
+	})
+	if err != nil {
 		output.discard()
+		closeFileQuietly(master)
+		return nil, fmt.Errorf("create v0 handoff vt: %w", err)
+	}
+	if err := replayV0Spool(ctx, vt, output, spoolPath); err != nil {
+		output.discard()
+		vt.Close()
 		closeFileQuietly(master)
 		return nil, err
 	}
-	state, err := adoptStateWithOutput(name, master, snapshot, size, output, createdAt, pid, exit, scrollbackMaxBytes)
+	state, err := adoptStateWithTerminal(name, master, vt, output, size, createdAt, pid, exit, scrollbackMaxBytes)
 	if err != nil {
 		output.discard()
 	}
 	return state, err
 }
 
-func replayV0SpoolToOutput(ctx context.Context, output *outputLog, spoolPath string) error {
+func replayV0Spool(ctx context.Context, vt *vtTerminal, output *outputLog, spoolPath string) error {
 	archives, err := filepath.Glob(spoolPath + ".*.gz")
 	if err != nil {
 		return fmt.Errorf("find v0 spool archives: %w", err)
@@ -61,14 +70,14 @@ func replayV0SpoolToOutput(ctx context.Context, output *outputLog, spoolPath str
 	}
 
 	for _, item := range paths {
-		if err := replayV0SpoolFile(ctx, output, item.path, item.compressed); err != nil {
+		if err := replayV0SpoolFile(ctx, vt, output, item.path, item.compressed); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func replayV0SpoolFile(ctx context.Context, output *outputLog, path string, compressed bool) error {
+func replayV0SpoolFile(ctx context.Context, vt *vtTerminal, output *outputLog, path string, compressed bool) error {
 	file, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open v0 spool replay %s: %w", path, err)
@@ -93,6 +102,7 @@ func replayV0SpoolFile(ctx context.Context, output *outputLog, path string, comp
 		}
 		read, readErr := reader.Read(buffer)
 		if read > 0 {
+			vt.Feed(buffer[:read])
 			if err := output.append(buffer[:read]); err != nil {
 				return fmt.Errorf("append v0 spool replay %s: %w", path, err)
 			}

@@ -204,10 +204,11 @@ file descriptors, output directories, and the active generation. There is no
 implicit v0 replay bridge in this native path. The final v0.8 compatibility
 daemon can be handed off separately through
 [`docs/v0-compat-bridge.md`](docs/v0-compat-bridge.md); that path rebuilds a
-fresh v1 output generation and never reuses a v0 byte offset as a cursor.
+fresh v1 VT/output generation and never reuses a v0 byte offset as a cursor.
 
 See [RFC 0002](docs/rfc/0002-serve-rolling-upgrade.md) for ordering and failure
-semantics.
+semantics. The real-binary handoff and crash-window rehearsal is documented in
+[`docs/integration-testing.md`](docs/integration-testing.md).
 
 ## Protocol and security
 

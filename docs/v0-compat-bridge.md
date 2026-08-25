@@ -9,8 +9,9 @@ retirement. The ghostline v1 consumer accepts only source protocol `0.8.0`
 with the exact handoff identifier. Unknown or missing handoff versions are
 rejected before any session is prepared.
 
-For each session, v1 transfers the live PTY master and native VT snapshot, then
-replays the v0 archived and live spool files into a new v1 output log. The
+For each live session, v1 transfers the PTY master and replays the v0 archived
+and live spool files into both a fresh v1 VT model and a new v1 output log.
+The v0 native snapshot envelope is deliberately not decoded by v1. The
 destination starts at generation one and creates fresh opaque cursors; v0 byte
 offsets and spool sizes are never interpreted as v1 cursors.
 

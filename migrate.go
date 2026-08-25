@@ -466,16 +466,6 @@ func adoptSessions(ctx context.Context, adminSocket string, h *Hub) (int, error)
 			}
 			master = os.NewFile(uintptr(masterFD), "adopted-master")
 		}
-		var snapshotResult adminSnapshotResult
-		if err := client.call(ctx, adminMethodSnapshot, adoptParams{Name: adopted.Name}, &snapshotResult); err != nil {
-			closeFileQuietly(master)
-			return 0, fmt.Errorf("encode snapshot for %s: %w", meta.Name, err)
-		}
-		snapshot, err := base64.StdEncoding.DecodeString(snapshotResult.Snapshot)
-		if err != nil {
-			closeFileQuietly(master)
-			return 0, fmt.Errorf("decode snapshot for %s: %w", meta.Name, err)
-		}
 		var state *sessionState
 		if v0Handoff {
 			if adopted.SpoolFormat != v0SpoolFormat || adopted.SpoolPath == "" {
@@ -487,7 +477,6 @@ func adoptSessions(ctx context.Context, adminSocket string, h *Hub) (int, error)
 				h.outputDir,
 				adopted.Name,
 				master,
-				snapshot,
 				Size{Columns: adopted.Cols, Rows: adopted.Rows},
 				adopted.SpoolPath,
 				time.Unix(adopted.CreatedAt, 0),
@@ -496,7 +485,18 @@ func adoptSessions(ctx context.Context, adminSocket string, h *Hub) (int, error)
 				resolveVTScrollbackMaxBytes(adopted.VTScrollbackMaxBytes, h.defaultVTScrollbackMaxBytes),
 			)
 		} else {
-			state, err = adoptState(
+			var snapshotResult adminSnapshotResult
+			if err := client.call(ctx, adminMethodSnapshot, adoptParams{Name: adopted.Name}, &snapshotResult); err != nil {
+				closeFileQuietly(master)
+				return 0, fmt.Errorf("encode snapshot for %s: %w", meta.Name, err)
+			}
+			snapshot, decodeErr := base64.StdEncoding.DecodeString(snapshotResult.Snapshot)
+			if decodeErr != nil {
+				closeFileQuietly(master)
+				return 0, fmt.Errorf("decode snapshot for %s: %w", meta.Name, decodeErr)
+			}
+			var stateErr error
+			state, stateErr = adoptState(
 				adopted.Name,
 				master,
 				snapshot,
@@ -508,6 +508,7 @@ func adoptSessions(ctx context.Context, adminSocket string, h *Hub) (int, error)
 				adopted.Exit.error(),
 				resolveVTScrollbackMaxBytes(adopted.VTScrollbackMaxBytes, h.defaultVTScrollbackMaxBytes),
 			)
+			err = stateErr
 		}
 		if err != nil {
 			return 0, fmt.Errorf("restore snapshot for %s: %w", meta.Name, err)
