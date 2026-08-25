@@ -76,7 +76,7 @@ type sessionMeta struct {
 	Alive                bool      `json:"alive"`
 	VTScrollbackMaxBytes uint64    `json:"vtScrollbackMaxBytes,omitempty"`
 	SpoolPath            string    `json:"spoolPath,omitempty"`
-	SpoolSize            int64     `json:"spoolSize,omitempty"`
+	SpoolSize            int64     `json:"spoolSize"`
 	SpoolFormat          string    `json:"spoolFormat,omitempty"`
 	Exit                 *exitMeta `json:"exit,omitempty"`
 }
