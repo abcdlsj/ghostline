@@ -213,6 +213,9 @@ type VersionInfo struct {
 	Capabilities []string
 	// Limits contains the server's enforced wire framing limits.
 	Limits ProtocolLimits
+	// MaxClientConnections is the maximum number of active client sockets the
+	// daemon accepts. Long-lived streams count against this limit.
+	MaxClientConnections int
 }
 
 // VersionInfo returns the server's RPC protocol version and release tag.
@@ -222,10 +225,11 @@ func (c *Client) VersionInfo(ctx context.Context) (VersionInfo, error) {
 		return VersionInfo{}, err
 	}
 	return VersionInfo{
-		ProtocolVersion: result.Version,
-		TagVersion:      result.TagVersion,
-		Capabilities:    append([]string(nil), result.Capabilities...),
-		Limits:          result.Limits,
+		ProtocolVersion:      result.Version,
+		TagVersion:           result.TagVersion,
+		Capabilities:         append([]string(nil), result.Capabilities...),
+		Limits:               result.Limits,
+		MaxClientConnections: result.MaxClientConnections,
 	}, nil
 }
 

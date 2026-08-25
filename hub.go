@@ -27,6 +27,11 @@ type Options struct {
 	// Disabled by default; Session.Metadata returns empty values without
 	// spawning any OS probes.
 	ProbeForeground bool
+	// ServerMaxClientConnections limits concurrently active client socket
+	// connections when these options are passed to NewServer. A connection is
+	// active for the life of an Output, Replay, or Checkpoint stream. Zero uses
+	// DefaultServerMaxClientConnections. Hub ignores this field.
+	ServerMaxClientConnections int
 }
 
 // ProcessSpec describes the process started inside a session. Path and Args

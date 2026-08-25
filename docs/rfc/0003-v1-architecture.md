@@ -65,6 +65,14 @@ a single arbitrary allocation through a declared frame. Public Replay methods
 still return a complete `[]byte`, so the configured VT budget remains the
 upper-level memory control.
 
+A daemon also bounds active client sockets. `Options.ServerMaxClientConnections`
+defaults to 1,024; each live Output, Replay, or Checkpoint stream occupies one
+connection because v1 deliberately does not multiplex requests. Dense runtimes
+must size that limit, process file-descriptor limits, and the per-session VT
+scrollback budget together. `Client.VersionInfo` reports the configured limit
+so workspace managers can budget long-lived streams without assuming the
+default.
+
 The exact envelope, raw-payload framing, request sequencing, stream state
 machine, limits, and compatibility rules are frozen in [RFC 0004](0004-wire-protocol.md).
 

@@ -111,9 +111,16 @@ jobs:
           cache-dependency-path: go.sum
       - name: Run bounded benchmarks
         run: go test -run '^$' -bench . -benchmem -benchtime=200ms -count=3 ./... | tee ghostline-bench.txt
+      - name: Run bounded PTY scale tests
+        run: >-
+          GHOSTLINE_SCALE=1 go test -v -count=1 -timeout=10m
+          -run '^(TestDaemonSupportsHundredsOfLiveSessionsAndOutputStreams|TestDaemonWarrenAttachDetachAndResizeLatency|TestDaemonHighTrafficAcrossHundredsOfPTYs|TestDaemonWarrenCodexTUIInputScale)$'
+          ./... | tee ghostline-scale.txt
       - name: Upload benchmark artifact
         uses: actions/upload-artifact@v4
         with:
           name: ghostline-bench
-          path: ghostline-bench.txt
+          path: |
+            ghostline-bench.txt
+            ghostline-scale.txt
           if-no-files-found: error

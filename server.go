@@ -21,20 +21,28 @@ import (
 // without ending any session. The wire protocol uses bounded JSON envelopes
 // with optional exact-length raw payloads over a Unix socket.
 type Server struct {
-	hub      *Hub
-	mu       sync.Mutex
-	listener net.Listener
-	admin    net.Listener
-	stopping atomic.Bool
+	hub                  *Hub
+	maxClientConnections int
+	mu                   sync.Mutex
+	listener             net.Listener
+	admin                net.Listener
+	stopping             atomic.Bool
 }
 
 // NewServer constructs a server with its own hub.
 func NewServer(options Options) (*Server, error) {
+	maxClientConnections := options.ServerMaxClientConnections
+	if maxClientConnections < 0 {
+		return nil, errors.New("ghostline: negative server max client connections")
+	}
+	if maxClientConnections == 0 {
+		maxClientConnections = DefaultServerMaxClientConnections
+	}
 	hub, err := New(options)
 	if err != nil {
 		return nil, err
 	}
-	return &Server{hub: hub}, nil
+	return &Server{hub: hub, maxClientConnections: maxClientConnections}, nil
 }
 
 // Serve listens on socketPath and handles requests until ctx is canceled or
@@ -79,7 +87,7 @@ func (s *Server) Serve(ctx context.Context, socketPath string) error {
 	}()
 	go s.adminLoop(adminListener)
 
-	slots := make(chan struct{}, maxConnections)
+	slots := make(chan struct{}, s.maxClientConnections)
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -625,10 +633,16 @@ func (s *Server) dispatchRequest(connection net.Conn, req request) (any, error) 
 
 	ctx, cancel := context.WithCancel(context.Background())
 	stop := make(chan struct{})
-	go monitorConnection(connection, cancel, stop)
+	monitored := make(chan struct{})
+	go func() {
+		defer close(monitored)
+		monitorConnection(connection, cancel, stop)
+	}()
 	result, err := s.dispatch(ctx, req.Method, req.Params, req.payload)
 	close(stop)
 	_ = connection.SetReadDeadline(time.Now())
+	<-monitored
+	_ = connection.SetReadDeadline(time.Time{})
 	cancel()
 	return result, err
 }
@@ -636,23 +650,27 @@ func (s *Server) dispatchRequest(connection net.Conn, req request) (any, error) 
 // monitorConnection cancels wait dispatch when the client stops reading.
 func monitorConnection(connection net.Conn, cancel context.CancelFunc, stop <-chan struct{}) {
 	buffer := make([]byte, 1)
-	for {
-		select {
-		case <-stop:
-			return
-		default:
-		}
-		_ = connection.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-		_, err := connection.Read(buffer)
-		if err == nil {
-			cancel()
-			return
-		}
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			continue
-		}
-		cancel()
+	select {
+	case <-stop:
 		return
+	default:
+	}
+	// The protocol is strictly serial: while an operation is running, any
+	// client byte is either a disconnect indication or an invalid pipelined
+	// request. Block without periodic deadlines. The operation owner closes
+	// stop and sets an immediate deadline to wake this read when work finishes.
+	_ = connection.SetReadDeadline(time.Time{})
+	select {
+	case <-stop:
+		return
+	default:
+	}
+	_, _ = connection.Read(buffer)
+	select {
+	case <-stop:
+		return
+	default:
+		cancel()
 	}
 }
 
@@ -677,6 +695,7 @@ func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessag
 		return versionResult{
 			Version: ProtocolVersion, TagVersion: TagVersion(),
 			Capabilities: append([]string(nil), protocolCapabilities...), Limits: currentProtocolLimits,
+			MaxClientConnections: s.maxClientConnections,
 		}, nil
 
 	case rpcMethodCreate:

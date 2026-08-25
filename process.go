@@ -23,16 +23,18 @@ const (
 )
 
 type sessionState struct {
-	name               string
-	command            *exec.Cmd
-	pid                int
-	masterFD           int
-	size               Size
-	master             *os.File
-	output             *outputLog
-	vt                 *vtTerminal
-	scrollbackMaxBytes uint64
-	createdAt          time.Time
+	name                string
+	command             *exec.Cmd
+	pid                 int
+	masterFD            int
+	size                Size
+	master              *os.File
+	migrationWakeReader *os.File
+	migrationWakeWriter *os.File
+	output              *outputLog
+	vt                  *vtTerminal
+	scrollbackMaxBytes  uint64
+	createdAt           time.Time
 
 	// operationMu is the session's read/write gate. Ordinary operations share
 	// it; migration takes the write side and keeps it until commit or abort.
@@ -124,32 +126,44 @@ func startSession(ctx context.Context, options SessionOptions, size Size, output
 		vt.Close()
 		return nil, err
 	}
+	migrationWakeReader, migrationWakeWriter, err := os.Pipe()
+	if err != nil {
+		output.discard()
+		vt.Close()
+		return nil, fmt.Errorf("create migration wake pipe: %w", err)
+	}
 	command := ptyCommand(options.Process, defaultTerm)
 	master, err := pty.StartWithSize(command, &pty.Winsize{Cols: uint16(size.Columns), Rows: uint16(size.Rows)})
 	if err != nil {
+		closeQuietly(migrationWakeReader)
+		closeQuietly(migrationWakeWriter)
 		output.discard()
 		vt.Close()
 		return nil, fmt.Errorf("start pty: %w", err)
 	}
 	return &sessionState{
-		name:               options.Name,
-		command:            command,
-		pid:                command.Process.Pid,
-		masterFD:           int(master.Fd()),
-		size:               size,
-		master:             master,
-		output:             output,
-		vt:                 vt,
-		scrollbackMaxBytes: scrollbackMaxBytes,
-		createdAt:          time.Now(),
-		done:               make(chan struct{}),
-		reaped:             make(chan struct{}),
+		name:                options.Name,
+		command:             command,
+		pid:                 command.Process.Pid,
+		masterFD:            int(master.Fd()),
+		size:                size,
+		master:              master,
+		migrationWakeReader: migrationWakeReader,
+		migrationWakeWriter: migrationWakeWriter,
+		output:              output,
+		vt:                  vt,
+		scrollbackMaxBytes:  scrollbackMaxBytes,
+		createdAt:           time.Now(),
+		done:                make(chan struct{}),
+		reaped:              make(chan struct{}),
 	}, nil
 }
 
 func copyOutput(state *sessionState) {
 	defer close(state.done)
 	defer state.output.close(nil)
+	defer closeQuietly(state.migrationWakeReader)
+	defer closeQuietly(state.migrationWakeWriter)
 	defer func() {
 		// A committed migration closes the old duplicate explicitly after the
 		// receiver has its fd; aborted and ordinary exits close it here.
@@ -218,7 +232,7 @@ func copyOutputLoop(state *sessionState, buffer []byte) bool {
 			}
 			return true
 		}
-		ready, err := waitReadable(state.master, 50*time.Millisecond)
+		ready, err := waitOutputOrMigration(state.master, state.migrationWakeReader)
 		if err != nil {
 			return false
 		}
@@ -244,9 +258,46 @@ func copyOutputLoop(state *sessionState, buffer []byte) bool {
 	}
 }
 
-// waitReadable polls file for readable data, returning true when a read will
-// not block. PTY masters do not support Go's SetReadDeadline, so the copy
-// loop uses poll(2) with a short timeout to notice migration requests.
+// waitOutputOrMigration blocks until the PTY produces output, exits, or a
+// migration request needs the copy loop. A wake pipe avoids periodic polling
+// for every idle PTY while preserving prompt rolling-upgrade handoff.
+func waitOutputOrMigration(master, migrationWake *os.File) (bool, error) {
+	if master == nil {
+		return false, os.ErrInvalid
+	}
+	if migrationWake == nil {
+		return waitReadable(master, 0)
+	}
+	fds := []unix.PollFd{
+		{Fd: int32(master.Fd()), Events: unix.POLLIN},
+		{Fd: int32(migrationWake.Fd()), Events: unix.POLLIN},
+	}
+	for {
+		ready, err := unix.Poll(fds, -1)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		if ready == 0 {
+			continue
+		}
+		if fds[1].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR) != 0 {
+			var wake [1]byte
+			_, _ = migrationWake.Read(wake[:])
+			return false, nil
+		}
+		if fds[0].Revents&unix.POLLNVAL != 0 {
+			return false, os.ErrInvalid
+		}
+		return fds[0].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR) != 0, nil
+	}
+}
+
+// waitReadable polls a file for readable data, returning true when a read will
+// not block. It is used by the bounded migration drain after the copy loop has
+// already been woken by its migration pipe.
 func waitReadable(file *os.File, timeout time.Duration) (bool, error) {
 	if file == nil {
 		return false, os.ErrInvalid
@@ -371,7 +422,14 @@ func (s *sessionState) beginMigration() (*migrationTicket, error) {
 	ticket := newMigrationTicket(true)
 	s.migration = ticket
 	s.migrationMu.Unlock()
+	s.signalMigrationWake()
 	return ticket, nil
+}
+
+func (s *sessionState) signalMigrationWake() {
+	if s.migrationWakeWriter != nil {
+		_, _ = s.migrationWakeWriter.Write([]byte{1})
+	}
 }
 
 func (s *sessionState) currentMigration() *migrationTicket {
@@ -440,18 +498,30 @@ func adoptState(name string, master *os.File, snapshot []byte, size Size, output
 		closeFileQuietly(master)
 		return nil, err
 	}
+	var migrationWakeReader, migrationWakeWriter *os.File
+	if master != nil {
+		migrationWakeReader, migrationWakeWriter, err = os.Pipe()
+		if err != nil {
+			output.discard()
+			vt.Close()
+			closeFileQuietly(master)
+			return nil, fmt.Errorf("create migration wake pipe: %w", err)
+		}
+	}
 	state := &sessionState{
-		name:               name,
-		pid:                pid,
-		masterFD:           -1,
-		size:               size,
-		master:             master,
-		output:             output,
-		vt:                 vt,
-		scrollbackMaxBytes: scrollbackMaxBytes,
-		createdAt:          createdAt,
-		done:               make(chan struct{}),
-		reaped:             make(chan struct{}),
+		name:                name,
+		pid:                 pid,
+		masterFD:            -1,
+		size:                size,
+		master:              master,
+		migrationWakeReader: migrationWakeReader,
+		migrationWakeWriter: migrationWakeWriter,
+		output:              output,
+		vt:                  vt,
+		scrollbackMaxBytes:  scrollbackMaxBytes,
+		createdAt:           createdAt,
+		done:                make(chan struct{}),
+		reaped:              make(chan struct{}),
 	}
 	if master == nil {
 		if exit == nil {
@@ -521,6 +591,8 @@ func (s *sessionState) close() {
 		if s.master != nil {
 			closeQuietly(s.master)
 		}
+		closeQuietly(s.migrationWakeReader)
+		closeQuietly(s.migrationWakeWriter)
 		s.output.close(nil)
 		s.vt.Close()
 	})

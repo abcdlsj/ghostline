@@ -17,6 +17,17 @@ Linux amd64/arm64 matrices, artifact checksum checks, and a final macOS binary
 deployment-target check. Remote CI and a native Linux amd64 run remain pending,
 so the two platform completion items stay open.
 
+Performance follow-up completed (2026-08-25): the working tree raises the daemon
+connection limit to 1,024, replaces per-session PTY polling with migration wake
+pipes, removes the 100 ms connection-monitor polling race, reclaims pruned
+segment metadata, and adds 256-session idle, attach/detach/resize, and 64 MiB
+output traffic tests. A Warren-style Codex TUI test delivered 8,192 ordered,
+lossless input frames across 256 PTYs at 17.4k–24.0k frames/s with 32 concurrent
+input calls. `WriteInput` p99 was 3.91–8.16 ms, end-to-end acknowledgement p99
+was 15.3–38.4 ms, and goroutine/file-descriptor deltas returned to zero. The
+measured result does not justify adding a persistent input-writer lifecycle to
+the v1 API.
+
 Delegation note: attempts to run the explicitly requested `codex-luna-max`
 sessions through Warren were blocked before model startup by Codex's repository
 trust prompt. Warren reported no independent agent thread or transcript, and
@@ -34,6 +45,13 @@ the requested `codex-luna-max` command. Warren created agent
 still waiting for repository trust and had no agent thread. Live attach plus
 Enter only repainted the prompt again. The zombie was removed and made no
 changes.
+
+A fourth attempt on 2026-08-25 succeeded after Warren's initial readiness
+timeout. The requested `codex-luna-max` Agent
+`e34cf425-f670-45b4-b9ba-1367c671e7ee` created the isolated input scale test,
+ran it, and then added the bounded CI artifact step and performance baseline in
+a follow-up turn. The parent reviewed and refined the measurements, reran all
+release gates, and accepted those changes.
 
 This document is the durable source of truth for the v1 rewrite. Read it before
 continuing work after a context reset. v1 is intentionally incompatible with
@@ -213,6 +231,22 @@ container; retain the native Linux amd64 run as a remote CI gate.
 - [x] Add malformed envelope/payload, unsupported version, length boundary,
       stream-state, and fuzz coverage before freezing wire v1.
 
+### 10. High-density interactive PTY qualification
+
+- [x] Remove periodic idle PTY and connection-monitor polling from the daemon
+      hot path.
+- [x] Exercise 256 live PTYs, long-lived Output streams, repeated attach,
+      detach, resize, and concurrent high-volume output.
+- [x] Exercise 256 Codex-like TUI PTYs with sustained concurrent small input
+      frames and deterministic output acknowledgements.
+- [x] Measure input RPC latency, end-to-end acknowledgement latency, aggregate
+      input/output throughput, ordering, loss, goroutine, and descriptor use.
+- [x] Decide from measured evidence whether one-shot `WriteInput` is sufficient
+      or an explicitly owned persistent input writer is required for v1.
+- [x] Add bounded scale workloads to the CI performance artifact job and record
+      the local baseline in `docs/performance.md`.
+- [x] Re-run the complete v1 release gate and commit the high-density changes.
+
 ## Completion checklist
 
 - [x] Core public contract implemented.
@@ -230,6 +264,7 @@ container; retain the native Linux amd64 run as a remote CI gate.
 - [x] Performance qualification baseline and CI artifact job complete.
 - [x] Final control-plane additions implemented and API freeze reviewed.
 - [x] Wire framing v1 implemented, documented, fuzzed, and frozen.
+- [x] High-density Warren/Codex PTY workloads qualified and preserved in CI.
 
 ## Continuation protocol
 

@@ -17,9 +17,14 @@ const (
 	maxRPCChunk        = 64 << 10
 	maxRPCErrorMessage = 4 << 10
 	rpcIdleTimeout     = time.Minute
-	maxConnections     = 64
 	wireVersion        = 1
 )
+
+// DefaultServerMaxClientConnections is the maximum number of active client
+// socket connections accepted by a Server when Options.ServerMaxClientConnections
+// is zero. It leaves room for hundreds of long-lived output streams and their
+// concurrent control calls on a trusted same-host socket.
+const DefaultServerMaxClientConnections = 1024
 
 // ProtocolVersion identifies the RPC protocol spoken by the server. Clients
 // use it to detect an outdated server process during upgrades instead of
@@ -135,10 +140,11 @@ type createResult struct {
 }
 
 type versionResult struct {
-	Version      string         `json:"version"`
-	TagVersion   string         `json:"tagVersion,omitempty"`
-	Capabilities []string       `json:"capabilities"`
-	Limits       ProtocolLimits `json:"limits"`
+	Version              string         `json:"version"`
+	TagVersion           string         `json:"tagVersion,omitempty"`
+	Capabilities         []string       `json:"capabilities"`
+	Limits               ProtocolLimits `json:"limits"`
+	MaxClientConnections int            `json:"maxClientConnections"`
 }
 
 type listResult struct {

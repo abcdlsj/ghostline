@@ -43,6 +43,12 @@ The bundled libraries are built from pinned Ghostty commit
 [the third-party artifact manifest](third_party/README.md) for build commands,
 targets, checksums, and license information.
 
+For high-density daemon use, set a realistic `VTScrollbackMaxBytes` budget and
+an explicit `ServerMaxClientConnections` limit. The default connection limit is
+1,024. Each live Output, Replay, or Checkpoint stream holds one server socket
+connection; the daemon is not a multiplexed stream transport. Clients can read
+the configured limit from `Client.VersionInfo`.
+
 ## Local sessions
 
 ```go

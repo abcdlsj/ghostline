@@ -56,6 +56,40 @@ positioned as a bulk-data transport. The raw-payload framing removes base64
 amplification, while the remaining per-chunk RPC work is visible in daemon
 allocation counts.
 
+## 256-session PTY scale baseline
+
+The scale baseline models Warren keeping 256 PTYs alive for Codex TUI
+sessions. Each run exercises session startup, output attachment, status
+queries, resize churn, high-volume output, and sustained bidirectional input.
+These figures are qualification ranges from completed runs, not hard latency
+SLOs for shared CI runners.
+
+| Measurement | Observed range |
+| --- | ---: |
+| Session start/open | 0.82–1.15 s |
+| Concurrent status | 5–8 ms |
+| Goroutine delta | roughly 771–797 |
+| Attach latency p50 | 152–301 us |
+| Attach latency p99 | 339 us–1.44 ms |
+| Active resize p50 | 87–178 us |
+| Active resize p99 | 170 us–1.19 ms |
+| 32-way resize batch p99 | 1.96–3.67 ms |
+| 64 MiB output aggregate | 17.9–29.3 MiB/s |
+| Input scale | 8,192 ordered, lossless frames at 17.4k–24.0k frames/s |
+| WriteInput p50 | 1.09–1.29 ms |
+| WriteInput p99 | 3.91–8.16 ms |
+| End-to-end ACK p99 | 15.3–38.4 ms |
+| Goroutine/FD delta during input scale | zero |
+
+The input scale uses 32 concurrent input calls. This models active
+interaction across hundreds of mostly background Codex TUI sessions. An
+instantaneous 256-dial burst can exceed the operating system's Unix listen
+backlog, so it is not the normal Warren workload.
+
+Run the bounded scale suite explicitly with `GHOSTLINE_SCALE=1`; ordinary and
+race test jobs skip it so instrumentation and repeated platform jobs do not
+distort the performance artifact.
+
 ## Comparison policy
 
 Before release, save two raw outputs on the same host with the same
@@ -78,6 +112,7 @@ GOBIN=/tmp/ghostline-tools go install golang.org/x/perf/cmd/benchstat@latest
 
 The CI `performance` job uses fixed `-benchtime=200ms -count=3` runs to catch
 hangs, timeouts, unbounded growth, and order-of-magnitude regressions. It
-uploads a `ghostline-bench` artifact. It intentionally has no noisy hard
-latency threshold on shared runners; release candidates still follow the
-same-host, multi-sample policy above.
+also runs the four bounded PTY scale tests once with `-v` and uploads their
+`ghostline-scale.txt` output alongside the benchmark artifact. It intentionally
+has no noisy hard latency threshold on shared runners; release candidates
+still follow the same-host, multi-sample policy above.

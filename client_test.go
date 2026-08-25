@@ -9,6 +9,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +21,13 @@ import (
 
 func startTestServer(t *testing.T) (string, *ghostline.Client) {
 	return startTestServerWithOptions(t, ghostline.Options{OutputDir: t.TempDir()})
+}
+
+func requireScaleTest(t *testing.T) {
+	t.Helper()
+	if testing.Short() || os.Getenv("GHOSTLINE_SCALE") != "1" {
+		t.Skip("scale test; set GHOSTLINE_SCALE=1")
+	}
 }
 
 func startTestServerWithOptions(t *testing.T, options ghostline.Options) (string, *ghostline.Client) {
@@ -219,6 +228,23 @@ func TestClientVersionInfoReportsProtocolAndTag(t *testing.T) {
 		info.Limits.MaxChunkBytes > info.Limits.MaxPayloadBytes {
 		t.Fatalf("VersionInfo limits = %+v", info.Limits)
 	}
+	if info.MaxClientConnections != ghostline.DefaultServerMaxClientConnections {
+		t.Fatalf("VersionInfo max client connections = %d, want %d", info.MaxClientConnections, ghostline.DefaultServerMaxClientConnections)
+	}
+}
+
+func TestClientVersionInfoReportsConfiguredConnectionLimit(t *testing.T) {
+	_, client := startTestServerWithOptions(t, ghostline.Options{
+		OutputDir:                  t.TempDir(),
+		ServerMaxClientConnections: 17,
+	})
+	info, err := client.VersionInfo(context.Background())
+	if err != nil {
+		t.Fatalf("VersionInfo: %v", err)
+	}
+	if info.MaxClientConnections != 17 {
+		t.Fatalf("VersionInfo max client connections = %d, want 17", info.MaxClientConnections)
+	}
 }
 
 func TestClientStreamsLargeReplayAndCheckpoint(t *testing.T) {
@@ -269,6 +295,449 @@ func TestClientStreamsLargeReplayAndCheckpoint(t *testing.T) {
 	if checkpoint.Cursor == (ghostline.Cursor{}) {
 		t.Fatal("Checkpoint returned a zero cursor after output")
 	}
+}
+
+func TestDaemonSupportsHundredsOfLiveSessionsAndOutputStreams(t *testing.T) {
+	requireScaleTest(t)
+	const sessionCount = 256
+	beforeGoroutines := runtime.NumGoroutine()
+	_, client := startTestServerWithOptions(t, ghostline.Options{
+		OutputDir:            t.TempDir(),
+		VTScrollbackMaxBytes: 64 << 10,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	sessions := make([]*ghostline.Session, 0, sessionCount)
+	readers := make([]*ghostline.OutputReader, 0, sessionCount)
+	t.Cleanup(func() {
+		for _, reader := range readers {
+			_ = reader.Close()
+		}
+	})
+	start := time.Now()
+	for index := range sessionCount {
+		session, err := client.Start(ctx, ghostline.SessionOptions{
+			Name: fmt.Sprintf("scale-%03d", index),
+			Process: ghostline.ProcessSpec{
+				Path: "sleep", Args: []string{"120"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Start %d/%d: %v", index+1, sessionCount, err)
+		}
+		reader, err := session.Output(ctx, ghostline.Cursor{})
+		if err != nil {
+			t.Fatalf("Output %d/%d: %v", index+1, sessionCount, err)
+		}
+		sessions = append(sessions, session)
+		readers = append(readers, reader)
+	}
+	opened := time.Now()
+
+	errs := make(chan error, sessionCount)
+	var wait sync.WaitGroup
+	for _, session := range sessions {
+		wait.Add(1)
+		go func(session *ghostline.Session) {
+			defer wait.Done()
+			status, err := session.Status(ctx)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if !status.Alive {
+				errs <- errors.New("live scale session reported stopped")
+			}
+		}(session)
+	}
+	wait.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	statusDone := time.Now()
+	if rawHold := os.Getenv("GHOSTLINE_SCALE_IDLE"); rawHold != "" {
+		hold, err := time.ParseDuration(rawHold)
+		if err != nil {
+			t.Fatalf("parse GHOSTLINE_SCALE_IDLE: %v", err)
+		}
+		if hold > 0 {
+			t.Logf("holding %d live sessions idle for %s", sessionCount, hold)
+			time.Sleep(hold)
+		}
+	}
+	t.Logf(
+		"%d live sessions and output streams: start/open=%s, concurrent status=%s, goroutines delta=%d",
+		sessionCount,
+		opened.Sub(start).Round(time.Millisecond),
+		statusDone.Sub(opened).Round(time.Millisecond),
+		runtime.NumGoroutine()-beforeGoroutines,
+	)
+}
+
+func TestServerRejectsNegativeMaxClientConnections(t *testing.T) {
+	if _, err := ghostline.NewServer(ghostline.Options{ServerMaxClientConnections: -1}); err == nil {
+		t.Fatal("NewServer accepted a negative connection limit")
+	}
+}
+
+func TestServerEnforcesMaxClientConnections(t *testing.T) {
+	_, client := startTestServerWithOptions(t, ghostline.Options{
+		OutputDir:                  t.TempDir(),
+		ServerMaxClientConnections: 2,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// Let the readiness probe's accepted socket reach EOF and release its slot.
+	time.Sleep(20 * time.Millisecond)
+	session, err := client.Start(ctx, ghostline.SessionOptions{
+		Name: "connection-limit",
+		Process: ghostline.ProcessSpec{
+			Path: "sleep", Args: []string{"30"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	first, err := session.Output(ctx, ghostline.Cursor{})
+	if err != nil {
+		t.Fatalf("first Output: %v", err)
+	}
+	second, err := session.Output(ctx, ghostline.Cursor{})
+	if err != nil {
+		_ = first.Close()
+		t.Fatalf("second Output: %v", err)
+	}
+	if _, err := client.VersionInfo(ctx); err == nil {
+		_ = first.Close()
+		_ = second.Close()
+		t.Fatal("VersionInfo succeeded while every connection slot was occupied")
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close first output: %v", err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatalf("Close second output: %v", err)
+	}
+	for {
+		if _, err := client.VersionInfo(ctx); err == nil {
+			break
+		}
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("VersionInfo after releasing connection slot: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestDaemonWarrenAttachDetachAndResizeLatency(t *testing.T) {
+	requireScaleTest(t)
+	const (
+		sessionCount = 256
+		churnRounds  = 512
+		resizePasses = 10
+		resizeWidth  = 32
+	)
+	_, client := startTestServerWithOptions(t, ghostline.Options{
+		OutputDir:            t.TempDir(),
+		VTScrollbackMaxBytes: 64 << 10,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	sessions := make([]*ghostline.Session, 0, sessionCount)
+	for index := range sessionCount {
+		process := ghostline.ProcessSpec{Path: "sleep", Args: []string{"120"}}
+		if index == 0 {
+			process = ghostline.Shell("yes warren-history | head -c 65536; sleep 120")
+		}
+		session, err := client.Start(ctx, ghostline.SessionOptions{
+			Name:    fmt.Sprintf("warren-%03d", index),
+			Process: process,
+		})
+		if err != nil {
+			t.Fatalf("Start %d/%d: %v", index+1, sessionCount, err)
+		}
+		sessions = append(sessions, session)
+	}
+	active := sessions[0]
+	historyDeadline := time.Now().Add(5 * time.Second)
+	activeReplayBytes := 0
+	for {
+		checkpoint, err := active.Checkpoint(ctx)
+		if err != nil {
+			t.Fatalf("wait for active history: %v", err)
+		}
+		activeReplayBytes = len(checkpoint.Replay)
+		if activeReplayBytes >= 4<<10 {
+			break
+		}
+		if time.Now().After(historyDeadline) {
+			t.Fatalf("active replay = %d bytes, want at least 4 KiB", activeReplayBytes)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	beforeChurnGoroutines := runtime.NumGoroutine()
+	beforeChurnFDs, haveFDCount := openFileDescriptorCount()
+
+	attachLatency := make([]time.Duration, 0, churnRounds)
+	checkpointLatency := make([]time.Duration, 0, churnRounds)
+	outputOpenLatency := make([]time.Duration, 0, churnRounds)
+	detachLatency := make([]time.Duration, 0, churnRounds)
+	resizeLatency := make([]time.Duration, 0, churnRounds)
+	for round := range churnRounds {
+		started := time.Now()
+		checkpoint, err := active.Checkpoint(ctx)
+		if err != nil {
+			t.Fatalf("Checkpoint round %d: %v", round, err)
+		}
+		checkpointDone := time.Now()
+		reader, err := active.Output(ctx, checkpoint.Cursor)
+		if err != nil {
+			t.Fatalf("Output round %d: %v", round, err)
+		}
+		outputOpened := time.Now()
+		checkpointLatency = append(checkpointLatency, checkpointDone.Sub(started))
+		outputOpenLatency = append(outputOpenLatency, outputOpened.Sub(checkpointDone))
+		attachLatency = append(attachLatency, outputOpened.Sub(started))
+
+		columns := 80 + round%81
+		rows := 24 + round%25
+		started = time.Now()
+		if err := active.Resize(ctx, ghostline.Size{Columns: columns, Rows: rows}); err != nil {
+			_ = reader.Close()
+			t.Fatalf("Resize round %d: %v", round, err)
+		}
+		resizeLatency = append(resizeLatency, time.Since(started))
+
+		started = time.Now()
+		if err := reader.Close(); err != nil {
+			t.Fatalf("Close round %d: %v", round, err)
+		}
+		detachLatency = append(detachLatency, time.Since(started))
+	}
+
+	burstLatency := make([]time.Duration, 0, sessionCount*resizePasses)
+	var burstWall time.Duration
+	burstCount := 0
+	for pass := range resizePasses {
+		for first := 0; first < sessionCount; first += resizeWidth {
+			last := first + resizeWidth
+			if last > sessionCount {
+				last = sessionCount
+			}
+			results := make(chan time.Duration, last-first)
+			errs := make(chan error, last-first)
+			var wait sync.WaitGroup
+			started := time.Now()
+			for index := first; index < last; index++ {
+				session := sessions[index]
+				wait.Add(1)
+				go func(index int, session *ghostline.Session) {
+					defer wait.Done()
+					operationStarted := time.Now()
+					err := session.Resize(ctx, ghostline.Size{
+						Columns: 100 + (index+pass)%40,
+						Rows:    30 + (index+pass)%20,
+					})
+					results <- time.Since(operationStarted)
+					if err != nil {
+						errs <- err
+					}
+				}(index, session)
+			}
+			wait.Wait()
+			burstWall += time.Since(started)
+			burstCount++
+			close(results)
+			close(errs)
+			for err := range errs {
+				t.Fatalf("concurrent Resize pass %d batch %d: %v", pass, first/resizeWidth, err)
+			}
+			for latency := range results {
+				burstLatency = append(burstLatency, latency)
+			}
+		}
+	}
+	resourceDeadline := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > beforeChurnGoroutines+16 && time.Now().Before(resourceDeadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if delta := runtime.NumGoroutine() - beforeChurnGoroutines; delta > 16 {
+		t.Fatalf("goroutines after attach/detach churn = %+d, want at most +16", delta)
+	}
+	if haveFDCount {
+		for {
+			afterFDs, _ := openFileDescriptorCount()
+			if afterFDs <= beforeChurnFDs+16 || time.Now().After(resourceDeadline) {
+				if delta := afterFDs - beforeChurnFDs; delta > 16 {
+					t.Fatalf("file descriptors after attach/detach churn = %+d, want at most +16", delta)
+				}
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	t.Logf("attach checkpoint+output with %d-byte replay: %s", activeReplayBytes, formatLatencyPercentiles(attachLatency))
+	t.Logf("checkpoint phase: %s", formatLatencyPercentiles(checkpointLatency))
+	t.Logf("output-open phase: %s", formatLatencyPercentiles(outputOpenLatency))
+	t.Logf("resize active session: %s", formatLatencyPercentiles(resizeLatency))
+	t.Logf("detach close: %s", formatLatencyPercentiles(detachLatency))
+	t.Logf(
+		"resize across %d sessions in batches of %d: %s; mean batch wall=%s",
+		sessionCount,
+		resizeWidth,
+		formatLatencyPercentiles(burstLatency),
+		(burstWall / time.Duration(burstCount)).Round(time.Microsecond),
+	)
+}
+
+func TestDaemonHighTrafficAcrossHundredsOfPTYs(t *testing.T) {
+	requireScaleTest(t)
+	const (
+		sessionCount     = 256
+		outputPerSession = 256 << 10
+		inputWidth       = 32
+	)
+	_, client := startTestServerWithOptions(t, ghostline.Options{
+		OutputDir:            t.TempDir(),
+		VTScrollbackMaxBytes: 64 << 10,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	readers := make([]*ghostline.OutputReader, 0, sessionCount)
+	sessions := make([]*ghostline.Session, 0, sessionCount)
+	t.Cleanup(func() {
+		for _, reader := range readers {
+			_ = reader.Close()
+		}
+	})
+	for index := range sessionCount {
+		session, err := client.Start(ctx, ghostline.SessionOptions{
+			Name: fmt.Sprintf("traffic-%03d", index),
+			Process: ghostline.Shell(
+				"stty -echo -icanon min 1 time 0; " +
+					"printf R; " +
+					"dd bs=1 count=1 of=/dev/null 2>/dev/null; " +
+					"yes x | tr -d '\\n' | head -c 262144; " +
+					"sleep 120",
+			),
+		})
+		if err != nil {
+			t.Fatalf("Start %d/%d: %v", index+1, sessionCount, err)
+		}
+		reader, err := session.Output(ctx, ghostline.Cursor{})
+		if err != nil {
+			t.Fatalf("Output %d/%d: %v", index+1, sessionCount, err)
+		}
+		var ready [1]byte
+		if _, err := io.ReadFull(reader, ready[:]); err != nil || ready[0] != 'R' {
+			t.Fatalf("ready %d/%d = (%q, %v)", index+1, sessionCount, ready, err)
+		}
+		sessions = append(sessions, session)
+		readers = append(readers, reader)
+	}
+
+	deliveryLatency := make([]time.Duration, sessionCount)
+	deliveryErrors := make(chan error, sessionCount)
+	var deliveryWait sync.WaitGroup
+	released := time.Now()
+	for index, reader := range readers {
+		deliveryWait.Add(1)
+		go func(index int, reader *ghostline.OutputReader) {
+			defer deliveryWait.Done()
+			read, err := io.CopyN(io.Discard, reader, outputPerSession)
+			deliveryLatency[index] = time.Since(released)
+			if err != nil || read != outputPerSession {
+				deliveryErrors <- fmt.Errorf("session %d output = (%d, %v)", index, read, err)
+			}
+		}(index, reader)
+	}
+
+	inputLatency := make([]time.Duration, 0, sessionCount)
+	for first := 0; first < sessionCount; first += inputWidth {
+		last := first + inputWidth
+		if last > sessionCount {
+			last = sessionCount
+		}
+		results := make(chan time.Duration, last-first)
+		errs := make(chan error, last-first)
+		var inputWait sync.WaitGroup
+		for index := first; index < last; index++ {
+			inputWait.Add(1)
+			go func(session *ghostline.Session) {
+				defer inputWait.Done()
+				started := time.Now()
+				err := session.WriteInput(ctx, []byte{'x'})
+				results <- time.Since(started)
+				if err != nil {
+					errs <- err
+				}
+			}(sessions[index])
+		}
+		inputWait.Wait()
+		close(results)
+		close(errs)
+		for err := range errs {
+			t.Fatalf("release traffic process: %v", err)
+		}
+		for latency := range results {
+			inputLatency = append(inputLatency, latency)
+		}
+	}
+
+	deliveryWait.Wait()
+	close(deliveryErrors)
+	for err := range deliveryErrors {
+		t.Fatal(err)
+	}
+	maximumDelivery := time.Duration(0)
+	for _, latency := range deliveryLatency {
+		if latency > maximumDelivery {
+			maximumDelivery = latency
+		}
+	}
+	totalBytes := float64(sessionCount * outputPerSession)
+	throughputMiB := totalBytes / maximumDelivery.Seconds() / (1 << 20)
+	t.Logf("traffic trigger input: %s", formatLatencyPercentiles(inputLatency))
+	t.Logf(
+		"256-PTY output delivery: total=64 MiB aggregate=%.1f MiB/s %s",
+		throughputMiB,
+		formatLatencyPercentiles(deliveryLatency),
+	)
+}
+
+func openFileDescriptorCount() (int, bool) {
+	for _, path := range []string{"/proc/self/fd", "/dev/fd"} {
+		entries, err := os.ReadDir(path)
+		if err == nil {
+			return len(entries), true
+		}
+	}
+	return 0, false
+}
+
+func formatLatencyPercentiles(samples []time.Duration) string {
+	ordered := append([]time.Duration(nil), samples...)
+	sort.Slice(ordered, func(left, right int) bool { return ordered[left] < ordered[right] })
+	percentile := func(percent int) time.Duration {
+		index := (len(ordered)*percent + 99) / 100
+		if index > 0 {
+			index--
+		}
+		return ordered[index].Round(time.Microsecond)
+	}
+	return fmt.Sprintf(
+		"n=%d p50=%s p95=%s p99=%s max=%s",
+		len(ordered),
+		percentile(50),
+		percentile(95),
+		percentile(99),
+		ordered[len(ordered)-1].Round(time.Microsecond),
+	)
 }
 
 func TestClientWaitReturnsExitError(t *testing.T) {

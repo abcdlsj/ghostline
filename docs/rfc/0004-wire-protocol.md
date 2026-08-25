@@ -73,7 +73,9 @@ field.
 ## Capabilities and limits
 
 `version` returns the semantic version, a capability-name list, and
-`ProtocolLimits`. Current capabilities are:
+`ProtocolLimits`. It also returns `maxClientConnections`, the daemon's active
+client-socket limit. Each long-lived Output, Replay, or Checkpoint stream counts
+against that limit. Current capabilities are:
 
 - `raw-payload-v1`: exact-length raw payload framing is supported.
 - `pull-stream-v1`: stream open/read/close state machines below are supported.
