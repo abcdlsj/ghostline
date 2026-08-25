@@ -55,8 +55,9 @@ release gates, and accepted those changes.
 
 This document is the durable source of truth for the v1 rewrite. Read it before
 continuing work after a context reset. v1 is intentionally incompatible with
-all v0 APIs and protocols. Do not add compatibility shims or legacy migration
-bridges.
+all v0 public APIs and protocols. The only exception is the separately
+specified v0.8 admin handoff contract for Warren-coordinated daemon migration;
+do not add mixed-protocol public shims.
 
 ## Product boundary
 
@@ -71,7 +72,7 @@ the core session contract.
 
 ## Non-negotiable v1 rules
 
-- No v0 source or wire compatibility.
+- No v0 public API or wire compatibility; only the isolated v0.8 admin handoff.
 - No hidden I/O in methods that lack `context.Context` and an error result.
 - No network or storage failure may be converted into an empty result, false,
   zero time, or discarded error.
@@ -130,7 +131,8 @@ the core session contract.
   `Done` polling goroutines.
 - Split plain dialing from managed server bootstrap; managed behavior must be
   explicit in its constructor/name.
-- Bump the protocol directly to v1 and delete all pre-v1 compatibility bridges.
+- Bump the public protocol directly to v1 and keep any v0 handoff isolated in
+  the dedicated migration contract.
 - Preserve all-or-nothing same-version PTY and VT-state adoption.
 
 ### 4. VT and policy boundaries
@@ -252,7 +254,8 @@ container; retain the native Linux amd64 run as a remote CI gate.
 - [x] Core public contract implemented.
 - [x] Generational segmented output implemented.
 - [x] Streaming local and daemon output implemented.
-- [x] v0 protocol and API compatibility code removed.
+- [x] v0 protocol and API compatibility code removed from the public v1 path;
+      the isolated v0.8 handoff is implemented separately.
 - [x] Daemon/VT/policy boundaries implemented.
 - [x] CLI, example, README, package docs, and RFC updated.
 - [x] Unit, conformance, integration, fuzz, benchmark, race, and platform tests

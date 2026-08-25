@@ -228,7 +228,12 @@ func startAdminServerWithSnapshot(t *testing.T, socket string, meta sessionMeta,
 			}
 			switch request.Method {
 			case adminMethodList:
-				raw, _ := json.Marshal(adminListResult{Version: ProtocolVersion, Sessions: []sessionMeta{meta}})
+				list := adminListResult{Version: ProtocolVersion, Sessions: []sessionMeta{meta}}
+				if meta.SpoolPath != "" {
+					list.Version = v0CompatibilityProtocolVersion
+					list.HandoffVersion = V0HandoffProtocolVersion
+				}
+				raw, _ := json.Marshal(list)
 				_ = transport.write(adminResponse{ID: request.ID, Result: raw}, -1)
 			case adminMethodAdopt:
 				raw, _ := json.Marshal(meta)

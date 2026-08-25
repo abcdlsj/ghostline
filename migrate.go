@@ -32,6 +32,16 @@ const (
 	adminMaxFrame = 64 << 20
 )
 
+// V0HandoffProtocolVersion identifies the final v0 compatibility contract
+// accepted by the v1 migration consumer. It is separate from ProtocolVersion
+// so v1 never treats a v0 source as a native same-version daemon.
+const V0HandoffProtocolVersion = "ghostline-v0-to-v1-1"
+
+const (
+	v0CompatibilityProtocolVersion = "0.8.0"
+	v0SpoolFormat                  = "ghostline-v0-spool-1"
+)
+
 type adminRequest struct {
 	ID     int64           `json:"id"`
 	Method string          `json:"method"`
@@ -68,12 +78,16 @@ type sessionMeta struct {
 	VTScrollbackMaxBytes uint64    `json:"vtScrollbackMaxBytes,omitempty"`
 	OutputDirectory      string    `json:"outputDirectory"`
 	OutputGeneration     uint64    `json:"outputGeneration"`
+	SpoolPath            string    `json:"spoolPath,omitempty"`
+	SpoolSize            int64     `json:"spoolSize,omitempty"`
+	SpoolFormat          string    `json:"spoolFormat,omitempty"`
 	Exit                 *exitMeta `json:"exit,omitempty"`
 }
 
 type adminListResult struct {
-	Version  string        `json:"version"`
-	Sessions []sessionMeta `json:"sessions"`
+	Version        string        `json:"version"`
+	HandoffVersion string        `json:"handoffVersion,omitempty"`
+	Sessions       []sessionMeta `json:"sessions"`
 }
 
 type adminSnapshotResult struct {
@@ -407,7 +421,15 @@ func adoptSessions(ctx context.Context, adminSocket string, h *Hub) (int, error)
 	if err := client.call(ctx, adminMethodList, nil, &listed); err != nil {
 		return 0, err
 	}
-	if listed.Version != ProtocolVersion {
+	v0Handoff := false
+	switch listed.Version {
+	case ProtocolVersion:
+	case v0CompatibilityProtocolVersion:
+		if listed.HandoffVersion != V0HandoffProtocolVersion {
+			return 0, fmt.Errorf("rolling upgrade handoff %q is not %q", listed.HandoffVersion, V0HandoffProtocolVersion)
+		}
+		v0Handoff = true
+	default:
 		return 0, fmt.Errorf("rolling upgrade protocol %q is not %q", listed.Version, ProtocolVersion)
 	}
 	prepared := make([]*sessionState, 0, len(listed.Sessions))
@@ -454,18 +476,39 @@ func adoptSessions(ctx context.Context, adminSocket string, h *Hub) (int, error)
 			closeFileQuietly(master)
 			return 0, fmt.Errorf("decode snapshot for %s: %w", meta.Name, err)
 		}
-		state, err := adoptState(
-			adopted.Name,
-			master,
-			snapshot,
-			Size{Columns: adopted.Cols, Rows: adopted.Rows},
-			adopted.OutputDirectory,
-			adopted.OutputGeneration,
-			time.Unix(adopted.CreatedAt, 0),
-			adopted.PID,
-			adopted.Exit.error(),
-			resolveVTScrollbackMaxBytes(adopted.VTScrollbackMaxBytes, h.defaultVTScrollbackMaxBytes),
-		)
+		var state *sessionState
+		if v0Handoff {
+			if adopted.SpoolFormat != v0SpoolFormat || adopted.SpoolPath == "" {
+				closeFileQuietly(master)
+				return 0, fmt.Errorf("invalid v0 handoff metadata for %s", meta.Name)
+			}
+			state, err = adoptV0State(
+				ctx,
+				h.outputDir,
+				adopted.Name,
+				master,
+				snapshot,
+				Size{Columns: adopted.Cols, Rows: adopted.Rows},
+				adopted.SpoolPath,
+				time.Unix(adopted.CreatedAt, 0),
+				adopted.PID,
+				adopted.Exit.error(),
+				resolveVTScrollbackMaxBytes(adopted.VTScrollbackMaxBytes, h.defaultVTScrollbackMaxBytes),
+			)
+		} else {
+			state, err = adoptState(
+				adopted.Name,
+				master,
+				snapshot,
+				Size{Columns: adopted.Cols, Rows: adopted.Rows},
+				adopted.OutputDirectory,
+				adopted.OutputGeneration,
+				time.Unix(adopted.CreatedAt, 0),
+				adopted.PID,
+				adopted.Exit.error(),
+				resolveVTScrollbackMaxBytes(adopted.VTScrollbackMaxBytes, h.defaultVTScrollbackMaxBytes),
+			)
+		}
 		if err != nil {
 			return 0, fmt.Errorf("restore snapshot for %s: %w", meta.Name, err)
 		}

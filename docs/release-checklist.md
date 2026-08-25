@@ -1,8 +1,9 @@
 # ghostline v1.0 release checklist
 
 This checklist is the release gate for the first stable ghostline API. v1.0 is
-intentionally incompatible with all v0 source APIs, cursor formats, and wire
-methods. Do not add migration aliases to make this checklist pass.
+intentionally incompatible with all v0 source APIs, cursor formats, and public
+wire methods. The separate v0.8 admin handoff is not a public compatibility
+alias and must remain isolated from the v1 socket.
 
 ## Supported platform statement
 
@@ -23,8 +24,9 @@ crashes that lose PTY ownership, host reboot, or cross-machine migration.
 - [x] `go doc -all .` contains only the intended frozen v1 surface.
 - [x] README, package docs, all RFCs, and the v1 migration note agree on API,
       ownership, durability, cancellation, and platform limits.
-- [x] No v0 API or wire compatibility shim remains. Mentions of v0 are limited
-      to rejection tests and the explicit incompatibility documentation.
+- [x] No v0 API or public wire compatibility shim remains. The isolated v0.8
+      admin handoff and its fresh-generation replay contract are documented
+      and covered by migration tests.
 - [x] The minimux example uses only public v1 APIs.
 - [x] `git diff --check` is clean and generated release artifacts are absent
       from the worktree.
@@ -82,8 +84,8 @@ Ghostty/Zig toolchain produces a canonicalized symbol table.
       entries to pass.
 - [ ] Confirm both macOS architectures and both Linux architectures exercised
       CGo rather than the `ErrUnavailable` fallback.
-- [ ] Review release notes for the explicit v0 incompatibility and the exact
-      platform statement above.
+- [ ] Review release notes for the explicit v0 public incompatibility, the
+      v0.8 handoff requirement, and the exact platform statement above.
 - [ ] Create and push annotated tag `v1.0.0` only after every gate is green.
 - [ ] Verify a fresh consumer can resolve `github.com/abcdlsj/ghostline@v1.0.0`,
       compile the README local and daemon examples, and observe a non-empty

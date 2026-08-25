@@ -480,6 +480,23 @@ func (s *sessionState) finishMigration(ticket *migrationTicket, commit bool) err
 // server process. The child keeps running; only the owner of the master
 // changes. The emulator state is restored from the encoded snapshot.
 func adoptState(name string, master *os.File, snapshot []byte, size Size, outputDirectory string, outputGeneration uint64, createdAt time.Time, pid int, exit *ExitError, scrollbackMaxBytes uint64) (*sessionState, error) {
+	output, err := adoptOutputLog(outputDirectory, outputGeneration)
+	if err != nil {
+		closeFileQuietly(master)
+		return nil, err
+	}
+	state, err := adoptStateWithOutput(name, master, snapshot, size, output, createdAt, pid, exit, scrollbackMaxBytes)
+	if err != nil {
+		output.discard()
+	}
+	return state, err
+}
+
+// adoptStateWithOutput builds a session around an already prepared output
+// log. The v0 handoff uses this form after rebuilding a fresh v1 generation
+// from the source spool; native v1 adoption opens an existing log through
+// adoptState above.
+func adoptStateWithOutput(name string, master *os.File, snapshot []byte, size Size, output *outputLog, createdAt time.Time, pid int, exit *ExitError, scrollbackMaxBytes uint64) (*sessionState, error) {
 	vt, err := newVTTerminalWithOptions(size.Columns, size.Rows, vtTerminalOptions{
 		ScrollbackMaxBytes: scrollbackMaxBytes,
 	})
@@ -491,12 +508,6 @@ func adoptState(name string, master *os.File, snapshot []byte, size Size, output
 		vt.Close()
 		closeFileQuietly(master)
 		return nil, fmt.Errorf("restore vt state: %w", err)
-	}
-	output, err := adoptOutputLog(outputDirectory, outputGeneration)
-	if err != nil {
-		vt.Close()
-		closeFileQuietly(master)
-		return nil, err
 	}
 	var migrationWakeReader, migrationWakeWriter *os.File
 	if master != nil {

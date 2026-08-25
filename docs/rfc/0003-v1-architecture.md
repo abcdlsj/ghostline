@@ -86,6 +86,6 @@ history, not process persistence.
 ## Compatibility
 
 Protocol v1 begins at `1.0.0`. No v0 source API, wire method, cursor, output
-offset, or migration snapshot is accepted. This keeps validation local and
-prevents an untestable compatibility matrix from becoming part of the first
-stable contract.
+offset, or migration snapshot is accepted on the public v1 path. The isolated
+v0.8 admin handoff is a separate coordinator contract that rebuilds output
+generations and does not expand the v1 client compatibility matrix.

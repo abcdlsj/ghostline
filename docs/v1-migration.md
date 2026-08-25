@@ -1,8 +1,9 @@
 # Migrating to ghostline v1
 
-ghostline v1 is a clean break. Upgrade clients and daemon servers together.
-There is no source compatibility shim, wire negotiation with v0, spool-offset
-adapter, or rolling-upgrade bridge from a v0 daemon.
+ghostline v1 is a clean break for public clients and RPC methods. Upgrade
+clients and daemon servers together. The final v0.8 daemon has one separate
+admin-only handoff contract for Warren-coordinated upgrades; it is not a
+source compatibility shim or a mixed v0/v1 public socket.
 
 ## API replacements
 
@@ -39,13 +40,27 @@ reader goroutine and must stop it before creating a checkpoint:
 5. write `Checkpoint.Replay`;
 6. start reading raw output.
 
+## v0.8 daemon handoff
+
+Warren may first roll an older v0 daemon into the final v0.8 compatibility
+bridge, then start v1 from its admin socket on the next restart. v1 accepts
+only `handoffVersion == "ghostline-v0-to-v1-1"` with source protocol `0.8.0`.
+It replays the v0 archived and live spool files into a new generation-one v1
+output log, restores the VT snapshot, and creates fresh opaque v1 cursors.
+The v0 spool path, size, and format are migration metadata only; a v0 byte
+offset is never exposed as a v1 cursor.
+
+The bridge remains same-host and all-or-nothing. Warren owns discovery, socket
+switching, process startup, and source retirement. See
+[`v0-compat-bridge.md`](v0-compat-bridge.md).
+
 ## Deployment cutover
 
-A v0 daemon cannot be adopted by a v1 daemon. Stop accepting new v0 sessions,
-let existing sessions finish or terminate them deliberately, stop the v0
-server, and start v1 with a fresh socket and output root. Do not point v1 at
-old spool files and infer cursors from their sizes; a v1 cursor includes a
-generation and validation state that v0 never recorded.
+A pre-0.8 v0 daemon cannot be adopted directly by a v1 daemon. Normalize it to
+v0.8 first, or stop accepting new v0 sessions, let existing sessions finish or
+terminate them deliberately, and start v1 with a fresh socket and output root.
+Do not infer cursors from v0 spool sizes; the handoff always creates a new v1
+generation and validation state.
 
 Once every deployed component speaks `ProtocolVersion == "1.0.0"`, future
 same-version daemon replacements can use native rolling adoption.

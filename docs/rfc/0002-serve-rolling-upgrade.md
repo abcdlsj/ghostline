@@ -10,8 +10,11 @@ A new ghostline server may adopt every session from an old same-host server
 without disconnecting child processes. Adoption is native-state,
 all-or-nothing, and same-protocol only.
 
-There is no v0 migration bridge. A source whose advertised protocol is not
-exactly `ProtocolVersion` is rejected before any session is prepared.
+Native rolling adoption remains same-version only: a source whose advertised
+protocol is not exactly `ProtocolVersion` is rejected by that path before any
+session is prepared. The final v0.8 daemon has a separate, explicit
+`ghostline-v0-to-v1-1` handoff contract; it is documented in
+`docs/v0-compat-bridge.md` and never mixed into this native protocol.
 
 ## Scope
 

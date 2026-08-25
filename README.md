@@ -23,8 +23,10 @@ manager.
 - Same-version, all-or-nothing daemon upgrades that adopt live PTY file
   descriptors, VT state, and output generations.
 
-v1 is intentionally incompatible with every v0 API and wire protocol. See
-[the v1 migration note](docs/v1-migration.md).
+v1 is intentionally incompatible with every v0 public API and wire method.
+The final v0.x daemon exposes a separate, explicit handoff contract for
+Warren-coordinated upgrades; it is not a mixed-protocol compatibility mode.
+See [the v1 migration note](docs/v1-migration.md).
 
 ## Requirements and platform status
 
@@ -199,7 +201,10 @@ from an existing server's `<socket>.admin` endpoint. Both sides must advertise
 exactly `ProtocolVersion == "1.0.0"`; protocol mismatch is rejected before any
 session is prepared. A successful batch transfers native VT state, live PTY
 file descriptors, output directories, and the active generation. There is no
-v0 replay bridge.
+implicit v0 replay bridge in this native path. The final v0.8 compatibility
+daemon can be handed off separately through
+[`docs/v0-compat-bridge.md`](docs/v0-compat-bridge.md); that path rebuilds a
+fresh v1 output generation and never reuses a v0 byte offset as a cursor.
 
 See [RFC 0002](docs/rfc/0002-serve-rolling-upgrade.md) for ordering and failure
 semantics.

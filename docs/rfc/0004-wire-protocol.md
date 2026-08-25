@@ -23,8 +23,9 @@ Three versions are independent:
 - The VT snapshot format version is owned by the VT implementation and is not
   inferred from either RPC version.
 
-Changing one does not silently change the others. v1 has no v0 compatibility
-path.
+Changing one does not silently change the others. The v1 public socket has no
+v0 compatibility path. A separate admin-only v0.8 handoff contract is outside
+this wire protocol and is accepted only by the migration coordinator.
 
 ## Envelope and framing
 
