@@ -145,7 +145,11 @@ func (s *Server) handleAdmin(connection net.Conn) {
 			}
 			batchFrozen = true
 			states := s.hub.sessionStates()
-			result := adminListResult{Sessions: make([]sessionMeta, 0, len(states))}
+			result := adminListResult{
+				Version:        ProtocolVersion,
+				HandoffVersion: V1HandoffProtocolVersion,
+				Sessions:       make([]sessionMeta, 0, len(states)),
+			}
 			for _, state := range states {
 				result.Sessions = append(result.Sessions, sessionMetaOf(state))
 			}

@@ -32,6 +32,15 @@ const (
 	adminMaxFrame = 64 << 20
 )
 
+// V1HandoffProtocolVersion identifies the opt-in migration contract exposed
+// by the final v0.x bridge. It is deliberately separate from ProtocolVersion:
+// v0 clients continue to speak the unchanged public RPC, while a v1 server
+// can recognize the richer handoff metadata without mistaking this source for
+// a v1 daemon.
+const V1HandoffProtocolVersion = "ghostline-v0-to-v1-1"
+
+const v0SpoolFormat = "ghostline-v0-spool-1"
+
 type adminRequest struct {
 	ID     int64           `json:"id"`
 	Method string          `json:"method"`
@@ -66,11 +75,16 @@ type sessionMeta struct {
 	PID                  int       `json:"pid"`
 	Alive                bool      `json:"alive"`
 	VTScrollbackMaxBytes uint64    `json:"vtScrollbackMaxBytes,omitempty"`
+	SpoolPath            string    `json:"spoolPath,omitempty"`
+	SpoolSize            int64     `json:"spoolSize,omitempty"`
+	SpoolFormat          string    `json:"spoolFormat,omitempty"`
 	Exit                 *exitMeta `json:"exit,omitempty"`
 }
 
 type adminListResult struct {
-	Sessions []sessionMeta `json:"sessions"`
+	Version        string        `json:"version,omitempty"`
+	HandoffVersion string        `json:"handoffVersion,omitempty"`
+	Sessions       []sessionMeta `json:"sessions"`
 }
 
 type adminSnapshotResult struct {
@@ -301,6 +315,11 @@ func sessionMetaLocked(state *sessionState) sessionMeta {
 		PID:                  state.pid,
 		Alive:                true,
 		VTScrollbackMaxBytes: state.scrollbackMaxBytes,
+		SpoolPath:            state.path,
+		SpoolFormat:          v0SpoolFormat,
+	}
+	if info, err := state.spool.Stat(); err == nil {
+		meta.SpoolSize = info.Size()
 	}
 	select {
 	case <-state.done:

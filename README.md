@@ -20,6 +20,8 @@ terminal, or their own session protocol on top.
 - Detached-mode terminal query responses for TUIs
 - Rolling server upgrades that keep PTY children and emulator state alive,
   including a bounded spool-replay bridge for pre-0.6.0 sources
+- The final v0.x compatibility bridge (`ProtocolVersion == "0.8.0"`) publishes
+  an explicit `ghostline-v0-to-v1-1` handoff contract for a later v1 daemon
 - Local `Hub` and Unix-socket `Server`/`Client` with one `Session` API
 
 ## Requirements
@@ -143,6 +145,11 @@ Adoption is all-or-nothing:
 
 The embedding daemon coordinates the switch and retires the old process; see
 `docs/rfc/0002-serve-rolling-upgrade.md`.
+
+The v0.8 bridge keeps the legacy public RPC for existing clients while adding
+optional handoff metadata on the admin socket. Warren can first normalize an
+older daemon to v0.8 and later start v1 from that handoff endpoint. See
+[`docs/v0-compat-bridge.md`](docs/v0-compat-bridge.md).
 
 ### Server bootstrap
 
