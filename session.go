@@ -8,6 +8,8 @@ import (
 	"os"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Session is a concrete handle to one local or daemon-owned terminal session.
@@ -287,8 +289,23 @@ func (l *localSession) signal(ctx context.Context, signal syscall.Signal) error 
 	if l.state.pid <= 0 {
 		return os.ErrProcessDone
 	}
-	if err := syscall.Kill(-l.state.pid, signal); err != nil {
-		if errors.Is(err, syscall.ESRCH) {
+	// pty.StartWithSize creates a new session, but a shell or wrapper is free
+	// to change its process group before the session is signalled. Resolve the
+	// live group instead of assuming it is always equal to the original PID;
+	// that assumption is not stable across Unix runners and can break signals
+	// after PTY handoff on some Linux images.
+	pgid, err := unix.Getpgid(l.state.pid)
+	if err != nil {
+		if errors.Is(err, unix.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return fmt.Errorf("get session process group: %w", err)
+	}
+	if pgid <= 0 {
+		return os.ErrProcessDone
+	}
+	if err := unix.Kill(-pgid, signal); err != nil {
+		if errors.Is(err, unix.ESRCH) {
 			return os.ErrProcessDone
 		}
 		return fmt.Errorf("signal session process group: %w", err)

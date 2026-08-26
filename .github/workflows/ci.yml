@@ -11,12 +11,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # GitHub retired the macos-13 hosted image. Build and link with the
-          # 13.0 deployment target on the oldest available Intel image.
-          - runner: macos-14
+          # macos-14 now resolves to arm64. Use the current explicit Intel
+          # label so the two CGo jobs exercise distinct architectures.
+          - runner: macos-15-intel
             arch: x86_64
             fuzz: false
-          - runner: macos-14-arm64
+          - runner: macos-15
             arch: arm64
             fuzz: true
     runs-on: ${{ matrix.runner }}
