@@ -56,6 +56,20 @@ func waitReplay(t *testing.T, session *ghostline.Session, needle string) {
 	t.Fatalf("replay did not contain %q; got %q", needle, data)
 }
 
+func waitReplayPrompt(t *testing.T, session *ghostline.Session) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := session.Replay(context.Background())
+		if err == nil && (bytes.Contains(data, []byte("$ ")) || bytes.Contains(data, []byte("# "))) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	data, _ := session.Replay(context.Background())
+	t.Fatalf("replay did not contain a shell prompt; got %q", data)
+}
+
 func TestHubStartWritesOutputAndReplay(t *testing.T) {
 	hub := newHub(t, ghostline.Options{})
 	session, err := hub.Start(context.Background(), shellOptions("capture", t.TempDir(), "printf 'hello-hub\\r\\n'"))
@@ -151,7 +165,7 @@ func TestSessionOutputReadsFromCheckpointCursor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	waitReplay(t, session, "$")
+	waitReplayPrompt(t, session)
 	checkpoint, err := session.Checkpoint(context.Background())
 	if err != nil {
 		t.Fatalf("Checkpoint: %v", err)
