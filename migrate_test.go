@@ -497,6 +497,9 @@ func TestRollingAdoptKeepsChildRunning(t *testing.T) {
 	if err := adoptedSession.Signal(ctx, syscall.SIGCONT); err != nil {
 		t.Fatalf("Signal after migrate: %v", err)
 	}
+	if err := adoptedSession.WriteInput(ctx, []byte("\r")); err != nil {
+		t.Fatalf("wake after Signal: %v", err)
+	}
 	waitSessionOutput(t, adoptedSession, "migrated-signal")
 	readerCtx, cancelReader := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelReader()

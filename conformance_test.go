@@ -88,6 +88,12 @@ func assertSessionConformance(t *testing.T, store sessionStore) {
 	if err := session.Signal(ctx, syscall.SIGCONT); err != nil {
 		t.Fatalf("Signal: %v", err)
 	}
+	// dash defers trapped signals while blocked in its interactive read until
+	// another input byte wakes it; an empty line keeps this conformance check
+	// portable without changing the signal API's process-group semantics.
+	if err := session.WriteInput(ctx, []byte("\r")); err != nil {
+		t.Fatalf("wake after Signal: %v", err)
+	}
 	waitForReplay(t, session, "signal-received")
 	if err := session.WriteInput(ctx, []byte("printf 'before-checkpoint\\r\\n'\r")); err != nil {
 		t.Fatalf("WriteInput before checkpoint: %v", err)
