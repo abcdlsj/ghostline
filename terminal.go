@@ -464,7 +464,11 @@ func (v *vtTerminal) Snapshot() ([]byte, error) {
 	opts := C.GhosttyFormatterTerminalOptions{
 		size: C.size_t(unsafe.Sizeof(C.GhosttyFormatterTerminalOptions{})),
 		emit: C.GHOSTTY_FORMATTER_FORMAT_VT,
-		trim: true,
+		// Preserve trailing blank cells and their SGR attributes. Full-screen
+		// TUIs commonly paint composer backgrounds across otherwise empty rows;
+		// trimming those cells collapses the coloured block on recovery until a
+		// subsequent resize forces the application to repaint.
+		trim: false,
 	}
 	// The VT formatter describes screen content but not the final cursor
 	// position. Replaying a snapshot without CUP leaves the client's cursor
