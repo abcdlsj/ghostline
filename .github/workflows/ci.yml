@@ -79,7 +79,7 @@ jobs:
       - run: >-
           docker run --rm --platform "${{ matrix.platform }}"
           -v /tmp/ghostline.test:/ghostline.test:ro
-          --entrypoint /ghostline.test ubuntu:20.04
+          --entrypoint /ghostline.test ubuntu:22.04
       - run: go test -race ./...
         working-directory: examples/minimux
 
