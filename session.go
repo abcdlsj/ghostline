@@ -289,14 +289,21 @@ func (l *localSession) signal(ctx context.Context, signal syscall.Signal) error 
 	if l.state.pid <= 0 {
 		return os.ErrProcessDone
 	}
-	// pty.StartWithSize creates a new session, but a shell or wrapper is free
-	// to change its foreground process group before the session is signalled.
-	// Ask the controlling PTY for the live foreground group first; falling back
-	// to the child lookup keeps signaling usable if the PTY has already closed.
-	pgid, err := unix.IoctlGetInt(l.state.masterFD, unix.TIOCGPGRP)
-	if err != nil {
-		pgid, err = unix.Getpgid(l.state.pid)
+	// TIOCSIG asks the controlling PTY to deliver directly to its current
+	// foreground process group. This avoids assuming that the shell's PID is
+	// still the group leader after job control or a PTY handoff. Older Unix
+	// implementations may not provide the ioctl, so retain a process-group
+	// fallback for those targets.
+	if err := unix.IoctlSetInt(l.state.masterFD, unix.TIOCSIG, int(signal)); err == nil {
+		return nil
+	} else if !errors.Is(err, unix.ENOTTY) && !errors.Is(err, unix.EINVAL) {
+		if errors.Is(err, unix.ESRCH) || errors.Is(err, unix.EIO) {
+			return os.ErrProcessDone
+		}
+		return fmt.Errorf("signal PTY foreground process group: %w", err)
 	}
+
+	pgid, err := unix.Getpgid(l.state.pid)
 	if err != nil {
 		if errors.Is(err, unix.ESRCH) {
 			return os.ErrProcessDone
