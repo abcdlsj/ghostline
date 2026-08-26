@@ -290,11 +290,13 @@ func (l *localSession) signal(ctx context.Context, signal syscall.Signal) error 
 		return os.ErrProcessDone
 	}
 	// pty.StartWithSize creates a new session, but a shell or wrapper is free
-	// to change its process group before the session is signalled. Resolve the
-	// live group instead of assuming it is always equal to the original PID;
-	// that assumption is not stable across Unix runners and can break signals
-	// after PTY handoff on some Linux images.
-	pgid, err := unix.Getpgid(l.state.pid)
+	// to change its foreground process group before the session is signalled.
+	// Ask the controlling PTY for the live foreground group first; falling back
+	// to the child lookup keeps signaling usable if the PTY has already closed.
+	pgid, err := unix.IoctlGetInt(l.state.masterFD, unix.TIOCGPGRP)
+	if err != nil {
+		pgid, err = unix.Getpgid(l.state.pid)
+	}
 	if err != nil {
 		if errors.Is(err, unix.ESRCH) {
 			return os.ErrProcessDone
