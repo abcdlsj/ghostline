@@ -458,7 +458,7 @@ func TestRollingAdoptKeepsChildRunning(t *testing.T) {
 		t.Fatalf("Input before migrate: %v", err)
 	}
 	waitSessionOutput(t, session, "before-migrate")
-	if err := session.WriteInput(ctx, []byte("trap 'printf \"migrated-%s\\r\\n\" signal' USR1; printf 'migrated-%s\\r\\n' ready\r")); err != nil {
+	if err := session.WriteInput(ctx, []byte("trap 'printf \"migrated-%s\\r\\n\" signal' CONT; printf 'migrated-%s\\r\\n' ready\r")); err != nil {
 		t.Fatalf("install signal trap: %v", err)
 	}
 	waitSessionOutput(t, session, "migrated-ready")
@@ -494,7 +494,7 @@ func TestRollingAdoptKeepsChildRunning(t *testing.T) {
 	if !status.Alive {
 		t.Fatal("child died during migration")
 	}
-	if err := adoptedSession.Signal(ctx, syscall.SIGUSR1); err != nil {
+	if err := adoptedSession.Signal(ctx, syscall.SIGCONT); err != nil {
 		t.Fatalf("Signal after migrate: %v", err)
 	}
 	waitSessionOutput(t, adoptedSession, "migrated-signal")

@@ -81,11 +81,11 @@ func assertSessionConformance(t *testing.T, store sessionStore) {
 	if size, err := session.Size(ctx); err != nil || size != (ghostline.Size{Columns: 100, Rows: 30}) {
 		t.Fatalf("Size = (%+v, %v)", size, err)
 	}
-	if err := session.WriteInput(ctx, []byte("trap 'printf \"signal-%s\\r\\n\" received' USR1; printf 'signal-%s\\r\\n' ready\r")); err != nil {
+	if err := session.WriteInput(ctx, []byte("trap 'printf \"signal-%s\\r\\n\" received' CONT; printf 'signal-%s\\r\\n' ready\r")); err != nil {
 		t.Fatalf("install signal trap: %v", err)
 	}
 	waitForReplay(t, session, "signal-ready")
-	if err := session.Signal(ctx, syscall.SIGUSR1); err != nil {
+	if err := session.Signal(ctx, syscall.SIGCONT); err != nil {
 		t.Fatalf("Signal: %v", err)
 	}
 	waitForReplay(t, session, "signal-received")
@@ -131,7 +131,7 @@ func assertSessionConformance(t *testing.T, store sessionStore) {
 	if err != nil || status.Alive {
 		t.Fatalf("stopped Status = (%+v, %v)", status, err)
 	}
-	if err := session.Signal(ctx, syscall.SIGUSR1); !errors.Is(err, os.ErrProcessDone) {
+	if err := session.Signal(ctx, syscall.SIGCONT); !errors.Is(err, os.ErrProcessDone) {
 		t.Fatalf("Signal after stop = %v, want os.ErrProcessDone", err)
 	}
 	if err := session.Delete(ctx); err != nil {
