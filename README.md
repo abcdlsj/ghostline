@@ -41,7 +41,7 @@ supported because ghostline requires Unix PTYs, Unix sockets, file-descriptor
 transfer, and process-group signals.
 
 The bundled libraries are built from pinned Ghostty commit
-`5851d98615187d85052e41042bcf66e0ccec11d4`. See
+`88f57ee66eeaad4da77b414b245f7b6693348985`. See
 [the third-party artifact manifest](third_party/README.md) for build commands,
 targets, checksums, and license information.
 

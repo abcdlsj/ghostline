@@ -6,7 +6,7 @@ Current checkpoint (2026-08-25): all planned v1 mechanisms are implemented in
 the working tree. Platform packaging now uses a macOS universal static archive
 with a 13.0 deployment target and Linux glibc 2.31 static archives for amd64
 and arm64, all built from pinned Ghostty commit
-`5851d98615187d85052e41042bcf66e0ccec11d4` with Zig 0.16.0. The old macOS
+`88f57ee66eeaad4da77b414b245f7b6693348985` with Zig 0.16.0. The old macOS
 dylibs and absolute source-tree runtime path are removed. Local macOS arm64
 tests and race tests pass; a fresh deployment-target build reports
 `LC_BUILD_VERSION minos 13.0`, and the macOS amd64 CGo test binary
