@@ -89,6 +89,15 @@ func (s *Session) Checkpoint(ctx context.Context) (Checkpoint, error) {
 	return s.backend.checkpoint(ctx)
 }
 
+// AtomicState captures the terminal's complete emulator state and output
+// cursor at one synchronization boundary. Payload is an opaque, versioned VT
+// state envelope. Consumers must install it as one unit before applying raw
+// output beginning at Cursor; they must not interleave that output with state
+// installation.
+func (s *Session) AtomicState(ctx context.Context) (AtomicState, error) {
+	return s.backend.atomicState(ctx)
+}
+
 // Output streams raw PTY output beginning at from. The zero Cursor starts at
 // the earliest retained byte. The caller must close the returned reader.
 func (s *Session) Output(ctx context.Context, from Cursor) (*OutputReader, error) {
@@ -142,6 +151,7 @@ type sessionBackend interface {
 	resize(context.Context, Size) error
 	replay(context.Context) ([]byte, error)
 	checkpoint(context.Context) (Checkpoint, error)
+	atomicState(context.Context) (AtomicState, error)
 	output(context.Context, Cursor) (*OutputReader, error)
 	outputCursor(context.Context) (Cursor, error)
 	rotateOutput(context.Context) (Cursor, error)
@@ -183,6 +193,34 @@ type Checkpoint struct {
 	// Replay is a full VT replay of the visible grid and scrollback.
 	Replay []byte
 	// Cursor is the first raw output byte not covered by Replay.
+	Cursor Cursor
+}
+
+// AtomicStateFormat identifies the opaque payload encoding returned by
+// Session.AtomicState. The format is tied to ghostline's bundled VT
+// implementation and is deliberately separate from the RPC wire version.
+// Consumers must treat Payload as opaque and reject formats they do not
+// understand.
+const AtomicStateFormat = "ghostty-vt-snapshot-v1"
+
+// AtomicState is a complete terminal emulator state paired with the first raw
+// output byte not represented by that state. It is suitable for an atomic
+// reattach when the consumer can install the advertised Ghostty VT snapshot
+// format.
+//
+// Payload is not a VT replay stream. It is an opaque serialized state stream
+// whose interpretation is selected by Format. The v1 format is the native
+// Ghostty snapshot record stream and may contain scrollback, cursor, modes,
+// parser continuation state, READY, and FINISH records. The payload and cursor
+// are captured while the session output lock is held, so opening Output at
+// Cursor after installing Payload cannot duplicate or omit bytes at the
+// boundary.
+type AtomicState struct {
+	// Format identifies Payload's serialization format.
+	Format string
+	// Payload is the opaque serialized VT state.
+	Payload []byte
+	// Cursor is the first raw output byte not represented by Payload.
 	Cursor Cursor
 }
 
@@ -430,6 +468,30 @@ func (l *localSession) checkpoint(ctx context.Context) (Checkpoint, error) {
 		return Checkpoint{}, err
 	}
 	return Checkpoint{Replay: replay, Cursor: cursor}, nil
+}
+
+func (l *localSession) atomicState(ctx context.Context) (AtomicState, error) {
+	l.hub.lifecycleMu.RLock()
+	defer l.hub.lifecycleMu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return AtomicState{}, err
+	}
+	if !l.current() {
+		return AtomicState{}, ErrSessionClosed
+	}
+	l.state.operationMu.RLock()
+	defer l.state.operationMu.RUnlock()
+	l.state.outputMu.Lock()
+	defer l.state.outputMu.Unlock()
+	payload, err := l.state.vt.encodeAtomicState()
+	if err != nil {
+		return AtomicState{}, err
+	}
+	cursor, err := l.state.output.cursor()
+	if err != nil {
+		return AtomicState{}, err
+	}
+	return AtomicState{Format: AtomicStateFormat, Payload: payload, Cursor: cursor}, nil
 }
 
 func (l *localSession) output(ctx context.Context, from Cursor) (*OutputReader, error) {

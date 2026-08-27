@@ -80,6 +80,8 @@ against that limit. Current capabilities are:
 
 - `raw-payload-v1`: exact-length raw payload framing is supported.
 - `pull-stream-v1`: stream open/read/close state machines below are supported.
+- `atomic-state-v1`: the `state.atomic` blob method returns a complete opaque
+  VT state paired with an output cursor.
 
 Unknown capability names are ignored. A client MUST require the capabilities it
 needs and MUST honor the peer's advertised minimum limits; it MUST NOT assume a
@@ -94,8 +96,8 @@ JSON-only and clients reject an unexpected response payload.
 
 ## Pull-stream state machines
 
-Replay and Checkpoint use a blob stream; Output uses an output stream. Both
-follow the same states:
+Replay, Checkpoint, and Atomic State use a blob stream; Output uses an output
+stream. Both follow the same states:
 
 ```text
 Open -> Ready -> (Read <-> Ready) -> Ended
@@ -103,9 +105,12 @@ Open -> Ready -> (Read <-> Ready) -> Ended
                          +--> Closed <--+
 ```
 
-1. **Open**: the client sends `replay`, `checkpoint`, or `output`. The open
-   request has no payload. The server returns one JSON result (size/cursor for
-   blobs, initial cursor for output) and no payload.
+1. **Open**: the client sends `replay`, `checkpoint`, `state.atomic`, or
+   `output`. The open request has no payload. The server returns one JSON
+   result (size/cursor for blobs, initial cursor for output) and no payload.
+   The `state.atomic` result also includes `format`, which must equal the
+   advertised `AtomicStateFormat` (`ghostty-vt-snapshot-v1`) before the payload
+   is installed.
 2. **Ready**: the client sends `*.read` with `maxBytes` in `1..MaxChunkBytes`.
    The server returns JSON metadata and at most `maxBytes` raw bytes. A zero
    byte, non-EOF read is invalid progress and is surfaced as `io.ErrNoProgress`.
@@ -139,8 +144,17 @@ MUST NOT reinterpret malformed bytes as a valid subsequent frame.
 ## Compatibility and extension
 
 Adding optional JSON members, capability names, methods, or result members is
-forward-compatible only when an older peer can safely ignore them. Changing
-field meaning, framing, byte order, length semantics, stream ordering, or
-required capabilities requires a new wire version or semantic protocol
+forward-compatible only when an older peer can safely ignore them. The
+`state.atomic` method is an additive capability; clients must check
+`atomic-state-v1` before requiring it and must reject an unknown `format`.
+Changing field meaning, framing, byte order, length semantics, stream ordering,
+or required capabilities requires a new wire version or semantic protocol
 version. No method may smuggle a new binary encoding behind an existing
 `payloadBytes` field.
+
+The `state.atomic` payload uses the bundled VT snapshot record stream. Its
+`READY` marker follows the renderable state prefix and its `FINISH` marker
+terminates the history records. Consumers may use the VT decoder's incremental
+READY/next operations when they need to install the visible state before
+loading older scrollback; the output cursor remains paired with the complete
+state capture and must not be consumed until the renderable state is installed.

@@ -639,24 +639,58 @@ func (r *remoteSession) checkpoint(ctx context.Context) (Checkpoint, error) {
 	return Checkpoint{Replay: replay, Cursor: cursor}, nil
 }
 
-func (c *Client) readBlobRetryable(ctx context.Context, method string, params any) ([]byte, Cursor, error) {
-	data, cursor, err := c.readBlobOnce(ctx, method, params)
-	if err == nil || c.lifecycle == nil || !isTransportError(err) {
-		return data, cursor, err
+func (r *remoteSession) atomicState(ctx context.Context) (AtomicState, error) {
+	state, err := r.client.readAtomicStateRetryable(ctx, nameParams{Name: r.name})
+	if err != nil {
+		return AtomicState{}, err
 	}
-	if socketReady(c.socket) {
-		return nil, Cursor{}, err
-	}
-	if spawnErr := c.spawnAndWait(ctx); spawnErr != nil {
-		return nil, Cursor{}, fmt.Errorf("%v (recovery: %w)", err, spawnErr)
-	}
-	return c.readBlobOnce(ctx, method, params)
+	return state, nil
 }
 
-func (c *Client) readBlobOnce(ctx context.Context, method string, params any) ([]byte, Cursor, error) {
+type blobValue struct {
+	data   []byte
+	cursor Cursor
+	format string
+}
+
+func (c *Client) readAtomicStateRetryable(ctx context.Context, params any) (AtomicState, error) {
+	value, err := c.readBlobWithMetadataRetryable(ctx, rpcMethodAtomicState, params)
+	if err != nil {
+		return AtomicState{}, err
+	}
+	if value.format != AtomicStateFormat {
+		return AtomicState{}, fmt.Errorf("ghostline: unsupported atomic state format %q", value.format)
+	}
+	return AtomicState{
+		Format:  value.format,
+		Payload: value.data,
+		Cursor:  value.cursor,
+	}, nil
+}
+
+func (c *Client) readBlobRetryable(ctx context.Context, method string, params any) ([]byte, Cursor, error) {
+	value, err := c.readBlobWithMetadataRetryable(ctx, method, params)
+	return value.data, value.cursor, err
+}
+
+func (c *Client) readBlobWithMetadataRetryable(ctx context.Context, method string, params any) (blobValue, error) {
+	value, err := c.readBlobOnceWithMetadata(ctx, method, params)
+	if err == nil || c.lifecycle == nil || !isTransportError(err) {
+		return value, err
+	}
+	if socketReady(c.socket) {
+		return blobValue{}, err
+	}
+	if spawnErr := c.spawnAndWait(ctx); spawnErr != nil {
+		return blobValue{}, fmt.Errorf("%v (recovery: %w)", err, spawnErr)
+	}
+	return c.readBlobOnceWithMetadata(ctx, method, params)
+}
+
+func (c *Client) readBlobOnceWithMetadata(ctx context.Context, method string, params any) (blobValue, error) {
 	connection, err := dial(ctx, c.socket)
 	if err != nil {
-		return nil, Cursor{}, contextErr(ctx, fmt.Errorf("connect ghostline server: %w", err))
+		return blobValue{}, contextErr(ctx, fmt.Errorf("connect ghostline server: %w", err))
 	}
 	defer closeQuietly(connection)
 	done := make(chan struct{})
@@ -673,33 +707,33 @@ func (c *Client) readBlobOnce(ctx context.Context, method string, params any) ([
 	if params != nil {
 		req.Params, err = json.Marshal(params)
 		if err != nil {
-			return nil, Cursor{}, err
+			return blobValue{}, err
 		}
 	}
 	reader := bufio.NewReader(connection)
 	writer := bufio.NewWriter(connection)
 	if err := writeRequest(writer, req); err != nil {
-		return nil, Cursor{}, contextErr(ctx, err)
+		return blobValue{}, contextErr(ctx, err)
 	}
 	var resp response
 	if err := readResponse(reader, &resp); err != nil {
-		return nil, Cursor{}, contextErr(ctx, err)
+		return blobValue{}, contextErr(ctx, err)
 	}
 	if resp.ID != req.ID {
-		return nil, Cursor{}, errors.New("ghostline: mismatched blob-open response ID")
+		return blobValue{}, errors.New("ghostline: mismatched blob-open response ID")
 	}
 	if resp.Error != nil {
-		return nil, Cursor{}, contextErr(ctx, decodeRPCError(resp.Error))
+		return blobValue{}, contextErr(ctx, decodeRPCError(resp.Error))
 	}
 	if resp.PayloadBytes != 0 {
-		return nil, Cursor{}, errors.New("ghostline: unexpected blob-open payload")
+		return blobValue{}, errors.New("ghostline: unexpected blob-open payload")
 	}
 	var opened blobOpenResult
 	if err := json.Unmarshal(resp.Result, &opened); err != nil {
-		return nil, Cursor{}, err
+		return blobValue{}, err
 	}
 	if opened.Size < 0 {
-		return nil, Cursor{}, errors.New("ghostline: server returned invalid blob size")
+		return blobValue{}, errors.New("ghostline: server returned invalid blob size")
 	}
 	capacity := opened.Size
 	if capacity > maxRPCFrame {
@@ -709,43 +743,43 @@ func (c *Client) readBlobOnce(ctx context.Context, method string, params any) ([
 	for {
 		encoded, err := json.Marshal(chunkReadParams{MaxBytes: maxRPCChunk})
 		if err != nil {
-			return nil, Cursor{}, err
+			return blobValue{}, err
 		}
 		next := request{ID: 1, Method: rpcMethodBlobRead, Params: encoded}
 		if err := writeRequest(writer, next); err != nil {
-			return nil, Cursor{}, contextErr(ctx, err)
+			return blobValue{}, contextErr(ctx, err)
 		}
 		resp = response{}
 		if err := readResponse(reader, &resp); err != nil {
-			return nil, Cursor{}, contextErr(ctx, err)
+			return blobValue{}, contextErr(ctx, err)
 		}
 		if resp.ID != next.ID {
-			return nil, Cursor{}, errors.New("ghostline: mismatched blob response ID")
+			return blobValue{}, errors.New("ghostline: mismatched blob response ID")
 		}
 		if resp.Error != nil {
-			return nil, Cursor{}, contextErr(ctx, decodeRPCError(resp.Error))
+			return blobValue{}, contextErr(ctx, decodeRPCError(resp.Error))
 		}
 		var chunk blobReadResult
 		if err := json.Unmarshal(resp.Result, &chunk); err != nil {
-			return nil, Cursor{}, err
+			return blobValue{}, err
 		}
 		chunkBytes := resp.PayloadBytes
 		if chunkBytes > maxRPCChunk || len(data) > opened.Size-chunkBytes {
-			return nil, Cursor{}, errors.New("ghostline: server returned invalid blob chunk")
+			return blobValue{}, errors.New("ghostline: server returned invalid blob chunk")
 		}
 		start := len(data)
 		data = append(data, make([]byte, chunkBytes)...)
 		if _, err := io.ReadFull(reader, data[start:]); err != nil {
-			return nil, Cursor{}, contextErr(ctx, err)
+			return blobValue{}, contextErr(ctx, err)
 		}
 		if chunk.EOF {
 			if len(data) != opened.Size {
-				return nil, Cursor{}, errors.New("ghostline: server returned incomplete blob")
+				return blobValue{}, errors.New("ghostline: server returned incomplete blob")
 			}
-			return data, opened.Cursor, nil
+			return blobValue{data: data, cursor: opened.Cursor, format: opened.Format}, nil
 		}
 		if chunkBytes == 0 {
-			return nil, Cursor{}, io.ErrNoProgress
+			return blobValue{}, io.ErrNoProgress
 		}
 	}
 }

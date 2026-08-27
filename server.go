@@ -450,7 +450,7 @@ func (s *Server) handle(connection net.Conn) {
 			s.serveOutput(connection, reader, writer, req)
 			return
 		}
-		if req.Method == rpcMethodReplay || req.Method == rpcMethodCheckpoint {
+		if req.Method == rpcMethodReplay || req.Method == rpcMethodCheckpoint || req.Method == rpcMethodAtomicState {
 			if len(req.payload) != 0 {
 				_ = writeResponse(writer, req.ID, nil, errors.New("blob open request cannot contain a payload"))
 				return
@@ -488,6 +488,12 @@ func (s *Server) serveBlob(connection net.Conn, wireReader *bufio.Reader, writer
 			checkpoint, err = session.Checkpoint(ctx)
 			data = checkpoint.Replay
 			opened.Cursor = checkpoint.Cursor
+		case rpcMethodAtomicState:
+			var state AtomicState
+			state, err = session.AtomicState(ctx)
+			data = state.Payload
+			opened.Cursor = state.Cursor
+			opened.Format = state.Format
 		}
 	}
 	close(stop)

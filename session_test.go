@@ -124,6 +124,37 @@ func TestSessionCheckpointMatchesOutputBoundary(t *testing.T) {
 	}
 }
 
+func TestSessionAtomicStateReturnsOpaqueVTStateAndCursor(t *testing.T) {
+	hub := newHub(t, ghostline.Options{})
+	session, err := hub.Start(context.Background(), ghostline.SessionOptions{
+		Name:    "atomic-state",
+		Process: ghostline.ProcessSpec{Path: "sh", Directory: t.TempDir()},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := session.WriteInput(context.Background(), []byte("printf 'atomic-state-output\\r\\n'\r")); err != nil {
+		t.Fatalf("Input: %v", err)
+	}
+	waitForReplay(t, session, "atomic-state-output")
+	state, err := session.AtomicState(context.Background())
+	if err != nil {
+		t.Fatalf("AtomicState: %v", err)
+	}
+	if state.Format != ghostline.AtomicStateFormat {
+		t.Fatalf("AtomicState format = %q, want %q", state.Format, ghostline.AtomicStateFormat)
+	}
+	if len(state.Payload) == 0 {
+		t.Fatal("AtomicState returned an empty payload")
+	}
+	if state.Cursor.String() == "" {
+		t.Fatal("AtomicState returned a zero cursor")
+	}
+	if !bytes.HasPrefix(state.Payload, []byte("GHOSTSNP")) {
+		t.Fatalf("AtomicState payload does not start with the Ghostty snapshot magic: %q", state.Payload[:min(len(state.Payload), 16)])
+	}
+}
+
 func TestSessionWaitCancellationDoesNotTerminateChild(t *testing.T) {
 	hub := newHub(t, ghostline.Options{})
 	session, err := hub.Start(context.Background(), ghostline.SessionOptions{

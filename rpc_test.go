@@ -87,6 +87,25 @@ func TestRawResponseEnvelopeRoundTrip(t *testing.T) {
 	}
 }
 
+func TestAtomicStateBlobOpenResultCarriesFormat(t *testing.T) {
+	want := blobOpenResult{
+		Size:   123,
+		Cursor: Cursor{generation: 4, offset: 96},
+		Format: AtomicStateFormat,
+	}
+	encoded, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("marshal blob result: %v", err)
+	}
+	var got blobOpenResult
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatalf("unmarshal blob result: %v", err)
+	}
+	if got.Size != want.Size || got.Cursor != want.Cursor || got.Format != want.Format {
+		t.Fatalf("blob result = %+v, want %+v", got, want)
+	}
+}
+
 func TestResponseEnvelopeRejectsUnsupportedWire(t *testing.T) {
 	var resp response
 	err := readResponse(bufio.NewReader(bytes.NewBufferString(`{"wire":2,"id":1}`+"\n")), &resp)

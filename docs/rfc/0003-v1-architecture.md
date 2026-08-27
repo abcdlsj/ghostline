@@ -42,8 +42,10 @@ Raw output is an ordered, generational log. `OutputReader` supplies pull-based
 backpressure and a cursor for its next unread byte. Cursors are opaque because
 generation layout and retention are runtime concerns.
 
-`Replay` represents rendered terminal state. `Checkpoint` is the only API that
-atomically relates rendered state to raw output position.
+`Replay` represents rendered terminal state. `Checkpoint` atomically relates a
+rendered replay to raw output position. `AtomicState` provides the same
+boundary for a complete opaque VT emulator state when the consumer supports
+`AtomicStateFormat`.
 
 ## Ownership and concurrency
 

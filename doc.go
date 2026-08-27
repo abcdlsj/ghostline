@@ -9,7 +9,9 @@
 // Raw PTY output is stored in immutable generations plus one active segment.
 // Output returns a bounded reader positioned by an opaque Cursor. Checkpoint
 // atomically pairs a terminal replay with the cursor of the first raw byte not
-// represented by that replay. Callers own reader cancellation, goroutines,
+// represented by that replay. AtomicState provides the same boundary for a
+// complete, versioned VT emulator state when the consumer can install the
+// advertised opaque format. Callers own reader cancellation, goroutines,
 // archive format, and retention policy.
 //
 // Sessions survive client detach and successful same-version daemon adoption.

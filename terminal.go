@@ -82,7 +82,7 @@ import (
 const snapshotContinuationMaxBytes = 1 << 20
 
 const (
-	vtStateMagic      = "ghostline-vt-v1\x00"
+	vtStateMagic      = AtomicStateFormat + "\x00"
 	vtStateHeaderSize = len(vtStateMagic) + 8 + sha256.Size
 )
 
@@ -360,6 +360,27 @@ func (v *vtTerminal) EncodeState() ([]byte, error) {
 	if v.terminal == nil {
 		return nil, fmt.Errorf("ghostty terminal is closed")
 	}
+	snapshot, err := v.encodeStateWithRepairLocked()
+	if err != nil {
+		return nil, err
+	}
+	return wrapVTState(snapshot), nil
+}
+
+// encodeAtomicState returns the native Ghostty snapshot without the
+// ghostline migration envelope. It is used by Session.AtomicState so a
+// compatible consumer can pass the payload directly to the Ghostty snapshot
+// decoder and stop at READY before loading history through FINISH.
+func (v *vtTerminal) encodeAtomicState() ([]byte, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.terminal == nil {
+		return nil, fmt.Errorf("ghostty terminal is closed")
+	}
+	return v.encodeStateWithRepairLocked()
+}
+
+func (v *vtTerminal) encodeStateWithRepairLocked() ([]byte, error) {
 	// Repair an already-resized active screen as a fallback for terminals
 	// created by an older Ghostty build.
 	var currentCols C.uint16_t
@@ -383,7 +404,7 @@ func (v *vtTerminal) EncodeState() ([]byte, error) {
 	if result != C.GHOSTTY_SUCCESS {
 		return nil, fmt.Errorf("ghostty snapshot encode failed: %d", result)
 	}
-	return wrapVTState(snapshot), nil
+	return snapshot, nil
 }
 
 func (v *vtTerminal) RestoreState(snapshot []byte) error {

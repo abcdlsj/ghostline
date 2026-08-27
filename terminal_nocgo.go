@@ -30,6 +30,11 @@ func (*vtTerminal) EncodeState() ([]byte, error) {
 	return nil, fmt.Errorf("%w: libghostty-vt is unavailable for this build", ErrUnavailable)
 }
 
+// encodeAtomicState reports that libghostty-vt is unavailable in this build.
+func (*vtTerminal) encodeAtomicState() ([]byte, error) {
+	return nil, fmt.Errorf("%w: libghostty-vt is unavailable for this build", ErrUnavailable)
+}
+
 // RestoreState reports that libghostty-vt is unavailable in this build.
 func (*vtTerminal) RestoreState([]byte) error {
 	return fmt.Errorf("%w: libghostty-vt is unavailable for this build", ErrUnavailable)

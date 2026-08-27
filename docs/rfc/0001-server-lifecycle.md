@@ -52,8 +52,8 @@ winner and does not claim process ownership.
 Managed clients may bootstrap and retry once after a socket transport failure
 for operations that are safe to repeat:
 
-- `Check`, version queries, `Get`, `List`, `Status`, `Metadata`, `Replay`, and
-  `Checkpoint`;
+- `Check`, version queries, `Get`, `List`, `Status`, `Metadata`, `Replay`,
+  `Checkpoint`, and `AtomicState`;
 - `Start`, because unique session names make duplicate creation observable as
   `ErrSessionExists`.
 

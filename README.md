@@ -20,6 +20,8 @@ manager.
 - Bounded `OutputReader` streams with cancellation and natural backpressure.
 - Atomic checkpoints that pair a VT replay with the first raw output byte not
   represented by that replay.
+- Atomic VT state captures that pair a complete opaque emulator state with the
+  first raw output byte not represented by that state.
 - Same-version, all-or-nothing daemon upgrades that adopt live PTY file
   descriptors, VT state, and output generations.
 
@@ -47,9 +49,9 @@ targets, checksums, and license information.
 
 For high-density daemon use, set a realistic `VTScrollbackMaxBytes` budget and
 an explicit `ServerMaxClientConnections` limit. The default connection limit is
-1,024. Each live Output, Replay, or Checkpoint stream holds one server socket
-connection; the daemon is not a multiplexed stream transport. Clients can read
-the configured limit from `Client.VersionInfo`.
+1,024. Each live Output, Replay, Checkpoint, or AtomicState stream holds one
+server socket connection; the daemon is not a multiplexed stream transport.
+Clients can read the configured limit from `Client.VersionInfo`.
 
 ## Local sessions
 
@@ -114,6 +116,31 @@ For a lossless window switch or client reattach:
 The checkpoint lock orders the VT replay and cursor atomically. Starting the
 new reader only after writing the replay prevents raw bytes from appearing
 before the reconstructed screen.
+
+When the destination can install ghostline's bundled VT state format, use
+`AtomicState` to avoid replaying the entire screen as input:
+
+```go
+state, err := session.AtomicState(ctx)
+if err != nil {
+	return err
+}
+if state.Format != ghostline.AtomicStateFormat {
+	return fmt.Errorf("unsupported terminal state format %q", state.Format)
+}
+// Install state.Payload as one opaque unit, then open Output at state.Cursor.
+output, err := session.Output(ctx, state.Cursor)
+```
+
+`AtomicState` is not a VT byte replay. Its payload is the raw `GHOSTSNP`
+CRC-protected binary snapshot record stream that includes emulator details such
+as scrollback, cursor, modes, and parser continuation state. The `READY` record
+terminates a renderable prefix; older history pages follow it and `FINISH`
+terminates the complete snapshot. A compatible consumer may decode `READY`
+first and prepend history pages incrementally, or decode the complete payload
+in one operation.
+The payload and cursor are captured under one session boundary; consumers must
+install the renderable state before consuming output from the returned cursor.
 
 ## Output retention
 

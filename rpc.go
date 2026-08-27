@@ -37,9 +37,12 @@ const (
 	CapabilityRawPayload = "raw-payload-v1"
 	// CapabilityStreams indicates support for the v1 pull-stream state machine.
 	CapabilityStreams = "pull-stream-v1"
+	// CapabilityAtomicState indicates support for the atomic native VT state
+	// stream. Its payload format is advertised separately by blob open results.
+	CapabilityAtomicState = "atomic-state-v1"
 )
 
-var protocolCapabilities = []string{CapabilityRawPayload, CapabilityStreams}
+var protocolCapabilities = []string{CapabilityRawPayload, CapabilityStreams, CapabilityAtomicState}
 
 const (
 	rpcMethodCreate       = "create"
@@ -56,6 +59,7 @@ const (
 	rpcMethodResize       = "resize"
 	rpcMethodReplay       = "replay"
 	rpcMethodCheckpoint   = "checkpoint"
+	rpcMethodAtomicState  = "state.atomic"
 	rpcMethodOutput       = "output"
 	rpcMethodOutputCursor = "output.cursor"
 	rpcMethodOutputRead   = "output.read"
@@ -115,6 +119,7 @@ type outputReadResult struct {
 type blobOpenResult struct {
 	Size   int    `json:"size"`
 	Cursor Cursor `json:"cursor,omitempty"`
+	Format string `json:"format,omitempty"`
 }
 
 type blobReadResult struct {

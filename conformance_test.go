@@ -110,6 +110,13 @@ func assertSessionConformance(t *testing.T, store sessionStore) {
 	if !bytes.Contains(checkpoint.Replay, []byte("before-checkpoint")) || checkpoint.Cursor == (ghostline.Cursor{}) {
 		t.Fatalf("Checkpoint = replay %d bytes, cursor %q", len(checkpoint.Replay), checkpoint.Cursor)
 	}
+	atomicState, err := session.AtomicState(ctx)
+	if err != nil {
+		t.Fatalf("AtomicState: %v", err)
+	}
+	if atomicState.Format != ghostline.AtomicStateFormat || len(atomicState.Payload) == 0 || atomicState.Cursor == (ghostline.Cursor{}) {
+		t.Fatalf("AtomicState = format %q, payload %d bytes, cursor %q", atomicState.Format, len(atomicState.Payload), atomicState.Cursor)
+	}
 	reader, err := session.Output(ctx, checkpoint.Cursor)
 	if err != nil {
 		t.Fatalf("Output: %v", err)

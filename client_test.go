@@ -221,7 +221,7 @@ func TestClientVersionInfoReportsProtocolAndTag(t *testing.T) {
 	for _, capability := range info.Capabilities {
 		capabilities[capability] = true
 	}
-	if !capabilities[ghostline.CapabilityRawPayload] || !capabilities[ghostline.CapabilityStreams] {
+	if !capabilities[ghostline.CapabilityRawPayload] || !capabilities[ghostline.CapabilityStreams] || !capabilities[ghostline.CapabilityAtomicState] {
 		t.Fatalf("VersionInfo capabilities = %v", info.Capabilities)
 	}
 	if info.Limits.MaxHeaderBytes <= 0 || info.Limits.MaxPayloadBytes <= 0 || info.Limits.MaxChunkBytes <= 0 ||
@@ -230,6 +230,36 @@ func TestClientVersionInfoReportsProtocolAndTag(t *testing.T) {
 	}
 	if info.MaxClientConnections != ghostline.DefaultServerMaxClientConnections {
 		t.Fatalf("VersionInfo max client connections = %d, want %d", info.MaxClientConnections, ghostline.DefaultServerMaxClientConnections)
+	}
+}
+
+func TestClientAtomicStateStreamsOpaqueVTStateAndCursor(t *testing.T) {
+	_, client := startTestServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := client.Start(ctx, ghostline.SessionOptions{
+		Name:    "remote-atomic-state",
+		Process: ghostline.ProcessSpec{Path: "sh", Directory: t.TempDir()},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := session.WriteInput(ctx, []byte("printf 'remote-atomic-state-output\\r\\n'\r")); err != nil {
+		t.Fatalf("Input: %v", err)
+	}
+	waitRemoteReplay(t, session, "remote-atomic-state-output")
+	state, err := session.AtomicState(ctx)
+	if err != nil {
+		t.Fatalf("AtomicState: %v", err)
+	}
+	if state.Format != ghostline.AtomicStateFormat {
+		t.Fatalf("AtomicState format = %q, want %q", state.Format, ghostline.AtomicStateFormat)
+	}
+	if len(state.Payload) == 0 || state.Cursor == (ghostline.Cursor{}) {
+		t.Fatalf("AtomicState = payload %d bytes, cursor %q", len(state.Payload), state.Cursor)
+	}
+	if !bytes.HasPrefix(state.Payload, []byte("GHOSTSNP")) {
+		t.Fatalf("AtomicState payload does not start with the Ghostty snapshot magic: %q", state.Payload[:min(len(state.Payload), 16)])
 	}
 }
 
