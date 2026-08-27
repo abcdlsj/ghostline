@@ -95,6 +95,27 @@ func TestEncodeStateSupportsUnfinishedContinuation(t *testing.T) {
 	}
 }
 
+func TestEncodeStateKeepsMigrationEnvelopeStable(t *testing.T) {
+	vt := newTestVTTerminal(t, vtTerminalOptions{})
+	defer vt.Close()
+	vt.Feed([]byte("migration-state"))
+
+	encoded, err := vt.EncodeState()
+	if err != nil {
+		t.Fatalf("EncodeState: %v", err)
+	}
+	if !bytes.HasPrefix(encoded, []byte("ghostline-vt-v1\x00")) {
+		t.Fatalf("EncodeState migration envelope changed: %q", encoded[:min(len(encoded), 24)])
+	}
+	atomic, err := vt.encodeAtomicState()
+	if err != nil {
+		t.Fatalf("encodeAtomicState: %v", err)
+	}
+	if !bytes.HasPrefix(atomic, []byte("GHOSTSNP")) {
+		t.Fatalf("atomic state is not a native Ghostty snapshot: %q", atomic[:min(len(atomic), 16)])
+	}
+}
+
 func TestVTTerminalResizeKeepsSnapshotEncodableAfterWideBoundary(t *testing.T) {
 	vt := newTestVTTerminalSize(t, 138, 42, vtTerminalOptions{})
 	defer vt.Close()

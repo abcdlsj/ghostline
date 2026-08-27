@@ -82,7 +82,9 @@ import (
 const snapshotContinuationMaxBytes = 1 << 20
 
 const (
-	vtStateMagic      = AtomicStateFormat + "\x00"
+	// Keep the migration envelope stable. AtomicState returns the native
+	// GHOSTSNP stream directly and advertises its format separately.
+	vtStateMagic      = "ghostline-vt-v1\x00"
 	vtStateHeaderSize = len(vtStateMagic) + 8 + sha256.Size
 )
 
