@@ -383,8 +383,13 @@ func cancelAdminOnContext(ctx context.Context, connection *net.UnixConn) func() 
 
 // adoptSessions migrates every source session into h as one transaction.
 func adoptSessions(ctx context.Context, adminSocket string, h *Hub) (int, error) {
+	n, _, err := adoptSessionsWithReport(ctx, adminSocket, h)
+	return n, err
+}
+
+func adoptSessionsWithReport(ctx context.Context, adminSocket string, h *Hub) (int, map[string]string, error) {
 	if h == nil {
-		return 0, errors.New("adopt target hub is nil")
+		return 0, nil, errors.New("adopt target hub is nil")
 	}
 
 	// A target hub is a destination, not a merge point. Holding this write
@@ -394,20 +399,20 @@ func adoptSessions(ctx context.Context, adminSocket string, h *Hub) (int, error)
 	h.mu.Lock()
 	if h.closed {
 		h.mu.Unlock()
-		return 0, ErrClosed
+		return 0, nil, ErrClosed
 	}
 	if len(h.sessions) != 0 || len(h.pending) != 0 {
 		h.mu.Unlock()
-		return 0, errors.New("adopt target hub is not empty")
+		return 0, nil, errors.New("adopt target hub is not empty")
 	}
 	h.mu.Unlock()
 	if err := os.MkdirAll(h.outputDir, 0o700); err != nil {
-		return 0, fmt.Errorf("create output dir: %w", err)
+		return 0, nil, fmt.Errorf("create output dir: %w", err)
 	}
 
 	connection, err := dialAdmin(ctx, adminSocket)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	stopContextWatcher := cancelAdminOnContext(ctx, connection)
 	defer stopContextWatcher()
@@ -419,18 +424,18 @@ func adoptSessions(ctx context.Context, adminSocket string, h *Hub) (int, error)
 
 	var listed adminListResult
 	if err := client.call(ctx, adminMethodList, nil, &listed); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	v0Handoff := false
 	switch listed.Version {
 	case ProtocolVersion:
 	case v0CompatibilityProtocolVersion:
 		if listed.HandoffVersion != V0HandoffProtocolVersion {
-			return 0, fmt.Errorf("rolling upgrade handoff %q is not %q", listed.HandoffVersion, V0HandoffProtocolVersion)
+			return 0, nil, fmt.Errorf("rolling upgrade handoff %q is not %q", listed.HandoffVersion, V0HandoffProtocolVersion)
 		}
 		v0Handoff = true
 	default:
-		return 0, fmt.Errorf("rolling upgrade protocol %q is not %q", listed.Version, ProtocolVersion)
+		return 0, nil, fmt.Errorf("rolling upgrade protocol %q is not %q", listed.Version, ProtocolVersion)
 	}
 	prepared := make([]*sessionState, 0, len(listed.Sessions))
 	preparedNames := make([]string, 0, len(listed.Sessions))
@@ -448,21 +453,29 @@ func adoptSessions(ctx context.Context, adminSocket string, h *Hub) (int, error)
 	}
 	defer abort()
 
+	skipped := make(map[string]string)
+	abortSingle := func(name string) {
+		abortCtx, cancel := context.WithTimeout(context.Background(), adminTimeout)
+		_ = client.call(abortCtx, adminMethodAbort, adminBatchParams{Names: []string{name}}, nil)
+		cancel()
+	}
 	for _, meta := range listed.Sessions {
 		var adopted sessionMeta
 		// The process may exit between list and adopt. Ask for the response
 		// first, then decide whether that response should carry an fd from its
 		// own Alive bit rather than trusting the initial list snapshot.
 		if err := client.call(ctx, adminMethodAdopt, adoptParams{Name: meta.Name}, &adopted); err != nil {
-			return 0, err
+			skipped[meta.Name] = fmt.Sprintf("adopt %s: %v", meta.Name, err)
+			continue
 		}
-		preparedNames = append(preparedNames, meta.Name)
 
 		var master *os.File
 		if adopted.Alive {
 			masterFD, err := transport.takeFD()
 			if err != nil {
-				return 0, err
+				skipped[meta.Name] = fmt.Sprintf("take fd %s: %v", meta.Name, err)
+				abortSingle(meta.Name)
+				continue
 			}
 			master = os.NewFile(uintptr(masterFD), "adopted-master")
 		}
@@ -470,7 +483,9 @@ func adoptSessions(ctx context.Context, adminSocket string, h *Hub) (int, error)
 		if v0Handoff {
 			if adopted.SpoolFormat != v0SpoolFormat || adopted.SpoolPath == "" {
 				closeFileQuietly(master)
-				return 0, fmt.Errorf("invalid v0 handoff metadata for %s", meta.Name)
+				skipped[meta.Name] = fmt.Sprintf("invalid v0 handoff metadata for %s", meta.Name)
+				abortSingle(meta.Name)
+				continue
 			}
 			state, err = adoptV0State(
 				ctx,
@@ -484,16 +499,27 @@ func adoptSessions(ctx context.Context, adminSocket string, h *Hub) (int, error)
 				adopted.Exit.error(),
 				resolveVTScrollbackMaxBytes(adopted.VTScrollbackMaxBytes, h.defaultVTScrollbackMaxBytes),
 			)
+			if err != nil {
+				closeFileQuietly(master)
+				skipped[meta.Name] = fmt.Sprintf("restore v0 %s: %v", meta.Name, err)
+				abortSingle(meta.Name)
+				continue
+			}
 		} else {
 			var snapshotResult adminSnapshotResult
 			if err := client.call(ctx, adminMethodSnapshot, adoptParams{Name: adopted.Name}, &snapshotResult); err != nil {
 				closeFileQuietly(master)
-				return 0, fmt.Errorf("encode snapshot for %s: %w", meta.Name, err)
+				skipped[meta.Name] = fmt.Sprintf("encode snapshot for %s: %v", meta.Name, err)
+				// Snapshot encode failure already aborted on server; best-effort abort for safety.
+				abortSingle(adopted.Name)
+				continue
 			}
 			snapshot, decodeErr := base64.StdEncoding.DecodeString(snapshotResult.Snapshot)
 			if decodeErr != nil {
 				closeFileQuietly(master)
-				return 0, fmt.Errorf("decode snapshot for %s: %w", meta.Name, decodeErr)
+				skipped[meta.Name] = fmt.Sprintf("decode snapshot for %s: %v", meta.Name, decodeErr)
+				abortSingle(adopted.Name)
+				continue
 			}
 			var stateErr error
 			state, stateErr = adoptState(
@@ -509,19 +535,32 @@ func adoptSessions(ctx context.Context, adminSocket string, h *Hub) (int, error)
 				resolveVTScrollbackMaxBytes(adopted.VTScrollbackMaxBytes, h.defaultVTScrollbackMaxBytes),
 			)
 			err = stateErr
-		}
-		if err != nil {
-			return 0, fmt.Errorf("restore snapshot for %s: %w", meta.Name, err)
+			if err != nil {
+				closeFileQuietly(master)
+				skipped[meta.Name] = fmt.Sprintf("restore snapshot for %s: %v", meta.Name, err)
+				abortSingle(adopted.Name)
+				continue
+			}
 		}
 		prepared = append(prepared, state)
+		preparedNames = append(preparedNames, adopted.Name)
 	}
+	if len(skipped) > 0 {
+		// Partial failure is not fatal; remaining sessions still migrate.
+		// Skipped sessions are aborted on the source and will remain there
+		// until the source exits. Their output is preserved (close, not discard).
+		if len(prepared) == 0 {
+			return 0, skipped, fmt.Errorf("all %d sessions failed to migrate: %v", len(listed.Sessions), skipped)
+		}
+	}
+
 
 	var batchResult adminBatchResult
 	if err := client.call(ctx, adminMethodCommit, adminBatchParams{Names: preparedNames}, &batchResult); err != nil {
-		return 0, err
+		return 0, skipped, err
 	}
 	if batchResult.Committed != len(prepared) {
-		return 0, fmt.Errorf("admin committed %d sessions, want %d", batchResult.Committed, len(prepared))
+		return 0, skipped, fmt.Errorf("admin committed %d sessions, want %d", batchResult.Committed, len(prepared))
 	}
 	committed = true
 
@@ -547,7 +586,10 @@ func adoptSessions(ctx context.Context, adminSocket string, h *Hub) (int, error)
 	_ = client.call(retireCtx, adminMethodExit, nil, &ignored)
 	_ = waitOldServerGone(retireCtx, adminSocket)
 	cancel()
-	return len(prepared), nil
+	if len(skipped) == 0 {
+		skipped = nil
+	}
+	return len(prepared), skipped, nil
 }
 
 func waitOldServerGone(ctx context.Context, adminSocket string) error {
@@ -570,4 +612,18 @@ func waitOldServerGone(ctx context.Context, adminSocket string) error {
 // never accepts a client while its session map is being rebuilt.
 func (s *Server) Adopt(ctx context.Context, adminSocket string) (int, error) {
 	return adoptSessions(ctx, adminSocket, s.hub)
+}
+
+// AdoptReport contains per-session skip details for a partial migration.
+type AdoptReport struct {
+	Adopted int
+	Skipped map[string]string
+}
+
+// AdoptWithReport migrates sessions and reports per-session skips separately
+// so control-plane callers can surface adopt runtime failures without
+// treating a single session decode error as a full outage.
+func (s *Server) AdoptWithReport(ctx context.Context, adminSocket string) (AdoptReport, error) {
+	n, skipped, err := adoptSessionsWithReport(ctx, adminSocket, s.hub)
+	return AdoptReport{Adopted: n, Skipped: skipped}, err
 }

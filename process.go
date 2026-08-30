@@ -487,7 +487,7 @@ func adoptState(name string, master *os.File, snapshot []byte, size Size, output
 	}
 	state, err := adoptStateWithOutput(name, master, snapshot, size, output, createdAt, pid, exit, scrollbackMaxBytes)
 	if err != nil {
-		output.discard()
+		output.close(nil)
 	}
 	return state, err
 }
@@ -518,7 +518,7 @@ func adoptStateWithTerminal(name string, master *os.File, vt *vtTerminal, output
 		var err error
 		migrationWakeReader, migrationWakeWriter, err = os.Pipe()
 		if err != nil {
-			output.discard()
+			output.close(nil)
 			vt.Close()
 			closeFileQuietly(master)
 			return nil, fmt.Errorf("create migration wake pipe: %w", err)
