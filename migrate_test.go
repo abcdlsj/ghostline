@@ -594,7 +594,7 @@ func TestAdminSocketIsPrivate(t *testing.T) {
 	}
 }
 
-func TestAdoptRollsBackPreparedSessions(t *testing.T) {
+func TestAdoptSkipsFailedSessionAndCommitsOthers(t *testing.T) {
 	ctx := context.Background()
 	outputDir := t.TempDir()
 	oldServer, oldSocket := startMigrateServer(t, outputDir, "rollback")
@@ -605,22 +605,35 @@ func TestAdoptRollsBackPreparedSessions(t *testing.T) {
 	}
 	// Keep the source's active descriptor alive but make the destination
 	// unable to open the second session's active segment. The first state is
-	// prepared before the second one fails, exercising the whole abort path.
+	// prepared before the second one fails, exercising per-session skipping.
 	second := oldServer.hub.session("second")
 	secondDirectory, secondGeneration := second.output.metadata()
 	if err := os.Remove(outputSegmentPath(secondDirectory, secondGeneration)); err != nil {
 		t.Fatalf("remove second output segment: %v", err)
 	}
 	target, _ := startMigrateServer(t, t.TempDir(), "rollback-new")
-	if _, err := adoptSessions(ctx, oldSocket+".admin", target.hub); err == nil {
-		t.Fatal("Adopt succeeded despite missing output segment")
-	}
-	if !socketReady(oldSocket) {
-		t.Fatal("old server stopped after failed adoption")
-	}
-	first, err := oldServer.hub.Get(ctx, "first")
+	adopted, skipped, err := adoptSessionsWithReport(ctx, oldSocket+".admin", target.hub)
 	if err != nil {
-		t.Fatal("first session disappeared after rollback")
+		t.Fatalf("Adopt = (%d, %v), want partial success", adopted, err)
+	}
+	if adopted != 1 {
+		t.Fatalf("adopted = %d, want 1", adopted)
+	}
+	if reason := skipped["second"]; !strings.Contains(reason, "restore snapshot") {
+		t.Fatalf("skipped second reason = %q, want restore snapshot error", reason)
+	}
+	if _, err := target.hub.Get(ctx, "first"); err != nil {
+		t.Fatalf("first session missing after partial adoption: %v", err)
+	}
+	if _, err := target.hub.Get(ctx, "second"); err == nil {
+		t.Fatal("failed second session was adopted")
+	}
+	if socketReady(oldSocket) {
+		t.Fatal("old server still serving after partial adoption")
+	}
+	first, err := target.hub.Get(ctx, "first")
+	if err != nil {
+		t.Fatalf("first session disappeared after partial adoption: %v", err)
 	}
 	if err := first.WriteInput(ctx, []byte("echo rollback-ok\r")); err != nil {
 		t.Fatalf("Input after rollback: %v", err)
