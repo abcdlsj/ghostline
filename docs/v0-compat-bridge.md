@@ -15,6 +15,8 @@ The v0 native snapshot envelope is deliberately not decoded by v1. The
 destination starts at generation one and creates fresh opaque cursors; v0 byte
 offsets and spool sizes are never interpreted as v1 cursors.
 
-The handoff is same-host and all-or-nothing. A preparation failure aborts the
-complete batch and leaves v0 as owner. The public v1 socket remains strictly
-v1 and never negotiates or serves v0 requests.
+The handoff is same-host. Native spool replay is preferred, but a session with
+unreadable history is still transferred with a blank terminal while its PTY
+remains live. If a session cannot receive a PTY or create a terminal, the
+destination rolls back the prepared batch and leaves v0 as owner. The public
+v1 socket remains strictly v1 and never negotiates or serves v0 requests.

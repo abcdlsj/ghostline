@@ -30,6 +30,9 @@ const (
 
 	adminTimeout  = 2 * time.Second
 	adminMaxFrame = 64 << 20
+	// ANSI replay is only a recovery hint. Keep it bounded so a degraded
+	// snapshot cannot crowd a native snapshot out of the admin frame.
+	adminMaxReplayBytes = 8 << 20
 )
 
 // V0HandoffProtocolVersion identifies the final v0 compatibility contract
@@ -91,7 +94,10 @@ type adminListResult struct {
 }
 
 type adminSnapshotResult struct {
-	Snapshot string `json:"snapshot"`
+	Snapshot string `json:"snapshot,omitempty"`
+	Replay   string `json:"replay,omitempty"`
+	Lossy    bool   `json:"lossy,omitempty"`
+	Reason   string `json:"reason,omitempty"`
 }
 
 type adminBatchResult struct {
@@ -387,6 +393,89 @@ func adoptSessions(ctx context.Context, adminSocket string, h *Hub) (int, error)
 	return n, err
 }
 
+func receiveAdoptedSession(ctx context.Context, client *adminClient, transport *adminTransport, name string) (sessionMeta, *os.File, error) {
+	var adopted sessionMeta
+	if err := client.call(ctx, adminMethodAdopt, adoptParams{Name: name}, &adopted); err != nil {
+		return sessionMeta{}, nil, err
+	}
+	if !adopted.Alive {
+		return adopted, nil, nil
+	}
+	masterFD, err := transport.takeFD()
+	if err != nil {
+		return sessionMeta{}, nil, err
+	}
+	return adopted, os.NewFile(uintptr(masterFD), "adopted-master"), nil
+}
+
+func decodeMigrationBlob(value, label string) ([]byte, error) {
+	if value == "" {
+		return nil, nil
+	}
+	decoded, err := base64.StdEncoding.DecodeString(value)
+	if err != nil {
+		return nil, fmt.Errorf("decode %s: %w", label, err)
+	}
+	return decoded, nil
+}
+
+func adoptNativeOrLossyState(adopted sessionMeta, master *os.File, snapshotResult adminSnapshotResult, outputRoot string, scrollbackMaxBytes uint64) (*sessionState, bool, string, error) {
+	replay, replayErr := decodeMigrationBlob(snapshotResult.Replay, "ANSI replay")
+	if replayErr != nil {
+		// A malformed recovery hint must not prevent the final blank-screen
+		// fallback. The PTY is still recoverable independently of its display.
+		replay = nil
+	}
+	native, nativeErr := decodeMigrationBlob(snapshotResult.Snapshot, "native snapshot")
+	if nativeErr == nil && len(native) > 0 {
+		state, err := adoptState(
+			adopted.Name,
+			master,
+			native,
+			Size{Columns: adopted.Cols, Rows: adopted.Rows},
+			adopted.OutputDirectory,
+			adopted.OutputGeneration,
+			time.Unix(adopted.CreatedAt, 0),
+			adopted.PID,
+			adopted.Exit.error(),
+			scrollbackMaxBytes,
+		)
+		if err == nil {
+			return state, false, "", nil
+		}
+		nativeErr = err
+	} else if nativeErr == nil {
+		nativeErr = errors.New("native snapshot is unavailable")
+	}
+	if nativeErr == nil {
+		nativeErr = errors.New("native snapshot is unavailable")
+	}
+	state, err := adoptLossyState(
+		adopted.Name,
+		master,
+		replay,
+		Size{Columns: adopted.Cols, Rows: adopted.Rows},
+		adopted.OutputDirectory,
+		adopted.OutputGeneration,
+		outputRoot,
+		time.Unix(adopted.CreatedAt, 0),
+		adopted.PID,
+		adopted.Exit.error(),
+		scrollbackMaxBytes,
+	)
+	if err != nil {
+		return nil, true, nativeErr.Error(), fmt.Errorf("%v; lossy recovery: %w", nativeErr, err)
+	}
+	reason := nativeErr.Error()
+	if snapshotResult.Reason != "" {
+		reason = snapshotResult.Reason + "; " + reason
+	}
+	if replayErr != nil {
+		reason += "; " + replayErr.Error()
+	}
+	return state, true, reason, nil
+}
+
 func adoptSessionsWithReport(ctx context.Context, adminSocket string, h *Hub) (int, map[string]string, error) {
 	if h == nil {
 		return 0, nil, errors.New("adopt target hub is nil")
@@ -460,100 +549,133 @@ func adoptSessionsWithReport(ctx context.Context, adminSocket string, h *Hub) (i
 		cancel()
 	}
 	for _, meta := range listed.Sessions {
-		var adopted sessionMeta
 		// The process may exit between list and adopt. Ask for the response
 		// first, then decide whether that response should carry an fd from its
 		// own Alive bit rather than trusting the initial list snapshot.
-		if err := client.call(ctx, adminMethodAdopt, adoptParams{Name: meta.Name}, &adopted); err != nil {
-			skipped[meta.Name] = fmt.Sprintf("adopt %s: %v", meta.Name, err)
+		adopted, master, adoptErr := receiveAdoptedSession(ctx, client, transport, meta.Name)
+		if adoptErr != nil {
+			skipped[meta.Name] = fmt.Sprintf("adopt %s: %v", meta.Name, adoptErr)
+			abortSingle(meta.Name)
 			continue
 		}
-
-		var master *os.File
-		if adopted.Alive {
-			masterFD, err := transport.takeFD()
-			if err != nil {
-				skipped[meta.Name] = fmt.Sprintf("take fd %s: %v", meta.Name, err)
-				abortSingle(meta.Name)
-				continue
-			}
-			master = os.NewFile(uintptr(masterFD), "adopted-master")
-		}
+		scrollbackMaxBytes := resolveVTScrollbackMaxBytes(adopted.VTScrollbackMaxBytes, h.defaultVTScrollbackMaxBytes)
 		var state *sessionState
 		if v0Handoff {
 			if adopted.SpoolFormat != v0SpoolFormat || adopted.SpoolPath == "" {
-				closeFileQuietly(master)
-				skipped[meta.Name] = fmt.Sprintf("invalid v0 handoff metadata for %s", meta.Name)
-				abortSingle(meta.Name)
-				continue
-			}
-			state, err = adoptV0State(
-				ctx,
-				h.outputDir,
-				adopted.Name,
-				master,
-				Size{Columns: adopted.Cols, Rows: adopted.Rows},
-				adopted.SpoolPath,
-				time.Unix(adopted.CreatedAt, 0),
-				adopted.PID,
-				adopted.Exit.error(),
-				resolveVTScrollbackMaxBytes(adopted.VTScrollbackMaxBytes, h.defaultVTScrollbackMaxBytes),
-			)
-			if err != nil {
-				closeFileQuietly(master)
-				skipped[meta.Name] = fmt.Sprintf("restore v0 %s: %v", meta.Name, err)
-				abortSingle(meta.Name)
-				continue
+				var recoverErr error
+				state, recoverErr = adoptLossyState(
+					adopted.Name,
+					master,
+					nil,
+					Size{Columns: adopted.Cols, Rows: adopted.Rows},
+					adopted.OutputDirectory,
+					adopted.OutputGeneration,
+					h.outputDir,
+					time.Unix(adopted.CreatedAt, 0),
+					adopted.PID,
+					adopted.Exit.error(),
+					scrollbackMaxBytes,
+				)
+				if recoverErr != nil {
+					closeFileQuietly(master)
+					skipped[meta.Name] = fmt.Sprintf("invalid v0 handoff metadata for %s: %v", meta.Name, recoverErr)
+					abortSingle(meta.Name)
+					continue
+				}
+			} else {
+				var restoreErr error
+				state, restoreErr = adoptV0State(
+					ctx,
+					h.outputDir,
+					adopted.Name,
+					master,
+					Size{Columns: adopted.Cols, Rows: adopted.Rows},
+					adopted.SpoolPath,
+					time.Unix(adopted.CreatedAt, 0),
+					adopted.PID,
+					adopted.Exit.error(),
+					scrollbackMaxBytes,
+				)
+				if restoreErr != nil {
+					state, restoreErr = adoptLossyState(
+						adopted.Name,
+						master,
+						nil,
+						Size{Columns: adopted.Cols, Rows: adopted.Rows},
+						adopted.OutputDirectory,
+						adopted.OutputGeneration,
+						h.outputDir,
+						time.Unix(adopted.CreatedAt, 0),
+						adopted.PID,
+						adopted.Exit.error(),
+						scrollbackMaxBytes,
+					)
+					if restoreErr != nil {
+						closeFileQuietly(master)
+						skipped[meta.Name] = fmt.Sprintf("restore v0 %s: %v", meta.Name, restoreErr)
+						abortSingle(meta.Name)
+						continue
+					}
+				}
 			}
 		} else {
 			var snapshotResult adminSnapshotResult
-			if err := client.call(ctx, adminMethodSnapshot, adoptParams{Name: adopted.Name}, &snapshotResult); err != nil {
+			if snapshotErr := client.call(ctx, adminMethodSnapshot, adoptParams{Name: adopted.Name}, &snapshotResult); snapshotErr != nil {
+				// Ghostline v1.1.1 aborted its pending ticket when native
+				// snapshot encoding failed. Re-adopt once so the new target can
+				// still take ownership and rebuild a lossy terminal. Newer
+				// sources return an explicit lossy result and never enter this
+				// compatibility path.
 				closeFileQuietly(master)
-				skipped[meta.Name] = fmt.Sprintf("encode snapshot for %s: %v", meta.Name, err)
-				// Snapshot encode failure already aborted on server; best-effort abort for safety.
-				abortSingle(adopted.Name)
-				continue
-			}
-			snapshot, decodeErr := base64.StdEncoding.DecodeString(snapshotResult.Snapshot)
-			if decodeErr != nil {
-				closeFileQuietly(master)
-				skipped[meta.Name] = fmt.Sprintf("decode snapshot for %s: %v", meta.Name, decodeErr)
-				abortSingle(adopted.Name)
-				continue
-			}
-			var stateErr error
-			state, stateErr = adoptState(
-				adopted.Name,
-				master,
-				snapshot,
-				Size{Columns: adopted.Cols, Rows: adopted.Rows},
-				adopted.OutputDirectory,
-				adopted.OutputGeneration,
-				time.Unix(adopted.CreatedAt, 0),
-				adopted.PID,
-				adopted.Exit.error(),
-				resolveVTScrollbackMaxBytes(adopted.VTScrollbackMaxBytes, h.defaultVTScrollbackMaxBytes),
-			)
-			err = stateErr
-			if err != nil {
-				closeFileQuietly(master)
-				skipped[meta.Name] = fmt.Sprintf("restore snapshot for %s: %v", meta.Name, err)
-				abortSingle(adopted.Name)
-				continue
+				retryMeta, retryMaster, retryErr := receiveAdoptedSession(ctx, client, transport, meta.Name)
+				if retryErr != nil {
+					abortSingle(adopted.Name)
+					skipped[meta.Name] = fmt.Sprintf("snapshot %s: %v; retry adopt: %v", meta.Name, snapshotErr, retryErr)
+					continue
+				}
+				adopted = retryMeta
+				master = retryMaster
+				var recoverErr error
+				state, recoverErr = adoptLossyState(
+					adopted.Name,
+					master,
+					nil,
+					Size{Columns: adopted.Cols, Rows: adopted.Rows},
+					adopted.OutputDirectory,
+					adopted.OutputGeneration,
+					h.outputDir,
+					time.Unix(adopted.CreatedAt, 0),
+					adopted.PID,
+					adopted.Exit.error(),
+					resolveVTScrollbackMaxBytes(adopted.VTScrollbackMaxBytes, h.defaultVTScrollbackMaxBytes),
+				)
+				if recoverErr != nil {
+					closeFileQuietly(master)
+					abortSingle(adopted.Name)
+					skipped[meta.Name] = fmt.Sprintf("snapshot %s: %v; lossy recovery: %v", meta.Name, snapshotErr, recoverErr)
+					continue
+				}
+			} else {
+				var stateErr error
+				state, _, _, stateErr = adoptNativeOrLossyState(adopted, master, snapshotResult, h.outputDir, scrollbackMaxBytes)
+				if stateErr != nil {
+					closeFileQuietly(master)
+					abortSingle(adopted.Name)
+					skipped[meta.Name] = fmt.Sprintf("restore snapshot for %s: %v", meta.Name, stateErr)
+					continue
+				}
 			}
 		}
 		prepared = append(prepared, state)
 		preparedNames = append(preparedNames, adopted.Name)
 	}
 	if len(skipped) > 0 {
-		// Partial failure is not fatal; remaining sessions still migrate.
-		// Skipped sessions are aborted on the source and will remain there
-		// until the source exits. Their output is preserved (close, not discard).
-		if len(prepared) == 0 {
-			return 0, skipped, fmt.Errorf("all %d sessions failed to migrate: %v", len(listed.Sessions), skipped)
-		}
+		// Do not create split ownership. Every session has been attempted and
+		// each failed name was aborted individually, but an unrecoverable name
+		// means the prepared states must be rolled back as one final safety net.
+		// The source remains the owner of the complete inventory.
+		return 0, skipped, fmt.Errorf("%d session(s) could not be recovered: %v", len(skipped), skipped)
 	}
-
 
 	var batchResult adminBatchResult
 	if err := client.call(ctx, adminMethodCommit, adminBatchParams{Names: preparedNames}, &batchResult); err != nil {
@@ -614,15 +736,18 @@ func (s *Server) Adopt(ctx context.Context, adminSocket string) (int, error) {
 	return adoptSessions(ctx, adminSocket, s.hub)
 }
 
-// AdoptReport contains per-session skip details for a partial migration.
+// AdoptReport contains per-session details for an adoption that could not
+// recover the complete source inventory. A non-empty Skipped map means the
+// destination committed no sessions and the source remains authoritative.
 type AdoptReport struct {
 	Adopted int
 	Skipped map[string]string
 }
 
 // AdoptWithReport migrates sessions and reports per-session skips separately
-// so control-plane callers can surface adopt runtime failures without
-// treating a single session decode error as a full outage.
+// so control-plane callers can surface failures that could not be recovered.
+// Native snapshot errors are handled as lossy recovery and do not appear in
+// Skipped when the PTY and a target terminal can still be created.
 func (s *Server) AdoptWithReport(ctx context.Context, adminSocket string) (AdoptReport, error) {
 	n, skipped, err := adoptSessionsWithReport(ctx, adminSocket, s.hub)
 	return AdoptReport{Adopted: n, Skipped: skipped}, err

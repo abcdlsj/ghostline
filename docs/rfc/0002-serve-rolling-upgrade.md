@@ -7,8 +7,10 @@
 ## Decision
 
 A new ghostline server may adopt every session from an old same-host server
-without disconnecting child processes. Adoption is native-state,
-all-or-nothing, and same-protocol only.
+without disconnecting child processes. Adoption prefers native state, but a
+session whose native state cannot be encoded or decoded falls back to an ANSI
+screen replay or a blank terminal while retaining its PTY. The source batch is
+same-protocol only.
 
 Native rolling adoption remains same-version only: a source whose advertised
 protocol is not exactly `ProtocolVersion` is rejected by that path before any
@@ -37,7 +39,7 @@ The source server exposes a mode `0600` admin Unix socket at
 - `list`: freeze the source inventory and return the protocol version and
   session metadata;
 - `adopt`: stabilize one session and transfer a live PTY descriptor;
-- `snapshot`: return its native VT state;
+- `snapshot`: return native VT state and an optional bounded ANSI replay;
 - `commit` or `abort`: resolve the complete prepared batch;
 - `exit`: request source retirement after commit.
 
@@ -51,8 +53,8 @@ Clients never connect to the admin socket.
    readable from the PTY is incorporated into both the VT and active output
    segment.
 4. The source transfers metadata, the PTY descriptor when live, and native VT
-   state. The destination opens the transferred output directory at the same
-   generation.
+   state plus a bounded ANSI replay. The destination opens the transferred
+   output directory at the same generation when possible.
 5. Only after every session is prepared does the destination send `commit`.
 6. The source releases ownership. The destination starts reading transferred
    PTYs, including bytes buffered during the pause.
@@ -64,8 +66,13 @@ interpreted as a durable position.
 
 ## Failure semantics
 
-- A failure before commit aborts every prepared session. The source resumes
-  unchanged.
+- A per-session preparation failure is aborted by name, leaving the migration
+  batch frozen so later sessions can still be attempted.
+- Native snapshot failures are recovered with the ANSI replay or a blank VT.
+  If output storage cannot be opened, the destination creates a fresh output
+  log and accepts loss of historical output.
+- If any session remains unrecoverable, the destination aborts all prepared
+  sessions before commit; the source resumes unchanged and remains the owner.
 - Commit preflights all migration tickets before resolving any one of them.
 - A child that exits during preparation makes its ticket unstable and aborts
   the batch.

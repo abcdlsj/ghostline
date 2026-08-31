@@ -142,6 +142,12 @@ func (s *Server) handleAdmin(connection net.Conn) {
 			s.hub.endMigrationBatch()
 		}
 	}()
+	endBatchIfIdle := func() {
+		if batchFrozen && len(pending) == 0 {
+			s.hub.endMigrationBatch()
+			batchFrozen = false
+		}
+	}
 	for {
 		_ = unixConn.SetReadDeadline(time.Now().Add(adminTimeout))
 		var request adminRequest
@@ -241,17 +247,28 @@ func (s *Server) handleAdmin(connection net.Conn) {
 				continue
 			}
 			adoption.state.outputMu.Lock()
-			snapshot, err := adoption.state.vt.EncodeState()
+			snapshot, snapshotErr := adoption.state.vt.EncodeState()
+			// Keep an ANSI display replay beside the native payload. It gives
+			// a newer Ghostty build a useful fallback if it rejects an older
+			// native snapshot during restore.
+			replay, replayErr := adoption.state.vt.Snapshot()
 			adoption.state.outputMu.Unlock()
-			if err != nil {
-				_ = s.resolveAdoption(adoption, false)
-				delete(pending, params.Name)
-				_ = transport.write(adminResponse{ID: request.ID, Error: err.Error()}, -1)
-				continue
+			result := adminSnapshotResult{}
+			if snapshotErr == nil {
+				result.Snapshot = base64.StdEncoding.EncodeToString(snapshot)
+			} else {
+				result.Lossy = true
+				result.Reason = snapshotErr.Error()
 			}
-			if err := writeAdminResult(transport, request.ID, adminSnapshotResult{
-				Snapshot: base64.StdEncoding.EncodeToString(snapshot),
-			}, -1); err != nil {
+			if replayErr == nil && len(replay) <= adminMaxReplayBytes {
+				result.Replay = base64.StdEncoding.EncodeToString(replay)
+			} else if snapshotErr != nil && replayErr == nil {
+				result.Reason += "; ANSI replay exceeds migration limit"
+			} else if snapshotErr != nil && replayErr != nil {
+				result.Reason += "; ANSI replay failed: " + replayErr.Error()
+			}
+			trimMigrationReplayForFrame(request.ID, &result)
+			if err := writeAdminResult(transport, request.ID, result, -1); err != nil {
 				return
 			}
 		case adminMethodCommit, adminMethodAbort:
@@ -305,8 +322,7 @@ func (s *Server) handleAdmin(connection net.Conn) {
 						delete(pending, adoption.state.name)
 					}
 					if batchFrozen {
-						s.hub.endMigrationBatch()
-						batchFrozen = false
+						endBatchIfIdle()
 					}
 					_ = transport.write(adminResponse{ID: request.ID, Error: unstable.Error()}, -1)
 					continue
@@ -331,8 +347,7 @@ func (s *Server) handleAdmin(connection net.Conn) {
 					}
 				}
 				if batchFrozen {
-					s.hub.endMigrationBatch()
-					batchFrozen = false
+					endBatchIfIdle()
 				}
 				_ = transport.write(adminResponse{ID: request.ID, Error: resolveErr.Error()}, -1)
 				return
@@ -346,9 +361,8 @@ func (s *Server) handleAdmin(connection net.Conn) {
 			if err := writeAdminResult(transport, request.ID, adminBatchResult{Committed: len(adoptions)}, -1); err != nil {
 				return
 			}
-			if batchFrozen {
-				s.hub.endMigrationBatch()
-				batchFrozen = false
+			if commit {
+				endBatchIfIdle()
 			}
 		case adminMethodExit:
 			if len(pending) != 0 {
@@ -364,6 +378,48 @@ func (s *Server) handleAdmin(connection net.Conn) {
 			_ = transport.write(adminResponse{ID: request.ID, Error: fmt.Sprintf("unknown admin method: %s", request.Method)}, -1)
 		}
 	}
+}
+
+func trimMigrationReplayForFrame(id int64, result *adminSnapshotResult) {
+	if result == nil || result.Replay == "" {
+		if migrationSnapshotFits(id, result) {
+			return
+		}
+		result.Snapshot = ""
+		result.Lossy = true
+		if result.Reason == "" {
+			result.Reason = "native snapshot exceeds migration limit"
+		}
+		return
+	}
+	if migrationSnapshotFits(id, result) {
+		return
+	}
+	// The native payload alone is still useful and remains bounded by the
+	// regular admin frame check. Drop only the optional recovery hint first.
+	result.Replay = ""
+	if migrationSnapshotFits(id, result) {
+		return
+	}
+	// A very large native snapshot is less useful than retaining the PTY with
+	// a blank terminal. Let the target take the normal lossy recovery path.
+	result.Snapshot = ""
+	result.Lossy = true
+	if result.Reason == "" {
+		result.Reason = "native snapshot exceeds migration limit"
+	}
+}
+
+func migrationSnapshotFits(id int64, result *adminSnapshotResult) bool {
+	if result == nil {
+		return true
+	}
+	encodedResult, err := json.Marshal(result)
+	if err != nil {
+		return false
+	}
+	frame, err := json.Marshal(adminResponse{ID: id, Result: encodedResult})
+	return err == nil && len(frame)+1 <= adminMaxFrame
 }
 
 func writeAdminResult(transport *adminTransport, id int64, result any, fd int) error {

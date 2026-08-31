@@ -208,6 +208,12 @@ func TestAdoptRejectsDifferentProtocolBeforePreparingSessions(t *testing.T) {
 }
 
 func startAdminServerWithSnapshot(t *testing.T, socket string, meta sessionMeta, fd *os.File, snapshot []byte, replyToExit bool) {
+	startAdminServerWithSnapshotResult(t, socket, meta, fd, adminSnapshotResult{
+		Snapshot: base64.StdEncoding.EncodeToString(snapshot),
+	}, replyToExit)
+}
+
+func startAdminServerWithSnapshotResult(t *testing.T, socket string, meta sessionMeta, fd *os.File, snapshotResult adminSnapshotResult, replyToExit bool) {
 	t.Helper()
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
 	if err != nil {
@@ -246,7 +252,7 @@ func startAdminServerWithSnapshot(t *testing.T, socket string, meta sessionMeta,
 					_ = fd.Close()
 				}
 			case adminMethodSnapshot:
-				raw, _ := json.Marshal(adminSnapshotResult{Snapshot: base64.StdEncoding.EncodeToString(snapshot)})
+				raw, _ := json.Marshal(snapshotResult)
 				_ = transport.write(adminResponse{ID: request.ID, Result: raw}, -1)
 			case adminMethodCommit:
 				raw, _ := json.Marshal(adminBatchResult{Committed: 1})
@@ -338,6 +344,203 @@ func TestRollingAdoptRestoresSnapshot(t *testing.T) {
 	}
 	if !bytes.HasSuffix(snapshot, []byte("\x1b[5;15H")) {
 		t.Fatalf("snapshot restore did not preserve cursor: %q", snapshot[len(snapshot)-min(len(snapshot), 40):])
+	}
+}
+
+func TestAdoptFallsBackToReplayWhenNativeRestoreFails(t *testing.T) {
+	ctx := context.Background()
+	outputDir := t.TempDir()
+	socketDir, err := os.MkdirTemp("/tmp", "ghostline-lossy-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	defer os.RemoveAll(socketDir)
+
+	meta := sessionMeta{
+		Name:      "lossy",
+		Cols:      80,
+		Rows:      24,
+		CreatedAt: time.Now().Unix(),
+		PID:       4242,
+		Alive:     false,
+		Exit:      &exitMeta{Code: 0},
+	}
+	attachMetaOutput(t, &meta, outputDir)
+	adminSocket := filepath.Join(socketDir, "old.admin")
+	startAdminServerWithSnapshotResult(t, adminSocket, meta, nil, adminSnapshotResult{
+		Snapshot: base64.StdEncoding.EncodeToString([]byte("not-a-native-snapshot")),
+		Replay:   base64.StdEncoding.EncodeToString([]byte("\x1b[2J\x1b[Hlossy-recovered\r\n")),
+		Lossy:    true,
+		Reason:   "test native restore failure",
+	}, true)
+
+	hub, err := New(Options{OutputDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer hub.Close()
+	adopted, skipped, err := adoptSessionsWithReport(ctx, adminSocket, hub)
+	if err != nil {
+		t.Fatalf("Adopt = (%d, %v), want lossy recovery", adopted, err)
+	}
+	if adopted != 1 || len(skipped) != 0 {
+		t.Fatalf("Adopt = (%d, %#v), want (1, nil)", adopted, skipped)
+	}
+	session, err := hub.Get(ctx, meta.Name)
+	if err != nil {
+		t.Fatalf("recovered session missing: %v", err)
+	}
+	replay, err := session.Replay(ctx)
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if !bytes.Contains(replay, []byte("lossy-recovered")) {
+		t.Fatalf("lossy replay missing marker: %q", replay)
+	}
+}
+
+func TestAdoptRecoversAfterLegacySnapshotError(t *testing.T) {
+	ctx := context.Background()
+	outputDir := t.TempDir()
+	socketDir, err := os.MkdirTemp("/tmp", "ghostline-legacy-lossy-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	defer os.RemoveAll(socketDir)
+	meta := sessionMeta{
+		Name:      "legacy-lossy",
+		Cols:      80,
+		Rows:      24,
+		CreatedAt: time.Now().Unix(),
+		PID:       4242,
+		Alive:     false,
+		Exit:      &exitMeta{Code: 0},
+	}
+	attachMetaOutput(t, &meta, outputDir)
+	adminSocket := filepath.Join(socketDir, "old.admin")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: adminSocket, Net: "unix"})
+	if err != nil {
+		t.Fatalf("ListenUnix: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		connection, acceptErr := listener.AcceptUnix()
+		if acceptErr != nil {
+			return
+		}
+		defer connection.Close()
+		transport := newAdminTransport(connection)
+		snapshotCalls := 0
+		for {
+			var request adminRequest
+			if err := transport.read(&request); err != nil {
+				return
+			}
+			switch request.Method {
+			case adminMethodList:
+				raw, _ := json.Marshal(adminListResult{Version: ProtocolVersion, Sessions: []sessionMeta{meta}})
+				_ = transport.write(adminResponse{ID: request.ID, Result: raw}, -1)
+			case adminMethodAdopt:
+				raw, _ := json.Marshal(meta)
+				_ = transport.write(adminResponse{ID: request.ID, Result: raw}, -1)
+			case adminMethodSnapshot:
+				snapshotCalls++
+				if snapshotCalls == 1 {
+					_ = transport.write(adminResponse{ID: request.ID, Error: "legacy snapshot encode failed"}, -1)
+					continue
+				}
+				raw, _ := json.Marshal(adminSnapshotResult{})
+				_ = transport.write(adminResponse{ID: request.ID, Result: raw}, -1)
+			case adminMethodAbort:
+				raw, _ := json.Marshal(adminBatchResult{})
+				_ = transport.write(adminResponse{ID: request.ID, Result: raw}, -1)
+			case adminMethodCommit:
+				raw, _ := json.Marshal(adminBatchResult{Committed: 1})
+				_ = transport.write(adminResponse{ID: request.ID, Result: raw}, -1)
+			case adminMethodExit:
+				_ = transport.write(adminResponse{ID: request.ID, Result: json.RawMessage("{}")}, -1)
+				return
+			default:
+				_ = transport.write(adminResponse{ID: request.ID, Error: "unknown admin method"}, -1)
+			}
+		}
+	}()
+
+	hub, err := New(Options{OutputDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer hub.Close()
+	adopted, skipped, err := adoptSessionsWithReport(ctx, adminSocket, hub)
+	if err != nil {
+		t.Fatalf("Adopt = (%d, %v), want legacy lossy recovery", adopted, err)
+	}
+	if adopted != 1 || len(skipped) != 0 {
+		t.Fatalf("Adopt = (%d, %#v), want (1, nil)", adopted, skipped)
+	}
+}
+
+func TestAdminAbortSingleKeepsRemainingBatchFrozen(t *testing.T) {
+	ctx := context.Background()
+	oldServer, oldSocket := startMigrateServer(t, t.TempDir(), "single-abort")
+	for _, name := range []string{"first", "second", "third"} {
+		if _, err := oldServer.hub.Start(ctx, SessionOptions{Name: name, Process: ProcessSpec{Path: "sh"}}); err != nil {
+			t.Fatalf("Start %s: %v", name, err)
+		}
+	}
+
+	connection, err := dialAdmin(ctx, oldSocket+".admin")
+	if err != nil {
+		t.Fatalf("dial admin: %v", err)
+	}
+	defer connection.Close()
+	transport := newAdminTransport(connection)
+	defer transport.closeReceived()
+	client := &adminClient{transport: transport, nextID: 1}
+	var listed adminListResult
+	if err := client.call(ctx, adminMethodList, nil, &listed); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	masters := make(map[string]*os.File, 2)
+	for _, name := range []string{"first", "second"} {
+		adopted, master, err := receiveAdoptedSession(ctx, client, transport, name)
+		if err != nil || !adopted.Alive || master == nil {
+			t.Fatalf("adopt %s = (%+v, %v), want live master", name, adopted, err)
+		}
+		masters[name] = master
+	}
+	if err := client.call(ctx, adminMethodAbort, adminBatchParams{Names: []string{"first"}}, nil); err != nil {
+		t.Fatalf("abort first: %v", err)
+	}
+	closeFileQuietly(masters["first"])
+	delete(masters, "first")
+
+	adopted, master, err := receiveAdoptedSession(ctx, client, transport, "third")
+	if err != nil || !adopted.Alive || master == nil {
+		t.Fatalf("adopt third after single abort = (%+v, %v), want live master", adopted, err)
+	}
+	masters["third"] = master
+	for _, name := range []string{"second", "third"} {
+		var snapshot adminSnapshotResult
+		if err := client.call(ctx, adminMethodSnapshot, adoptParams{Name: name}, &snapshot); err != nil {
+			t.Fatalf("snapshot %s: %v", name, err)
+		}
+		if snapshot.Snapshot == "" {
+			t.Fatalf("snapshot %s is empty", name)
+		}
+	}
+	var result adminBatchResult
+	if err := client.call(ctx, adminMethodCommit, adminBatchParams{Names: []string{"second", "third"}}, &result); err != nil {
+		t.Fatalf("commit remaining sessions: %v", err)
+	}
+	if result.Committed != 2 {
+		t.Fatalf("committed = %d, want 2", result.Committed)
+	}
+	for _, master := range masters {
+		closeFileQuietly(master)
+	}
+	if err := client.call(ctx, adminMethodExit, nil, nil); err != nil {
+		t.Fatalf("exit: %v", err)
 	}
 }
 
@@ -594,7 +797,7 @@ func TestAdminSocketIsPrivate(t *testing.T) {
 	}
 }
 
-func TestAdoptSkipsFailedSessionAndCommitsOthers(t *testing.T) {
+func TestAdoptRecoversFailedSessionAndCommitsOthers(t *testing.T) {
 	ctx := context.Background()
 	outputDir := t.TempDir()
 	oldServer, oldSocket := startMigrateServer(t, outputDir, "rollback")
@@ -605,7 +808,7 @@ func TestAdoptSkipsFailedSessionAndCommitsOthers(t *testing.T) {
 	}
 	// Keep the source's active descriptor alive but make the destination
 	// unable to open the second session's active segment. The first state is
-	// prepared before the second one fails, exercising per-session skipping.
+	// prepared before the second one fails, exercising the lossy recovery path.
 	second := oldServer.hub.session("second")
 	secondDirectory, secondGeneration := second.output.metadata()
 	if err := os.Remove(outputSegmentPath(secondDirectory, secondGeneration)); err != nil {
@@ -616,17 +819,17 @@ func TestAdoptSkipsFailedSessionAndCommitsOthers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Adopt = (%d, %v), want partial success", adopted, err)
 	}
-	if adopted != 1 {
-		t.Fatalf("adopted = %d, want 1", adopted)
+	if adopted != 2 {
+		t.Fatalf("adopted = %d, want 2", adopted)
 	}
-	if reason := skipped["second"]; !strings.Contains(reason, "restore snapshot") {
-		t.Fatalf("skipped second reason = %q, want restore snapshot error", reason)
+	if len(skipped) != 0 {
+		t.Fatalf("skipped = %#v, want no skipped sessions", skipped)
 	}
 	if _, err := target.hub.Get(ctx, "first"); err != nil {
 		t.Fatalf("first session missing after partial adoption: %v", err)
 	}
-	if _, err := target.hub.Get(ctx, "second"); err == nil {
-		t.Fatal("failed second session was adopted")
+	if _, err := target.hub.Get(ctx, "second"); err != nil {
+		t.Fatalf("recovered second session missing: %v", err)
 	}
 	if socketReady(oldSocket) {
 		t.Fatal("old server still serving after partial adoption")

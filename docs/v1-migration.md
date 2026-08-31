@@ -51,8 +51,11 @@ envelope. The handoff creates fresh opaque v1 cursors.
 The v0 spool path, size, and format are migration metadata only; a v0 byte
 offset is never exposed as a v1 cursor.
 
-The bridge remains same-host and all-or-nothing. Warren owns discovery, socket
-switching, process startup, and source retirement. See
+The bridge remains same-host. Native and v0 state are preferred, but a session
+whose history cannot be rebuilt is restored with a blank terminal while its
+PTY remains live. If a session cannot even receive a PTY or create a terminal,
+the destination rolls back the prepared batch so the source remains the sole
+owner. Warren owns discovery, socket switching, process startup, and source retirement. See
 [`v0-compat-bridge.md`](v0-compat-bridge.md).
 
 ## Deployment cutover

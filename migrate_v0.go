@@ -18,7 +18,6 @@ import (
 func adoptV0State(ctx context.Context, outputRoot, name string, master *os.File, size Size, spoolPath string, createdAt time.Time, pid int, exit *ExitError, scrollbackMaxBytes uint64) (*sessionState, error) {
 	output, err := createOutputLog(outputRoot, name)
 	if err != nil {
-		closeFileQuietly(master)
 		return nil, err
 	}
 	vt, err := newVTTerminalWithOptions(size.Columns, size.Rows, vtTerminalOptions{
@@ -26,17 +25,16 @@ func adoptV0State(ctx context.Context, outputRoot, name string, master *os.File,
 	})
 	if err != nil {
 		output.discard()
-		closeFileQuietly(master)
 		return nil, fmt.Errorf("create v0 handoff vt: %w", err)
 	}
 	if err := replayV0Spool(ctx, vt, output, spoolPath); err != nil {
 		output.discard()
 		vt.Close()
-		closeFileQuietly(master)
 		return nil, err
 	}
 	state, err := adoptStateWithTerminal(name, master, vt, output, size, createdAt, pid, exit, scrollbackMaxBytes)
 	if err != nil {
+		vt.Close()
 		output.discard()
 	}
 	return state, err

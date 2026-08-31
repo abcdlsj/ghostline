@@ -482,7 +482,6 @@ func (s *sessionState) finishMigration(ticket *migrationTicket, commit bool) err
 func adoptState(name string, master *os.File, snapshot []byte, size Size, outputDirectory string, outputGeneration uint64, createdAt time.Time, pid int, exit *ExitError, scrollbackMaxBytes uint64) (*sessionState, error) {
 	output, err := adoptOutputLog(outputDirectory, outputGeneration)
 	if err != nil {
-		closeFileQuietly(master)
 		return nil, err
 	}
 	state, err := adoptStateWithOutput(name, master, snapshot, size, output, createdAt, pid, exit, scrollbackMaxBytes)
@@ -501,26 +500,29 @@ func adoptStateWithOutput(name string, master *os.File, snapshot []byte, size Si
 		ScrollbackMaxBytes: scrollbackMaxBytes,
 	})
 	if err != nil {
-		closeFileQuietly(master)
 		return nil, fmt.Errorf("create vt: %w", err)
 	}
 	if err := vt.RestoreState(snapshot); err != nil {
 		vt.Close()
-		closeFileQuietly(master)
 		return nil, fmt.Errorf("restore vt state: %w", err)
 	}
-	return adoptStateWithTerminal(name, master, vt, output, size, createdAt, pid, exit, scrollbackMaxBytes)
+	state, err := adoptStateWithTerminal(name, master, vt, output, size, createdAt, pid, exit, scrollbackMaxBytes)
+	if err != nil {
+		vt.Close()
+	}
+	return state, err
 }
 
+// adoptStateWithTerminal builds a session around an already prepared terminal
+// and output log. On error it leaves all inputs owned by the caller so a
+// migration can choose a lossy recovery path without losing the transferred
+// PTY master.
 func adoptStateWithTerminal(name string, master *os.File, vt *vtTerminal, output *outputLog, size Size, createdAt time.Time, pid int, exit *ExitError, scrollbackMaxBytes uint64) (*sessionState, error) {
 	var migrationWakeReader, migrationWakeWriter *os.File
 	if master != nil {
 		var err error
 		migrationWakeReader, migrationWakeWriter, err = os.Pipe()
 		if err != nil {
-			output.close(nil)
-			vt.Close()
-			closeFileQuietly(master)
 			return nil, fmt.Errorf("create migration wake pipe: %w", err)
 		}
 	}
@@ -549,6 +551,49 @@ func adoptStateWithTerminal(name string, master *os.File, vt *vtTerminal, output
 		close(state.reaped)
 	} else {
 		state.masterFD = int(master.Fd())
+	}
+	return state, nil
+}
+
+// adoptLossyState rebuilds a session when the native terminal snapshot cannot
+// be decoded. The PTY master remains attached to the child, so the session is
+// still interactive; only the emulator history may be reduced to an ANSI
+// replay or an empty screen. Existing output storage is reused when possible.
+// If that storage is unavailable (for example after a cross-host handoff), a
+// fresh target-owned log is created and the historical output is forfeited.
+func adoptLossyState(name string, master *os.File, replay []byte, size Size, outputDirectory string, outputGeneration uint64, outputRoot string, createdAt time.Time, pid int, exit *ExitError, scrollbackMaxBytes uint64) (*sessionState, error) {
+	output, err := adoptOutputLog(outputDirectory, outputGeneration)
+	freshOutput := false
+	if err != nil {
+		output, err = createOutputLog(outputRoot, name)
+		if err != nil {
+			return nil, fmt.Errorf("create lossy output log: %w", err)
+		}
+		freshOutput = true
+	}
+	vt, err := newVTTerminalWithOptions(size.Columns, size.Rows, vtTerminalOptions{
+		ScrollbackMaxBytes: scrollbackMaxBytes,
+	})
+	if err != nil {
+		if freshOutput {
+			output.discard()
+		} else {
+			output.close(nil)
+		}
+		return nil, fmt.Errorf("create lossy vt: %w", err)
+	}
+	if len(replay) > 0 {
+		vt.Feed(replay)
+	}
+	state, err := adoptStateWithTerminal(name, master, vt, output, size, createdAt, pid, exit, scrollbackMaxBytes)
+	if err != nil {
+		vt.Close()
+		if freshOutput {
+			output.discard()
+		} else {
+			output.close(nil)
+		}
+		return nil, err
 	}
 	return state, nil
 }

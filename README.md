@@ -22,8 +22,9 @@ manager.
   represented by that replay.
 - Atomic VT state captures that pair a complete opaque emulator state with the
   first raw output byte not represented by that state.
-- Same-version, all-or-nothing daemon upgrades that adopt live PTY file
-  descriptors, VT state, and output generations.
+- Same-version daemon upgrades that adopt live PTY file descriptors, VT state,
+  and output generations, with ANSI or blank-screen recovery when native state
+  is not portable.
 
 v1 is intentionally incompatible with every v0 public API and wire method.
 The final v0.x daemon exposes a separate, explicit handoff contract for

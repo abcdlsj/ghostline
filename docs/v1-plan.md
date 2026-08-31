@@ -133,7 +133,8 @@ the core session contract.
   explicit in its constructor/name.
 - Bump the public protocol directly to v1 and keep any v0 handoff isolated in
   the dedicated migration contract.
-- Preserve all-or-nothing same-version PTY and VT-state adoption.
+- Preserve same-version PTY ownership while allowing lossy VT-state recovery
+  when a native snapshot is not portable.
 
 ### 4. VT and policy boundaries
 
