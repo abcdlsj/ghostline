@@ -6,7 +6,7 @@ path, `.dylib`, or `.so` file.
 
 ## Source and toolchain
 
-- Ghostty commit: `88f57ee66eeaad4da77b414b245f7b6693348985`
+- Ghostty commit: `32192762fbbc9fa58a14407fb566fa5ad1f15ace`
 - Zig: `0.16.0`
 - Optimization: `ReleaseFast`
 - License: MIT; see [LICENSE.ghostty](LICENSE.ghostty)
@@ -53,9 +53,9 @@ from the aarch64 build to `third_party/lib/linux_arm64/libghostty-vt.a`.
 
 | Path | Target | SHA-256 |
 | --- | --- | --- |
-| `third_party/lib/libghostty-vt.a` | macOS 13+, universal x86_64/arm64 | `53c7466cf10784db9aeb40623bc66bdb9211e883447a6e55aa8eb508617ec75e` |
-| `third_party/lib/linux_amd64/libghostty-vt.a` | Linux x86_64, glibc 2.31+ | `ead758370bb255db90ee00a009531ba02b936bafc8d5be29e5c4c806ec8219bc` |
-| `third_party/lib/linux_arm64/libghostty-vt.a` | Linux aarch64, glibc 2.31+ | `e4383a86372d6376b9b08cb7a37e2fa12e61dab39804904fb6090d16d00f318e` |
+| `third_party/lib/libghostty-vt.a` | macOS 13+, universal x86_64/arm64 | `caf85ee55ae5f964ad3ea02b26e7c71eafd1ab5888a68ac598cd8ae4fbf93e45` |
+| `third_party/lib/linux_amd64/libghostty-vt.a` | Linux x86_64, glibc 2.31+ | `78390354a0bf85038158e9e6f56e973384a573266a440e03f1c9927f9f028638` |
+| `third_party/lib/linux_arm64/libghostty-vt.a` | Linux aarch64, glibc 2.31+ | `4684dae520983fe406364c5d8598927e226949d7ac244bc8db342df95f04152e` |
 
 Run `shasum -a 256 -c third_party/SHA256SUMS` from the ghostline repository
 root to verify all three files. CI performs the same check before tests.
