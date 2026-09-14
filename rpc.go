@@ -157,8 +157,9 @@ type listResult struct {
 }
 
 type metadataResult struct {
-	Process   string `json:"process"`
-	Directory string `json:"directory"`
+	Process     string `json:"process,omitempty"`
+	CommandLine string `json:"commandLine,omitempty"`
+	Directory   string `json:"directory,omitempty"`
 }
 
 type request struct {

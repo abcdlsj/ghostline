@@ -92,6 +92,7 @@ type vtTerminal struct {
 	mu                 sync.Mutex
 	terminal           C.GhosttyTerminal
 	scrollbackMaxBytes uint64
+	reportedPwd        string
 }
 
 func newVTTerminal(cols, rows int) (*vtTerminal, error) {
@@ -161,6 +162,35 @@ func (v *vtTerminal) Feed(data []byte) {
 		return
 	}
 	v.writeLocked(data)
+	v.refreshReportedPwdLocked()
+}
+
+// refreshReportedPwdLocked snapshots the terminal's OSC 7 pwd after a write.
+// Reading the value instead of registering a C callback keeps the terminal
+// usable from tests and migration paths without a Go-to-C function pointer.
+func (v *vtTerminal) refreshReportedPwdLocked() {
+	if v.terminal == nil {
+		v.reportedPwd = ""
+		return
+	}
+	var value C.GhosttyString
+	if result := C.ghostty_terminal_get(
+		v.terminal,
+		C.GHOSTTY_TERMINAL_DATA_PWD,
+		unsafe.Pointer(&value),
+	); result != C.GHOSTTY_SUCCESS || value.ptr == nil || value.len == 0 {
+		v.reportedPwd = ""
+		return
+	}
+	v.reportedPwd = parseReportedPwd(string(C.GoBytes(unsafe.Pointer(value.ptr), C.int(value.len))))
+}
+
+// ReportedPwd returns the local working directory the program reported through
+// OSC 7, or an empty string when it has not reported one.
+func (v *vtTerminal) ReportedPwd() string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.reportedPwd
 }
 
 func (v *vtTerminal) writeLocked(data []byte) {
@@ -443,6 +473,7 @@ func (v *vtTerminal) RestoreState(snapshot []byte) error {
 	}
 	C.ghostty_terminal_free(v.terminal)
 	v.terminal = restored
+	v.refreshReportedPwdLocked()
 	return nil
 }
 

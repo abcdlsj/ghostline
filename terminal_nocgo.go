@@ -17,6 +17,9 @@ func newVTTerminalWithOptions(int, int, vtTerminalOptions) (*vtTerminal, error) 
 // Feed is a no-op on an unavailable terminal.
 func (*vtTerminal) Feed([]byte) {}
 
+// ReportedPwd reports no pwd because libghostty-vt is unavailable.
+func (*vtTerminal) ReportedPwd() string { return "" }
+
 // Resize is a no-op on an unavailable terminal.
 func (*vtTerminal) Resize(int, int) {}
 

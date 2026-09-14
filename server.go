@@ -805,7 +805,7 @@ func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessag
 		if err != nil {
 			return nil, err
 		}
-		return metadataResult{Process: metadata.Process, Directory: metadata.Directory}, nil
+		return metadataResult{Process: metadata.Process, CommandLine: metadata.CommandLine, Directory: metadata.Directory}, nil
 
 	case rpcMethodSize:
 		session, err := s.namedSession(ctx, raw)

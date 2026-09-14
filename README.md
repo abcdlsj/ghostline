@@ -215,7 +215,8 @@ server-side output files.
   output storage. Archive required output before deletion.
 - `Hub.Close` terminates all local sessions. `Server.Shutdown` does the same
   for daemon-owned sessions.
-- Foreground process metadata is opt-in through `ProbeForeground`.
+- The working directory is read from the OSC 7 report a shell integration emits.
+- Foreground process name and command line are opt-in through `ProbeForeground`.
 
 Sessions survive client detach and a successful same-version rolling daemon
 upgrade. They do not survive daemon crashes that lose PTY masters, host

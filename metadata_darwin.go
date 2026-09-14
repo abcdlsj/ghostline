@@ -13,13 +13,17 @@ import (
 )
 
 // probeForegroundFD resolves the PTY's foreground process group with
-// TIOCGPGRP, then maps it to a process with ps and reads its cwd with lsof.
+// TIOCGPGRP, then reads that group's command line with ps. The command column
+// carries the full argv, so a running "npm run dev" is reported instead of only
+// the executable name.
 func probeForegroundFD(ctx context.Context, fd int) (SessionMetadata, error) {
 	pgrp, err := unix.IoctlGetInt(fd, unix.TIOCGPGRP)
 	if err != nil {
 		return SessionMetadata{}, err
 	}
-	output, err := exec.CommandContext(ctx, "ps", "-axo", "pid=,pgid=,comm=").Output()
+	// -ww disables the terminal-width truncation ps otherwise applies to the
+	// command column.
+	output, err := exec.CommandContext(ctx, "ps", "-ww", "-axo", "pid=,pgid=,command=").Output()
 	if err != nil {
 		return SessionMetadata{}, err
 	}
@@ -27,39 +31,51 @@ func probeForegroundFD(ctx context.Context, fd int) (SessionMetadata, error) {
 		if err := ctx.Err(); err != nil {
 			return SessionMetadata{}, err
 		}
-		fields := strings.Fields(line)
-		if len(fields) < 3 {
+		pgid, command, ok := parseForegroundPSLine(line)
+		if !ok || pgid != pgrp {
 			continue
-		}
-		pid, err := strconv.Atoi(fields[0])
-		if err != nil {
-			continue
-		}
-		pgid, err := strconv.Atoi(fields[1])
-		if err != nil || pgid != pgrp {
-			continue
-		}
-		directory, err := processCWD(ctx, pid)
-		if err != nil {
-			return SessionMetadata{}, err
 		}
 		return SessionMetadata{
-			Process:   strings.Join(fields[2:], " "),
-			Directory: directory,
+			Process:     firstCommandToken(command),
+			CommandLine: command,
 		}, nil
 	}
 	return SessionMetadata{}, fmt.Errorf("no process for foreground process group %d", pgrp)
 }
 
-func processCWD(ctx context.Context, pid int) (string, error) {
-	output, err := exec.CommandContext(ctx, "lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn").Output()
+// parseForegroundPSLine extracts the process group and command from one
+// "pid=,pgid=,command=" row. Only the first two columns are positional; the
+// command keeps its internal spacing because ps makes it the final column.
+func parseForegroundPSLine(line string) (int, string, bool) {
+	line = strings.TrimLeft(line, " \t")
+	if line == "" {
+		return 0, "", false
+	}
+	pidEnd := strings.IndexAny(line, " \t")
+	if pidEnd < 0 {
+		return 0, "", false
+	}
+	rest := strings.TrimLeft(line[pidEnd:], " \t")
+	pgidEnd := strings.IndexAny(rest, " \t")
+	if pgidEnd < 0 {
+		return 0, "", false
+	}
+	pgid, err := strconv.Atoi(rest[:pgidEnd])
 	if err != nil {
-		return "", err
+		return 0, "", false
 	}
-	for _, line := range strings.Split(string(output), "\n") {
-		if strings.HasPrefix(line, "n") {
-			return strings.TrimPrefix(line, "n"), nil
-		}
+	command := strings.TrimLeft(rest[pgidEnd:], " \t")
+	if command == "" {
+		return 0, "", false
 	}
-	return "", nil
+	return pgid, command, true
+}
+
+// firstCommandToken is the executable as invoked, matching the value ps
+// reports for the command name column in the common case.
+func firstCommandToken(command string) string {
+	if index := strings.IndexAny(command, " \t"); index >= 0 {
+		return command[:index]
+	}
+	return command
 }

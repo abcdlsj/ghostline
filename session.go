@@ -49,7 +49,11 @@ func (s *Session) Status(ctx context.Context) (Status, error) {
 	return s.backend.status(ctx)
 }
 
-// Metadata reports the foreground process metadata when probing is enabled.
+// Metadata reports presentation metadata for the session. The working
+// directory is the path the program reported through OSC 7 and is always
+// collected from the parsed output stream. The foreground process name and
+// command line require Options.ProbeForeground; both are best-effort and empty
+// when probing is disabled or the foreground process cannot be resolved.
 func (s *Session) Metadata(ctx context.Context) (SessionMetadata, error) {
 	return s.backend.metadata(ctx)
 }
@@ -179,13 +183,19 @@ type Status struct {
 	Exit *ExitError `json:"exit,omitempty"`
 }
 
-// SessionMetadata is the OS-level foreground process snapshot for one
-// session. It is presentation metadata, not lifecycle state.
+// SessionMetadata is presentation metadata for one session. It is not
+// lifecycle state, and every field is best-effort.
 type SessionMetadata struct {
-	// Process is the foreground process name.
-	Process string `json:"process"`
-	// Directory is the foreground process working directory.
-	Directory string `json:"directory"`
+	// Process is the foreground process name. It is empty when foreground
+	// probing is disabled or the process cannot be resolved.
+	Process string `json:"process,omitempty"`
+	// CommandLine is the foreground process command line including arguments.
+	// It is empty when foreground probing is disabled or the process cannot be
+	// resolved.
+	CommandLine string `json:"commandLine,omitempty"`
+	// Directory is the working directory the program reported through OSC 7.
+	// It is empty until a valid report is parsed.
+	Directory string `json:"directory,omitempty"`
 }
 
 // Checkpoint is an atomic screen replay and raw output position.
@@ -271,27 +281,38 @@ func (l *localSession) status(ctx context.Context) (Status, error) {
 }
 
 func (l *localSession) metadata(ctx context.Context) (SessionMetadata, error) {
-	if !l.hub.probeForeground {
-		return SessionMetadata{}, nil
-	}
 	if err := ctx.Err(); err != nil {
 		return SessionMetadata{}, err
+	}
+	// OSC 7 is parsed from the output stream on every write, so the reported
+	// pwd is available without any OS probe.
+	metadata := SessionMetadata{Directory: l.state.vt.ReportedPwd()}
+	if !l.hub.probeForeground {
+		return metadata, nil
 	}
 	l.hub.lifecycleMu.RLock()
 	l.state.operationMu.RLock()
 	if l.state.masterFD < 0 {
 		l.state.operationMu.RUnlock()
 		l.hub.lifecycleMu.RUnlock()
-		return SessionMetadata{}, nil
+		return metadata, nil
 	}
 	fd, err := duplicateMasterFD(l.state.masterFD)
 	l.state.operationMu.RUnlock()
 	l.hub.lifecycleMu.RUnlock()
 	if err != nil {
-		return SessionMetadata{}, nil
+		return metadata, nil
 	}
 	defer func() { _ = closeMasterFD(fd) }()
-	return probeForegroundFD(ctx, fd)
+	// Foreground probing races process exit and migration. A failed probe
+	// yields no process data but must not discard the reported pwd.
+	probe, err := probeForegroundFD(ctx, fd)
+	if err != nil {
+		return metadata, nil
+	}
+	metadata.Process = probe.Process
+	metadata.CommandLine = probe.CommandLine
+	return metadata, nil
 }
 
 func (l *localSession) size(ctx context.Context) (Size, error) {

@@ -23,9 +23,11 @@ type Options struct {
 	// VTScrollbackMaxBytes is the default logical scrollback budget for new
 	// sessions. Zero uses DefaultVTScrollbackMaxBytes.
 	VTScrollbackMaxBytes uint64
-	// ProbeForeground enables OS-level foreground process/cwd metadata.
-	// Disabled by default; Session.Metadata returns empty values without
-	// spawning any OS probes.
+	// ProbeForeground enables OS-level foreground process metadata (name and
+	// command line). Disabled by default; Session.Metadata reports an empty
+	// process and command line without spawning any OS probes. The OSC 7
+	// working directory is parsed from the output stream regardless of this
+	// setting.
 	ProbeForeground bool
 	// ServerMaxClientConnections limits concurrently active client socket
 	// connections when these options are passed to NewServer. A connection is

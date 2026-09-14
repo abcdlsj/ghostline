@@ -598,7 +598,7 @@ func (r *remoteSession) metadata(ctx context.Context) (SessionMetadata, error) {
 	if err := r.callRetryable(ctx, rpcMethodMetadata, nameParams{Name: r.name}, &result); err != nil {
 		return SessionMetadata{}, err
 	}
-	return SessionMetadata{Process: result.Process, Directory: result.Directory}, nil
+	return SessionMetadata{Process: result.Process, CommandLine: result.CommandLine, Directory: result.Directory}, nil
 }
 
 func (r *remoteSession) size(ctx context.Context) (Size, error) {

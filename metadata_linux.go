@@ -14,8 +14,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// probeForegroundFD resolves the PTY's foreground process group and reads
-// the group's command name and working directory from /proc.
+// probeForegroundFD resolves the PTY's foreground process group and reads the
+// group's command name and command line from /proc.
 func probeForegroundFD(ctx context.Context, fd int) (SessionMetadata, error) {
 	pgrp, err := unix.IoctlGetInt(fd, unix.TIOCGPGRP)
 	if err != nil {
@@ -29,14 +29,31 @@ func probeForegroundFD(ctx context.Context, fd int) (SessionMetadata, error) {
 	if err != nil {
 		return SessionMetadata{}, err
 	}
-	directory, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "cwd"))
-	if err != nil {
-		return SessionMetadata{}, err
-	}
+	// cmdline is NUL-separated and may be empty for kernel threads or processes
+	// that cleared their argv. The process name still reports a value.
+	cmdline, _ := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
 	return SessionMetadata{
-		Process:   strings.TrimSpace(string(comm)),
-		Directory: directory,
+		Process:     strings.TrimSpace(string(comm)),
+		CommandLine: formatCmdline(cmdline),
 	}, nil
+}
+
+// formatCmdline renders a NUL-separated /proc/<pid>/cmdline as one
+// space-separated command line.
+func formatCmdline(raw []byte) string {
+	raw = bytes.TrimRight(raw, "\x00")
+	if len(raw) == 0 {
+		return ""
+	}
+	parts := bytes.Split(raw, []byte{0})
+	fields := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if len(part) == 0 {
+			continue
+		}
+		fields = append(fields, string(part))
+	}
+	return strings.Join(fields, " ")
 }
 
 // processIDForGroup returns a process whose process group matches pgrp. The
