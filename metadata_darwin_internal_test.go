@@ -2,45 +2,64 @@
 
 package ghostline
 
-import "testing"
+import (
+	"encoding/binary"
+	"os"
+	"strings"
+	"testing"
 
-func TestParseForegroundPSLine(t *testing.T) {
+	"golang.org/x/sys/unix"
+)
+
+func TestCommStringTrimsAtNUL(t *testing.T) {
 	cases := []struct {
-		line    string
-		pgid    int
-		command string
-		ok      bool
+		raw  []byte
+		want string
 	}{
-		{"  96263  96263 sleep 3", 96263, "sleep 3", true},
-		{"  96263  96263   /bin/zsh -lc 'git status'", 96263, "/bin/zsh -lc 'git status'", true},
-		{"  1     1 /sbin/launchd", 1, "/sbin/launchd", true},
-		{"  96263  96263 npm run dev -- --port 3000", 96263, "npm run dev -- --port 3000", true},
-		{"", 0, "", false},
-		{"  96263", 0, "", false},
-		{"  96263  notanumber sleep", 0, "", false},
-		{"  96263  96263   ", 0, "", false},
+		{[]byte("zsh\x00stale\x00"), "zsh"},
+		{[]byte("bash"), "bash"},
+		{[]byte("\x00"), ""},
+		{nil, ""},
 	}
 	for _, testCase := range cases {
-		pgid, command, ok := parseForegroundPSLine(testCase.line)
-		if ok != testCase.ok || pgid != testCase.pgid || command != testCase.command {
-			t.Fatalf(
-				"parseForegroundPSLine(%q) = (%d, %q, %v), want (%d, %q, %v)",
-				testCase.line, pgid, command, ok, testCase.pgid, testCase.command, testCase.ok,
-			)
+		if got := commString(testCase.raw); got != testCase.want {
+			t.Fatalf("commString(%q) = %q, want %q", testCase.raw, got, testCase.want)
 		}
 	}
 }
 
-func TestFirstCommandToken(t *testing.T) {
-	cases := map[string]string{
-		"sleep 3":               "sleep",
-		"/bin/zsh -lc go build": "/bin/zsh",
-		"npm run dev":           "npm",
-		"solo":                  "solo",
-	}
-	for command, want := range cases {
-		if got := firstCommandToken(command); got != want {
-			t.Fatalf("firstCommandToken(%q) = %q, want %q", command, got, want)
+func TestParseProcArgs(t *testing.T) {
+	buffer := func(execPath string, argv ...string) []byte {
+		raw := make([]byte, 4)
+		binary.NativeEndian.PutUint32(raw, uint32(len(argv)))
+		raw = append(raw, execPath...)
+		// Exec path terminator plus the alignment padding the kernel emits
+		// before argv[0].
+		raw = append(raw, 0, 0, 0, 0)
+		for _, arg := range argv {
+			raw = append(raw, arg...)
+			raw = append(raw, 0)
 		}
+		return raw
+	}
+
+	argv := parseProcArgs(buffer("/usr/bin/npm", "/usr/bin/npm", "run", "dev"))
+	if strings.Join(argv, " ") != "/usr/bin/npm run dev" {
+		t.Fatalf("parseProcArgs argv = %q", argv)
+	}
+
+	if got := parseProcArgs(nil); got != nil {
+		t.Fatalf("parseProcArgs(nil) = %q, want nil", got)
+	}
+	if got := parseProcArgs([]byte{0, 0, 0, 0}); got != nil {
+		t.Fatalf("parseProcArgs(zero argc) = %q, want nil", got)
+	}
+}
+
+func TestProcessCommandLineMatchesArgs(t *testing.T) {
+	got := processCommandLine(unix.Getpid(), "fallback")
+	want := strings.Join(os.Args, " ")
+	if got != want {
+		t.Fatalf("processCommandLine = %q, want %q", got, want)
 	}
 }
