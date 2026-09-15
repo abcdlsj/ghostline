@@ -96,8 +96,13 @@ type adminListResult struct {
 type adminSnapshotResult struct {
 	Snapshot string `json:"snapshot,omitempty"`
 	Replay   string `json:"replay,omitempty"`
-	Lossy    bool   `json:"lossy,omitempty"`
-	Reason   string `json:"reason,omitempty"`
+	// Pwd is the parsed OSC 7 working directory. It is carried beside the
+	// snapshot because it is presentation metadata and not part of the VT
+	// state, so a rolling upgrade keeps the reported directory until the
+	// shell emits the next OSC 7.
+	Pwd    string `json:"pwd,omitempty"`
+	Lossy  bool   `json:"lossy,omitempty"`
+	Reason string `json:"reason,omitempty"`
 }
 
 type adminBatchResult struct {
@@ -441,6 +446,7 @@ func adoptNativeOrLossyState(adopted sessionMeta, master *os.File, snapshotResul
 			scrollbackMaxBytes,
 		)
 		if err == nil {
+			state.vt.SetReportedPwd(snapshotResult.Pwd)
 			return state, false, "", nil
 		}
 		nativeErr = err
@@ -466,6 +472,7 @@ func adoptNativeOrLossyState(adopted sessionMeta, master *os.File, snapshotResul
 	if err != nil {
 		return nil, true, nativeErr.Error(), fmt.Errorf("%v; lossy recovery: %w", nativeErr, err)
 	}
+	state.vt.SetReportedPwd(snapshotResult.Pwd)
 	reason := nativeErr.Error()
 	if snapshotResult.Reason != "" {
 		reason = snapshotResult.Reason + "; " + reason

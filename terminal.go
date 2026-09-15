@@ -193,6 +193,15 @@ func (v *vtTerminal) ReportedPwd() string {
 	return v.reportedPwd
 }
 
+// SetReportedPwd seeds an already-parsed OSC 7 pwd. It is used when a session
+// is adopted from another server process, because the pwd is presentation
+// metadata and not part of the VT snapshot.
+func (v *vtTerminal) SetReportedPwd(pwd string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.reportedPwd = pwd
+}
+
 func (v *vtTerminal) writeLocked(data []byte) {
 	if len(data) == 0 {
 		return

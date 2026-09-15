@@ -927,3 +927,63 @@ func TestFinishMigrationDoesNotHangWhenCopyLoopIsGone(t *testing.T) {
 		t.Fatal("migration ticket not cleared")
 	}
 }
+
+func TestRollingAdoptPreservesReportedPwd(t *testing.T) {
+	ctx := context.Background()
+	outputDir := t.TempDir()
+	socketDir, err := os.MkdirTemp("/tmp", "ghostline-pwd-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	defer os.RemoveAll(socketDir)
+
+	vt, err := newVTTerminal(80, 24)
+	if err != nil {
+		t.Fatalf("newVTTerminal: %v", err)
+	}
+	vt.Feed([]byte("\x1b]7;file://localhost/tmp/adopted\x07"))
+	if got := vt.ReportedPwd(); got != "/tmp/adopted" {
+		t.Fatalf("seed pwd = %q, want /tmp/adopted", got)
+	}
+	nativeSnapshot, err := vt.EncodeState()
+	vt.Close()
+	if err != nil {
+		t.Fatalf("EncodeState: %v", err)
+	}
+
+	meta := sessionMeta{
+		Name:      "warren_pwd",
+		Cols:      80,
+		Rows:      24,
+		CreatedAt: time.Now().Unix(),
+		PID:       4242,
+		Alive:     false,
+		Exit:      &exitMeta{Code: 0},
+	}
+	attachMetaOutput(t, &meta, outputDir)
+	adminSocket := filepath.Join(socketDir, "old.admin")
+	startAdminServerWithSnapshotResult(t, adminSocket, meta, nil, adminSnapshotResult{
+		Snapshot: base64.StdEncoding.EncodeToString(nativeSnapshot),
+		Pwd:      "/tmp/adopted",
+	}, true)
+
+	hub, err := New(Options{OutputDir: outputDir})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer hub.Close()
+	if _, err := adoptSessions(ctx, adminSocket, hub); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	session, err := hub.Get(ctx, "warren_pwd")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	metadata, err := session.Metadata(ctx)
+	if err != nil {
+		t.Fatalf("Metadata: %v", err)
+	}
+	if metadata.Directory != "/tmp/adopted" {
+		t.Fatalf("adopted pwd = %q, want /tmp/adopted", metadata.Directory)
+	}
+}

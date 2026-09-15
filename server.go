@@ -253,7 +253,7 @@ func (s *Server) handleAdmin(connection net.Conn) {
 			// native snapshot during restore.
 			replay, replayErr := adoption.state.vt.Snapshot()
 			adoption.state.outputMu.Unlock()
-			result := adminSnapshotResult{}
+			result := adminSnapshotResult{Pwd: adoption.state.vt.ReportedPwd()}
 			if snapshotErr == nil {
 				result.Snapshot = base64.StdEncoding.EncodeToString(snapshot)
 			} else {
