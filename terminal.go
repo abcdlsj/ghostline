@@ -73,6 +73,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"unsafe"
 )
@@ -80,6 +81,10 @@ import (
 // snapshotContinuationMaxBytes keeps unfinished VT and UTF-8 input replayable
 // during migration. It is independent of the resize repair below.
 const snapshotContinuationMaxBytes = 1 << 20
+
+// maxReportedPwdBytes bounds the borrowed OSC 7 payload before it is viewed as
+// a Go string, so a pathological report cannot overflow the length conversion.
+const maxReportedPwdBytes = 1 << 16
 
 const (
 	// Keep the migration envelope stable. AtomicState returns the native
@@ -182,7 +187,21 @@ func (v *vtTerminal) refreshReportedPwdLocked() {
 		v.reportedPwd = ""
 		return
 	}
-	v.reportedPwd = parseReportedPwd(string(C.GoBytes(unsafe.Pointer(value.ptr), C.int(value.len))))
+	if uint64(value.len) > maxReportedPwdBytes {
+		v.reportedPwd = ""
+		return
+	}
+	// Borrow the terminal-owned bytes so an unchanged pwd costs no allocation.
+	// The pointer is valid until the next mutating terminal call, and the lock
+	// is held for the whole comparison.
+	raw := unsafe.String((*byte)(unsafe.Pointer(value.ptr)), int(value.len))
+	parsed := parseReportedPwd(raw)
+	if parsed == v.reportedPwd {
+		return
+	}
+	// parseReportedPwd returns a substring of the borrowed view, so copy it
+	// before it outlives the pointer.
+	v.reportedPwd = strings.Clone(parsed)
 }
 
 // ReportedPwd returns the local working directory the program reported through
