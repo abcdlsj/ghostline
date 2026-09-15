@@ -72,6 +72,24 @@ func (c *Cursor) UnmarshalText(text []byte) error {
 	return nil
 }
 
+// Distance reports how many bytes separate c from to.
+//
+// It reports false when the distance is not defined: either cursor is zero,
+// they belong to different output generations, or to precedes c. Callers must
+// treat false as "unknown" rather than as zero. A reader that cannot bound its
+// next read has to fall back to reading a single byte at a time, because
+// consuming past a known target cursor duplicates output the live stream is
+// still going to deliver.
+func (c Cursor) Distance(to Cursor) (uint64, bool) {
+	if c.generation == 0 || to.generation == 0 || c.generation != to.generation {
+		return 0, false
+	}
+	if to.offset < c.offset {
+		return 0, false
+	}
+	return to.offset - c.offset, true
+}
+
 // OutputReader streams raw PTY output from a cursor. Read applies natural
 // backpressure: it returns at most len(p) bytes and does not buffer the rest in
 // memory. Close unblocks a pending Read. Cursor returns the next unread byte.

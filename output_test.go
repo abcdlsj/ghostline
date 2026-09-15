@@ -234,3 +234,31 @@ func FuzzParseCursorRoundTrip(f *testing.F) {
 		}
 	})
 }
+
+func TestCursorDistanceReportsOnlyKnownForwardSpans(t *testing.T) {
+	from := Cursor{generation: 3, offset: 100}
+	forward := Cursor{generation: 3, offset: 2842 + 100}
+	backward := Cursor{generation: 3, offset: 40}
+	otherGeneration := Cursor{generation: 4, offset: 500}
+
+	if distance, ok := from.Distance(forward); !ok || distance != 2842 {
+		t.Fatalf("Distance(forward) = %d, %v; want 2842, true", distance, ok)
+	}
+	if distance, ok := from.Distance(from); !ok || distance != 0 {
+		t.Fatalf("Distance(self) = %d, %v; want 0, true", distance, ok)
+	}
+	// A caller that cannot bound its read has to fall back to one byte at a
+	// time, so an unknown span must be reported as unknown, not as zero.
+	if distance, ok := from.Distance(backward); ok || distance != 0 {
+		t.Fatalf("Distance(backward) = %d, %v; want 0, false", distance, ok)
+	}
+	if distance, ok := from.Distance(otherGeneration); ok || distance != 0 {
+		t.Fatalf("Distance(other generation) = %d, %v; want 0, false", distance, ok)
+	}
+	if distance, ok := (Cursor{}).Distance(forward); ok || distance != 0 {
+		t.Fatalf("Distance from zero cursor = %d, %v; want 0, false", distance, ok)
+	}
+	if distance, ok := from.Distance(Cursor{}); ok || distance != 0 {
+		t.Fatalf("Distance to zero cursor = %d, %v; want 0, false", distance, ok)
+	}
+}
