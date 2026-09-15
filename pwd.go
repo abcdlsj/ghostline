@@ -1,54 +1,67 @@
 package ghostline
 
-import "strings"
+import (
+	"os"
+	"strings"
+)
 
 // parseReportedPwd converts the raw pwd payload a program reported through the
-// terminal (OSC 7 file URI, or the ConEmu/iTerm2 bare-path variants) into a
-// local filesystem path.
+// terminal into a local filesystem path.
 //
-// The terminal stores the payload verbatim, so this is the generic decoder for
-// every shape the VT layer accepts. It returns an empty string when the value
-// cannot be interpreted as a local path, which callers treat as "no report".
+// The VT layer stores the payload verbatim, so this decodes every shape the
+// ecosystem emits: a file:// URI, the Kitty/Ghostty kitty-shell-cwd:// URI, and
+// the ConEmu/iTerm2 bare-path variants. It returns an empty string when the
+// value cannot be interpreted as a local path, which callers treat as "no
+// report".
 func parseReportedPwd(raw string) string {
 	value := strings.TrimSpace(raw)
 	if value == "" {
 		return ""
 	}
-	if strings.HasPrefix(value, "file://") {
-		return fileURIPath(value)
+	if _, rest, ok := splitReportedScheme(value); ok {
+		return hostPath(rest, localHostname())
 	}
 	return absolutePath(value)
 }
 
-// fileURIPath decodes a file:// URI that carries an absolute path. Hosts other
-// than the empty host or localhost are rejected: a remote pwd does not
-// describe the local filesystem.
-func fileURIPath(uri string) string {
-	rest := strings.TrimPrefix(uri, "file://")
+// splitReportedScheme splits "scheme://rest". A bare path has no scheme.
+func splitReportedScheme(value string) (scheme, rest string, ok bool) {
+	index := strings.Index(value, "://")
+	if index <= 0 {
+		return "", "", false
+	}
+	return value[:index], value[index+3:], true
+}
+
+// hostPath decodes the authority and path of a reported cwd URI. A host other
+// than the empty host, localhost, or this machine is rejected: a remote cwd
+// does not describe the local filesystem.
+func hostPath(rest, localHost string) string {
 	var path string
-	switch {
-	case strings.HasPrefix(rest, "/"):
+	if strings.HasPrefix(rest, "/") {
 		path = rest
-	default:
+	} else {
 		slash := strings.IndexByte(rest, '/')
 		if slash < 0 {
 			return ""
 		}
 		host := rest[:slash]
-		if host != "" && !strings.EqualFold(host, "localhost") {
+		if host != "" && !isLocalHost(host, localHost) {
 			return ""
 		}
 		path = rest[slash:]
 	}
 	decoded, ok := percentDecode(path)
 	if !ok {
-		return ""
+		// A path may legitimately contain a percent sign. Keep the raw value
+		// rather than dropping a valid working directory.
+		decoded = path
 	}
 	return absolutePath(decoded)
 }
 
 // absolutePath trims the optional double quotes some shells wrap around the
-// OSC 7 payload and requires the result to be an absolute path.
+// payload and requires the result to be an absolute path.
 func absolutePath(value string) string {
 	path := strings.Trim(value, `"`)
 	if !strings.HasPrefix(path, "/") {
@@ -57,8 +70,40 @@ func absolutePath(value string) string {
 	return path
 }
 
-// percentDecode expands %XX escapes. A malformed or truncated escape makes the
-// whole URI unusable rather than silently dropping bytes.
+func localHostname() string {
+	host, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	return host
+}
+
+// isLocalHost accepts the loopback name and this machine's hostname in either
+// its short or fully-qualified form.
+func isLocalHost(host, local string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if local == "" {
+		return false
+	}
+	host = strings.ToLower(host)
+	local = strings.ToLower(local)
+	if host == local {
+		return true
+	}
+	return shortHostname(host) == shortHostname(local)
+}
+
+func shortHostname(value string) string {
+	if index := strings.IndexByte(value, '.'); index > 0 {
+		return value[:index]
+	}
+	return value
+}
+
+// percentDecode expands %XX escapes. A malformed or truncated escape reports
+// ok=false so the caller can fall back to the raw value.
 func percentDecode(input string) (string, bool) {
 	if !strings.Contains(input, "%") {
 		return input, true
