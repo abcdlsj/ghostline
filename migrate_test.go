@@ -347,6 +347,86 @@ func TestRollingAdoptRestoresSnapshot(t *testing.T) {
 	}
 }
 
+// TestRollingAdoptSeedsSemanticPromptState verifies that the OSC 133 command
+// text and exit status that live only in ghostline's Go-side cache are carried
+// across a rolling upgrade, like the reported pwd.
+func TestRollingAdoptSeedsSemanticPromptState(t *testing.T) {
+	ctx := context.Background()
+	outputDir := t.TempDir()
+	socketDir, err := os.MkdirTemp("/tmp", "ghostline-semantic-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	defer os.RemoveAll(socketDir)
+
+	vt, err := newVTTerminal(80, 24)
+	if err != nil {
+		t.Fatalf("newVTTerminal: %v", err)
+	}
+	vt.Feed([]byte("\x1b]133;A\x07$ \x1b]133;B\x07make test\r\n\x1b]133;C\x07"))
+	nativeSnapshot, err := vt.EncodeState()
+	vt.Close()
+	if err != nil {
+		t.Fatalf("EncodeState: %v", err)
+	}
+
+	exitCode := 1
+	exitAt := time.Unix(1700000000, 0)
+	meta := sessionMeta{
+		Name:      "warren_semantic",
+		Cols:      80,
+		Rows:      24,
+		CreatedAt: time.Now().Unix(),
+		PID:       4242,
+		Alive:     false,
+		Exit:      &exitMeta{Code: 1},
+	}
+	attachMetaOutput(t, &meta, outputDir)
+	adminSocket := filepath.Join(socketDir, "old.admin")
+	startAdminServerWithSnapshotResult(t, adminSocket, meta, nil, adminSnapshotResult{
+		Snapshot: base64.StdEncoding.EncodeToString(nativeSnapshot),
+		Shell: &ShellMetadata{
+			RunningCommand: "make test",
+			LastCommand:    "go vet",
+			LastExitCode:   &exitCode,
+			LastExitAt:     &exitAt,
+		},
+	}, true)
+
+	hub, err := New(Options{OutputDir: outputDir})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer hub.Close()
+	adopted, err := adoptSessions(ctx, adminSocket, hub)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	if adopted != 1 {
+		t.Fatalf("adopted = %d, want 1", adopted)
+	}
+	session, err := hub.Get(ctx, "warren_semantic")
+	if err != nil {
+		t.Fatal("adopted session missing")
+	}
+	metadata, err := session.Metadata(ctx)
+	if err != nil {
+		t.Fatalf("Metadata: %v", err)
+	}
+	if metadata.Shell == nil {
+		t.Fatal("Shell = nil after adoption, want seeded semantic prompt state")
+	}
+	if metadata.Shell.RunningCommand != "make test" || metadata.Shell.LastCommand != "go vet" {
+		t.Fatalf("seeded command state = %+v", metadata.Shell)
+	}
+	if metadata.Shell.LastExitCode == nil || *metadata.Shell.LastExitCode != 1 {
+		t.Fatalf("seeded LastExitCode = %v, want 1", metadata.Shell.LastExitCode)
+	}
+	if metadata.Shell.LastExitAt == nil || !metadata.Shell.LastExitAt.Equal(exitAt) {
+		t.Fatalf("seeded LastExitAt = %v, want %v", metadata.Shell.LastExitAt, exitAt)
+	}
+}
+
 func TestAdoptFallsBackToReplayWhenNativeRestoreFails(t *testing.T) {
 	ctx := context.Background()
 	outputDir := t.TempDir()

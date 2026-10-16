@@ -3,6 +3,7 @@ package ghostline
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -296,6 +297,54 @@ func BenchmarkParseCursor(b *testing.B) {
 	for range b.N {
 		if _, err := ParseCursor("v1:18446744073709551615:9223372036854775807"); err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+// benchmarkVTTerminalFeed measures the PTY output hot path. Every output chunk
+// passes through Feed, so the OSC 133 scan and the at-prompt read must not be a
+// measurable share of the VT write cost.
+func BenchmarkVTTerminalFeed(b *testing.B) {
+	terminal, err := newVTTerminal(120, 36)
+	if errors.Is(err, ErrUnavailable) {
+		b.Skip("libghostty-vt is unavailable for this build")
+	}
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(terminal.Close)
+	chunk := bytes.Repeat([]byte("ghostline output line with colour \x1b[31mred\x1b[0m\r\n"), 1024)
+	b.SetBytes(int64(len(chunk)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		terminal.Feed(chunk)
+	}
+}
+
+// BenchmarkFindOSC133NoMarkers isolates the per-chunk marker scan that the
+// output hot path adds. It returns nil for ordinary output.
+func BenchmarkFindOSC133NoMarkers(b *testing.B) {
+	chunk := bytes.Repeat([]byte("ghostline output line with colour \x1b[31mred\x1b[0m\r\n"), 1024)
+	b.SetBytes(int64(len(chunk)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if spans := findOSC133(chunk); spans != nil {
+			b.Fatalf("unexpected markers: %v", spans)
+		}
+	}
+}
+
+// BenchmarkFindOSC133WithMarkers isolates the scanner's marker path.
+func BenchmarkFindOSC133WithMarkers(b *testing.B) {
+	chunk := bytes.Repeat([]byte("output \x1b]133;A\x07prompt \x1b]133;B\x07command\r\n"), 128)
+	b.SetBytes(int64(len(chunk)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if spans := findOSC133(chunk); len(spans) != 256 {
+			b.Fatalf("markers = %d, want 256", len(spans))
 		}
 	}
 }
