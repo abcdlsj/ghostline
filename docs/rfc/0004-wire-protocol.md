@@ -94,6 +94,13 @@ ordinary method accepting a request raw payload in v1; its `params` identify the
 session. Other ordinary methods reject request payloads. Ordinary responses are
 JSON-only and clients reject an unexpected response payload.
 
+The `metadata` result may carry an optional `shell` object with OSC 133
+semantic prompt state (`atPrompt`, `runningCommand`, `lastCommand`,
+`lastExitCode`, `lastExitAt`). This is an additive optional result member: a
+peer that does not produce or understand it omits or ignores the member, and a
+missing `shell` means the semantic state is unknown, never a guess. No wire or
+protocol version change is required.
+
 ## Pull-stream state machines
 
 Replay, Checkpoint, and Atomic State use a blob stream; Output uses an output

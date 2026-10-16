@@ -56,6 +56,29 @@ positioned as a bulk-data transport. The raw-payload framing removes base64
 amplification, while the remaining per-chunk RPC work is visible in daemon
 allocation counts.
 
+## Semantic prompt hot path
+
+OSC 133 semantic prompt tracking runs inside the per-chunk VT feed. The added
+work is one `GHOSTTY_TERMINAL_DATA_CURSOR_AT_PROMPT` read per chunk and one
+bounded scan for the rare `]133;` fragment; the marker path also snapshots the
+semantic input region, but only once per command. The scan deliberately searches
+the rare fragment rather than the ESC-led prefix, because ESC is common in
+colored output.
+
+Local measurement (2026-10-16, Apple M3, `go test -run '^$' -bench
+'BenchmarkVTTerminalFeed|BenchmarkFindOSC133' -benchmem -benchtime=300ms
+-count=3`):
+
+| Operation | Time | Throughput | Heap allocation |
+| --- | ---: | ---: | ---: |
+| Feed 49 KiB of colored output | 109–112 us | 440–449 MB/s | 17 B, 2 allocs/op |
+| `findOSC133`, same chunk, no markers | 0.56–0.57 us | 86 GB/s | 0 B, 0 allocs/op |
+| `findOSC133`, 256 markers | 4.3–4.4 us | 1.1 GB/s | 16 KiB, 9 allocs/op |
+
+The no-marker scan is under 0.6% of the VT feed cost, so ordinary output pays
+no measurable semantic-prompt overhead. The marker path allocates its span list
+and mutates cached state only when a shell actually emits OSC 133.
+
 ## 256-session PTY scale baseline
 
 The scale baseline models Warren keeping 256 PTYs alive for Codex TUI
