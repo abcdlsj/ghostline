@@ -253,7 +253,7 @@ func (s *Server) handleAdmin(connection net.Conn) {
 			// native snapshot during restore.
 			replay, replayErr := adoption.state.vt.Snapshot()
 			adoption.state.outputMu.Unlock()
-			result := adminSnapshotResult{Pwd: adoption.state.vt.ReportedPwd()}
+			result := adminSnapshotResult{Pwd: adoption.state.vt.ReportedPwd(), Shell: adoption.state.vt.ShellMetadata()}
 			if snapshotErr == nil {
 				result.Snapshot = base64.StdEncoding.EncodeToString(snapshot)
 			} else {
@@ -805,7 +805,7 @@ func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessag
 		if err != nil {
 			return nil, err
 		}
-		return metadataResult{Process: metadata.Process, CommandLine: metadata.CommandLine, Directory: metadata.Directory}, nil
+		return metadataResult{Process: metadata.Process, CommandLine: metadata.CommandLine, Directory: metadata.Directory, Shell: metadata.Shell}, nil
 
 	case rpcMethodSize:
 		session, err := s.namedSession(ctx, raw)

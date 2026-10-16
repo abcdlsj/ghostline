@@ -64,6 +64,108 @@ static bool ghostline_terminal_mode(
         &config
     ) == GHOSTTY_SUCCESS && config.value;
 }
+
+static int ghostline_terminal_row_semantic(
+    GhosttyTerminal terminal,
+    uint32_t y
+) {
+    GhosttyPoint point = {0};
+    point.tag = GHOSTTY_POINT_TAG_ACTIVE;
+    point.value.coordinate.x = 0;
+    point.value.coordinate.y = y;
+    GhosttyGridRef ref = {0};
+    ref.size = sizeof(ref);
+    if (ghostty_terminal_grid_ref(terminal, point, &ref) != GHOSTTY_SUCCESS) {
+        return GHOSTTY_ROW_SEMANTIC_NONE;
+    }
+    GhosttyRow row = 0;
+    if (ghostty_grid_ref_row(&ref, &row) != GHOSTTY_SUCCESS) {
+        return GHOSTTY_ROW_SEMANTIC_NONE;
+    }
+    GhosttyRowSemanticPrompt semantic = GHOSTTY_ROW_SEMANTIC_NONE;
+    if (ghostty_row_get(row, GHOSTTY_ROW_DATA_SEMANTIC_PROMPT, &semantic) != GHOSTTY_SUCCESS) {
+        return GHOSTTY_ROW_SEMANTIC_NONE;
+    }
+    return (int)semantic;
+}
+
+static bool ghostline_terminal_row_wrap(
+    GhosttyTerminal terminal,
+    uint32_t y
+) {
+    GhosttyPoint point = {0};
+    point.tag = GHOSTTY_POINT_TAG_ACTIVE;
+    point.value.coordinate.x = 0;
+    point.value.coordinate.y = y;
+    GhosttyGridRef ref = {0};
+    ref.size = sizeof(ref);
+    if (ghostty_terminal_grid_ref(terminal, point, &ref) != GHOSTTY_SUCCESS) {
+        return false;
+    }
+    GhosttyRow row = 0;
+    if (ghostty_grid_ref_row(&ref, &row) != GHOSTTY_SUCCESS) {
+        return false;
+    }
+    bool wrap = false;
+    if (ghostty_row_get(row, GHOSTTY_ROW_DATA_WRAP, &wrap) != GHOSTTY_SUCCESS) {
+        return false;
+    }
+    return wrap;
+}
+
+// ghostline_terminal_input_row copies the codepoints of the semantic input
+// cells in one active-area row into out. It returns the number of codepoints
+// written, or max+1 when the row would exceed max. Wide-character spacer cells
+// are skipped so a wide glyph contributes exactly one codepoint.
+static size_t ghostline_terminal_input_row(
+    GhosttyTerminal terminal,
+    uint32_t y,
+    uint32_t *out,
+    size_t max
+) {
+    uint16_t cols = 0;
+    if (ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_COLS, &cols) != GHOSTTY_SUCCESS) {
+        return 0;
+    }
+    size_t count = 0;
+    for (uint16_t x = 0; x < cols; x++) {
+        GhosttyPoint point = {0};
+        point.tag = GHOSTTY_POINT_TAG_ACTIVE;
+        point.value.coordinate.x = x;
+        point.value.coordinate.y = y;
+        GhosttyGridRef ref = {0};
+        ref.size = sizeof(ref);
+        if (ghostty_terminal_grid_ref(terminal, point, &ref) != GHOSTTY_SUCCESS) {
+            continue;
+        }
+        GhosttyCell cell = 0;
+        if (ghostty_grid_ref_cell(&ref, &cell) != GHOSTTY_SUCCESS) {
+            continue;
+        }
+        GhosttyCellSemanticContent semantic = GHOSTTY_CELL_SEMANTIC_OUTPUT;
+        if (ghostty_cell_get(cell, GHOSTTY_CELL_DATA_SEMANTIC_CONTENT, &semantic) != GHOSTTY_SUCCESS) {
+            continue;
+        }
+        if (semantic != GHOSTTY_CELL_SEMANTIC_INPUT) {
+            continue;
+        }
+        GhosttyCellWide wide = GHOSTTY_CELL_WIDE_NARROW;
+        if (ghostty_cell_get(cell, GHOSTTY_CELL_DATA_WIDE, &wide) == GHOSTTY_SUCCESS) {
+            if (wide == GHOSTTY_CELL_WIDE_SPACER_TAIL || wide == GHOSTTY_CELL_WIDE_SPACER_HEAD) {
+                continue;
+            }
+        }
+        uint32_t codepoint = 0;
+        if (ghostty_cell_get(cell, GHOSTTY_CELL_DATA_CODEPOINT, &codepoint) != GHOSTTY_SUCCESS) {
+            continue;
+        }
+        if (count >= max) {
+            return max + 1;
+        }
+        out[count++] = codepoint;
+    }
+    return count;
+}
 */
 import "C"
 
@@ -75,6 +177,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 )
 
@@ -93,11 +196,34 @@ const (
 	vtStateHeaderSize = len(vtStateMagic) + 8 + sha256.Size
 )
 
+// Semantic prompt limits bound the command text captured from the terminal
+// input area. The capture copies at most maxSemanticCommandBytes UTF-8 bytes;
+// a longer command is dropped whole rather than truncated.
+const (
+	maxSemanticCommandBytes = 8 << 10
+	semanticLookbackRows    = 4
+	semanticRegionMaxRows   = 128
+)
+
 type vtTerminal struct {
 	mu                 sync.Mutex
 	terminal           C.GhosttyTerminal
 	scrollbackMaxBytes uint64
 	reportedPwd        string
+
+	// Semantic prompt state derived from OSC 133 markers. It is read on every
+	// write but only mutated on a marker occurrence.
+	semanticSeen   bool
+	atPrompt       bool
+	runningCommand string
+	lastCommand    string
+	lastExitCode   int
+	lastExitKnown  bool
+	lastExitAt     time.Time
+
+	// inputScratch is reused for the codepoints of one input row so a command
+	// snapshot does not allocate per row.
+	inputScratch []C.uint32_t
 }
 
 func newVTTerminal(cols, rows int) (*vtTerminal, error) {
@@ -160,14 +286,187 @@ func enableContinuationTracking(terminal C.GhosttyTerminal) error {
 }
 
 // Feed parses raw PTY bytes into the emulated terminal state.
+//
+// OSC 133 semantic prompt markers are applied in two ways: the marker bytes are
+// fed to the VT parser (which maintains cursor, row, and cell semantics that
+// the metadata reads), and ghostline acts on the state change at the exact
+// point the marker terminates. That ordering matters for 133;C, because the
+// command text lives in the semantic input region only until the command's
+// output and the next prompt repaint replace it.
 func (v *vtTerminal) Feed(data []byte) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.terminal == nil || len(data) == 0 {
 		return
 	}
-	v.writeLocked(data)
+	spans := findOSC133(data)
+	if len(spans) == 0 {
+		v.writeLocked(data)
+		v.refreshReportedPwdLocked()
+		v.refreshAtPromptLocked()
+		return
+	}
+	fed := 0
+	for _, span := range spans {
+		v.writeLocked(data[fed:span.end])
+		fed = span.end
+		v.applyOSC133Locked(span)
+		v.refreshAtPromptLocked()
+	}
+	v.writeLocked(data[fed:])
 	v.refreshReportedPwdLocked()
+	v.refreshAtPromptLocked()
+}
+
+// applyOSC133Locked updates ghostline's semantic prompt state for one complete
+// marker. The VT parser has already consumed the marker bytes.
+func (v *vtTerminal) applyOSC133Locked(span osc133Span) {
+	switch span.kind {
+	case 'A', 'B', 'C', 'D':
+		v.semanticSeen = true
+	default:
+		return
+	}
+	switch span.kind {
+	case 'C':
+		// The command line is still in the input region now; snapshot it before
+		// the command output and the next prompt replace it.
+		v.runningCommand = v.captureInputLocked()
+	case 'D':
+		v.lastCommand = v.runningCommand
+		v.runningCommand = ""
+		if span.hasExit {
+			v.lastExitCode = span.exitCode
+			v.lastExitKnown = true
+		}
+		v.lastExitAt = time.Now()
+	}
+}
+
+// refreshAtPromptLocked reads GHOSTTY_TERMINAL_DATA_CURSOR_AT_PROMPT after a
+// write. A true value also proves that semantic markers are in use, so a shell
+// that only ever reported a prompt still produces known metadata.
+func (v *vtTerminal) refreshAtPromptLocked() {
+	if v.terminal == nil {
+		return
+	}
+	var atPrompt C.bool
+	if C.ghostty_terminal_get(
+		v.terminal,
+		C.GHOSTTY_TERMINAL_DATA_CURSOR_AT_PROMPT,
+		unsafe.Pointer(&atPrompt),
+	) != C.GHOSTTY_SUCCESS {
+		return
+	}
+	if atPrompt {
+		v.semanticSeen = true
+	}
+	v.atPrompt = bool(atPrompt)
+}
+
+// captureInputLocked reconstructs the command line from the semantic input
+// region that ends at the cursor. The region is the contiguous block of prompt
+// rows (primary and continuation) above the cursor; walking backward from the
+// most recent primary prompt keeps older commands out even when two prompts are
+// adjacent. Soft-wrapped rows are joined without a separator; distinct prompt
+// lines are joined with a single space. A region that exceeds
+// maxSemanticCommandBytes is discarded whole.
+func (v *vtTerminal) captureInputLocked() string {
+	if v.terminal == nil {
+		return ""
+	}
+	var cursorY C.uint16_t
+	if C.ghostty_terminal_get(
+		v.terminal,
+		C.GHOSTTY_TERMINAL_DATA_CURSOR_Y,
+		unsafe.Pointer(&cursorY),
+	) != C.GHOSTTY_SUCCESS {
+		return ""
+	}
+
+	rows, ok := v.inputRegionRowsLocked(int(cursorY))
+	if !ok || len(rows) == 0 {
+		return ""
+	}
+	if cap(v.inputScratch) < maxSemanticCommandBytes+1 {
+		v.inputScratch = make([]C.uint32_t, maxSemanticCommandBytes+1)
+	}
+
+	var builder strings.Builder
+	previousWrapped := false
+	previousEmpty := true
+	for _, row := range rows {
+		count := int(C.ghostline_terminal_input_row(
+			v.terminal,
+			C.uint32_t(row),
+			(*C.uint32_t)(unsafe.Pointer(&v.inputScratch[0])),
+			C.size_t(len(v.inputScratch)),
+		))
+		if count > maxSemanticCommandBytes {
+			return ""
+		}
+		var rowText strings.Builder
+		for _, codepoint := range v.inputScratch[:count] {
+			if codepoint == 0 {
+				continue
+			}
+			rowText.WriteRune(rune(codepoint))
+		}
+		// Continuation rows are indented by the shell's secondary prompt (PS2),
+		// which is part of the semantic input region. Trim that cosmetic blank
+		// padding so the joined command reads as one line.
+		trimmed := strings.TrimSpace(rowText.String())
+		if trimmed != "" {
+			if !previousEmpty && !previousWrapped {
+				builder.WriteByte(' ')
+			}
+			builder.WriteString(trimmed)
+			previousEmpty = false
+		}
+		if builder.Len() > maxSemanticCommandBytes {
+			return ""
+		}
+		previousWrapped = bool(C.ghostline_terminal_row_wrap(v.terminal, C.uint32_t(row)))
+	}
+	return builder.String()
+}
+
+// inputRegionRowsLocked returns the active-area rows of the current semantic
+// input region in top-to-bottom order. ok is false when no primary prompt row
+// was found within the bounded look-back, in which case the command is unknown.
+func (v *vtTerminal) inputRegionRowsLocked(cursorY int) ([]int, bool) {
+	bottom := cursorY
+	for skipped := 0; bottom >= 0; skipped++ {
+		if skipped > semanticLookbackRows {
+			return nil, false
+		}
+		if C.ghostline_terminal_row_semantic(v.terminal, C.uint32_t(bottom)) != C.GHOSTTY_ROW_SEMANTIC_NONE {
+			break
+		}
+		bottom--
+	}
+	if bottom < 0 {
+		return nil, false
+	}
+	start := -1
+	for row := bottom; row >= 0 && bottom-row <= semanticRegionMaxRows; row-- {
+		semantic := C.ghostline_terminal_row_semantic(v.terminal, C.uint32_t(row))
+		if semantic == C.GHOSTTY_ROW_SEMANTIC_NONE {
+			break
+		}
+		if semantic == C.GHOSTTY_ROW_SEMANTIC_PROMPT {
+			start = row
+			break
+		}
+	}
+	if start < 0 {
+		return nil, false
+	}
+	rows := make([]int, 0, bottom-start+1)
+	for row := start; row <= bottom; row++ {
+		rows = append(rows, row)
+	}
+	return rows, true
 }
 
 // refreshReportedPwdLocked snapshots the terminal's OSC 7 pwd after a write.
@@ -219,6 +518,55 @@ func (v *vtTerminal) SetReportedPwd(pwd string) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.reportedPwd = pwd
+}
+
+// ShellMetadata returns the OSC 133 semantic prompt metadata, or nil when the
+// program has not emitted any semantic marker. The VT snapshot carries the
+// cursor, row, and cell semantics, but the cached command text and exit status
+// are reconstructed from markers, so they must be seeded across adoption.
+func (v *vtTerminal) ShellMetadata() *ShellMetadata {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if !v.semanticSeen {
+		return nil
+	}
+	metadata := &ShellMetadata{
+		AtPrompt:       v.atPrompt,
+		RunningCommand: v.runningCommand,
+		LastCommand:    v.lastCommand,
+	}
+	if v.lastExitKnown {
+		code := v.lastExitCode
+		metadata.LastExitCode = &code
+	}
+	if !v.lastExitAt.IsZero() {
+		at := v.lastExitAt
+		metadata.LastExitAt = &at
+	}
+	return metadata
+}
+
+// SetShellMetadata seeds semantic prompt metadata when a session is adopted
+// from another server process. The VT snapshot already carries the terminal
+// semantics, but the captured command text and the OSC 133;D exit status are
+// ghostline state that the payload does not encode.
+func (v *vtTerminal) SetShellMetadata(metadata *ShellMetadata) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if metadata == nil {
+		return
+	}
+	v.semanticSeen = true
+	v.atPrompt = metadata.AtPrompt
+	v.runningCommand = metadata.RunningCommand
+	v.lastCommand = metadata.LastCommand
+	if metadata.LastExitCode != nil {
+		v.lastExitCode = *metadata.LastExitCode
+		v.lastExitKnown = true
+	}
+	if metadata.LastExitAt != nil {
+		v.lastExitAt = *metadata.LastExitAt
+	}
 }
 
 func (v *vtTerminal) writeLocked(data []byte) {

@@ -160,6 +160,10 @@ type metadataResult struct {
 	Process     string `json:"process,omitempty"`
 	CommandLine string `json:"commandLine,omitempty"`
 	Directory   string `json:"directory,omitempty"`
+	// Shell extends the v1 metadata result with optional OSC 133 semantic
+	// prompt state. Older peers ignore the unknown member and newer clients
+	// read a missing member as unknown, so no wire version change is needed.
+	Shell *ShellMetadata `json:"shell,omitempty"`
 }
 
 type request struct {

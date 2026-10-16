@@ -100,9 +100,14 @@ type adminSnapshotResult struct {
 	// snapshot because it is presentation metadata and not part of the VT
 	// state, so a rolling upgrade keeps the reported directory until the
 	// shell emits the next OSC 7.
-	Pwd    string `json:"pwd,omitempty"`
-	Lossy  bool   `json:"lossy,omitempty"`
-	Reason string `json:"reason,omitempty"`
+	Pwd string `json:"pwd,omitempty"`
+	// Shell is the OSC 133 semantic prompt state. The VT snapshot carries the
+	// terminal semantics, but the captured command text and OSC 133;D exit
+	// status are ghostline state, so a rolling upgrade keeps them until the
+	// shell emits its next marker.
+	Shell  *ShellMetadata `json:"shell,omitempty"`
+	Lossy  bool           `json:"lossy,omitempty"`
+	Reason string         `json:"reason,omitempty"`
 }
 
 type adminBatchResult struct {
@@ -447,6 +452,7 @@ func adoptNativeOrLossyState(adopted sessionMeta, master *os.File, snapshotResul
 		)
 		if err == nil {
 			state.vt.SetReportedPwd(snapshotResult.Pwd)
+			state.vt.SetShellMetadata(snapshotResult.Shell)
 			return state, false, "", nil
 		}
 		nativeErr = err
@@ -473,6 +479,7 @@ func adoptNativeOrLossyState(adopted sessionMeta, master *os.File, snapshotResul
 		return nil, true, nativeErr.Error(), fmt.Errorf("%v; lossy recovery: %w", nativeErr, err)
 	}
 	state.vt.SetReportedPwd(snapshotResult.Pwd)
+	state.vt.SetShellMetadata(snapshotResult.Shell)
 	reason := nativeErr.Error()
 	if snapshotResult.Reason != "" {
 		reason = snapshotResult.Reason + "; " + reason

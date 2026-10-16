@@ -54,6 +54,11 @@ func (s *Session) Status(ctx context.Context) (Status, error) {
 // collected from the parsed output stream. The foreground process name and
 // command line require Options.ProbeForeground; both are best-effort and empty
 // when probing is disabled or the foreground process cannot be resolved.
+//
+// Shell carries the OSC 133 semantic prompt state. It is nil until the
+// program emits a semantic prompt marker, so a missing Shell means "unknown",
+// never a guess. Semantic prompt markers are parsed from the output stream
+// regardless of Options.ProbeForeground.
 func (s *Session) Metadata(ctx context.Context) (SessionMetadata, error) {
 	return s.backend.metadata(ctx)
 }
@@ -196,6 +201,34 @@ type SessionMetadata struct {
 	// Directory is the working directory the program reported through OSC 7.
 	// It is empty until a valid report is parsed.
 	Directory string `json:"directory,omitempty"`
+	// Shell is the semantic prompt state the program reported through OSC 133.
+	// It is nil when the program has not emitted a semantic prompt marker, and
+	// then every subfield is unknown.
+	Shell *ShellMetadata `json:"shell,omitempty"`
+}
+
+// ShellMetadata describes the OSC 133 semantic prompt state of a shell
+// session. It lets a consumer tell whether the shell is waiting for input or
+// running a command, which command it is running or last ran, and how that
+// command exited, without inferring any of it from the foreground process.
+type ShellMetadata struct {
+	// AtPrompt is true while the cursor is inside the shell's prompt or input
+	// area. It is false while a command or its output is on screen.
+	AtPrompt bool `json:"atPrompt"`
+	// RunningCommand is the command line captured from the semantic input area
+	// when the shell started executing it. It is empty when no command is
+	// running or the command text was unavailable (for example, longer than
+	// ghostline's capture bound).
+	RunningCommand string `json:"runningCommand,omitempty"`
+	// LastCommand is the command line of the most recently completed command.
+	// It is empty when the text was unavailable.
+	LastCommand string `json:"lastCommand,omitempty"`
+	// LastExitCode is the exit status the shell reported for the last command
+	// through OSC 133;D. It is nil when no status has been reported.
+	LastExitCode *int `json:"lastExitCode,omitempty"`
+	// LastExitAt is when the last command finished. It is nil until OSC 133;D
+	// is observed.
+	LastExitAt *time.Time `json:"lastExitAt,omitempty"`
 }
 
 // Checkpoint is an atomic screen replay and raw output position.
@@ -284,9 +317,13 @@ func (l *localSession) metadata(ctx context.Context) (SessionMetadata, error) {
 	if err := ctx.Err(); err != nil {
 		return SessionMetadata{}, err
 	}
-	// OSC 7 is parsed from the output stream on every write, so the reported
-	// pwd is available without any OS probe.
-	metadata := SessionMetadata{Directory: l.state.vt.ReportedPwd()}
+	// OSC 7 and OSC 133 are parsed from the output stream on every write, so
+	// the reported pwd and semantic prompt state are available without any OS
+	// probe.
+	metadata := SessionMetadata{
+		Directory: l.state.vt.ReportedPwd(),
+		Shell:     l.state.vt.ShellMetadata(),
+	}
 	if !l.hub.probeForeground {
 		return metadata, nil
 	}

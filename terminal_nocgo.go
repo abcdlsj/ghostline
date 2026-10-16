@@ -23,6 +23,13 @@ func (*vtTerminal) ReportedPwd() string { return "" }
 // SetReportedPwd is a no-op on an unavailable terminal.
 func (*vtTerminal) SetReportedPwd(string) {}
 
+// ShellMetadata reports no semantic prompt metadata because libghostty-vt is
+// unavailable for this build.
+func (*vtTerminal) ShellMetadata() *ShellMetadata { return nil }
+
+// SetShellMetadata is a no-op on an unavailable terminal.
+func (*vtTerminal) SetShellMetadata(*ShellMetadata) {}
+
 // Resize is a no-op on an unavailable terminal.
 func (*vtTerminal) Resize(int, int) {}
 
