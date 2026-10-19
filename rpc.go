@@ -109,17 +109,23 @@ type outputParams struct {
 
 type chunkReadParams struct {
 	MaxBytes int `json:"maxBytes"`
+	// Sized asks for ReadSized semantics. A server that predates it ignores
+	// the field and never returns Size.
+	Sized bool `json:"sized,omitempty"`
 }
 
 type outputReadResult struct {
-	Cursor Cursor `json:"cursor"`
-	EOF    bool   `json:"eof,omitempty"`
+	Cursor Cursor      `json:"cursor"`
+	EOF    bool        `json:"eof,omitempty"`
+	Size   *sizeResult `json:"size,omitempty"`
 }
 
 type blobOpenResult struct {
 	Size   int    `json:"size"`
 	Cursor Cursor `json:"cursor,omitempty"`
 	Format string `json:"format,omitempty"`
+	// Grid is the terminal size at Cursor for an atomic state.
+	Grid *sizeResult `json:"grid,omitempty"`
 }
 
 type blobReadResult struct {

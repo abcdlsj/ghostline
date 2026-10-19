@@ -265,6 +265,10 @@ type AtomicState struct {
 	Payload []byte
 	// Cursor is the first raw output byte not represented by Payload.
 	Cursor Cursor
+	// Size is the terminal grid size at Cursor: the size Payload was captured
+	// at and the size raw output from Cursor is produced for until a reader
+	// reports a change. It is zero when the server predates size reporting.
+	Size Size
 }
 
 // localSession runs a session inside the embedding process.
@@ -476,6 +480,14 @@ func (l *localSession) resize(ctx context.Context, size Size) error {
 	defer l.state.inputMu.Unlock()
 	l.state.outputMu.Lock()
 	defer l.state.outputMu.Unlock()
+	// Record what the child already wrote for the old size before the grid
+	// changes. The copy loop reads only under outputMu, so every byte that
+	// reached the PTY before the resize lands in the log ahead of the size
+	// mark; only output the child produces after this drain is attributed to
+	// the new size.
+	if err := drainResizeOutput(l.state); err != nil {
+		return err
+	}
 	// Resize the server-side emulator before the real PTY. The child sees
 	// SIGWINCH only after ptySetSize and redraws immediately; the emulator
 	// must already be at the new size or that redraw is parsed against the
@@ -485,6 +497,7 @@ func (l *localSession) resize(ctx context.Context, size Size) error {
 		return err
 	}
 	l.state.size = size
+	l.state.output.markSize(size)
 	return nil
 }
 
@@ -549,7 +562,7 @@ func (l *localSession) atomicState(ctx context.Context) (AtomicState, error) {
 	if err != nil {
 		return AtomicState{}, err
 	}
-	return AtomicState{Format: AtomicStateFormat, Payload: payload, Cursor: cursor}, nil
+	return AtomicState{Format: AtomicStateFormat, Payload: payload, Cursor: cursor, Size: l.state.size}, nil
 }
 
 func (l *localSession) output(ctx context.Context, from Cursor) (*OutputReader, error) {

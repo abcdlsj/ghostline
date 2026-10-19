@@ -117,10 +117,18 @@ Open -> Ready -> (Read <-> Ready) -> Ended
    result (size/cursor for blobs, initial cursor for output) and no payload.
    The `state.atomic` result also includes `format`, which must equal the
    advertised `AtomicStateFormat` (`ghostty-vt-snapshot-v1`) before the payload
-   is installed.
+   is installed, and an optional `grid` (`{columns,rows}`): the terminal size at
+   the state's cursor. A missing `grid` means the size is unknown.
 2. **Ready**: the client sends `*.read` with `maxBytes` in `1..MaxChunkBytes`.
    The server returns JSON metadata and at most `maxBytes` raw bytes. A zero
    byte, non-EOF read is invalid progress and is surfaced as `io.ErrNoProgress`.
+   An `output.read` may set `sized:true` to request `ReadSized` semantics: the
+   result then carries an optional `size` (`{columns,rows}`) naming the grid the
+   returned bytes were produced for, no chunk spans a resize, and a zero byte,
+   non-EOF result that carries `size` is a valid resize report rather than
+   invalid progress. A missing `size` means the size is unknown. A server that
+   predates `sized` ignores it and never returns `size`, so the client sees only
+   unknown sizes.
 3. **Ended**: the final read sets `eof:true`; its payload may be non-empty. The
    server closes the stream after that response. Clients return the bytes first
    and `io.EOF` on the next read (or immediately when the final payload is

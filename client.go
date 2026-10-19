@@ -651,6 +651,7 @@ type blobValue struct {
 	data   []byte
 	cursor Cursor
 	format string
+	grid   Size
 }
 
 func (c *Client) readAtomicStateRetryable(ctx context.Context, params any) (AtomicState, error) {
@@ -665,6 +666,7 @@ func (c *Client) readAtomicStateRetryable(ctx context.Context, params any) (Atom
 		Format:  value.format,
 		Payload: value.data,
 		Cursor:  value.cursor,
+		Size:    value.grid,
 	}, nil
 }
 
@@ -776,7 +778,11 @@ func (c *Client) readBlobOnceWithMetadata(ctx context.Context, method string, pa
 			if len(data) != opened.Size {
 				return blobValue{}, errors.New("ghostline: server returned incomplete blob")
 			}
-			return blobValue{data: data, cursor: opened.Cursor, format: opened.Format}, nil
+			value := blobValue{data: data, cursor: opened.Cursor, format: opened.Format}
+			if opened.Grid != nil {
+				value.grid = Size{Columns: opened.Grid.Columns, Rows: opened.Grid.Rows}
+			}
+			return value, nil
 		}
 		if chunkBytes == 0 {
 			return blobValue{}, io.ErrNoProgress
@@ -888,58 +894,83 @@ func (c *Client) openOutput(ctx context.Context, name string, from Cursor) (*rem
 }
 
 func (r *remoteOutputSource) Read(buffer []byte) (int, error) {
+	n, _, err := r.read(buffer, false)
+	return n, err
+}
+
+func (r *remoteOutputSource) ReadSized(buffer []byte) (int, Size, error) {
+	return r.read(buffer, true)
+}
+
+func (r *remoteOutputSource) read(buffer []byte, sized bool) (int, Size, error) {
+	n, size, err := r.readOnce(buffer, sized)
+	if sized && n == 0 && err == nil && size == (Size{}) {
+		// Only a size report may be empty; anything else is a stalled server.
+		return 0, Size{}, io.ErrNoProgress
+	}
+	return n, size, err
+}
+
+func (r *remoteOutputSource) readOnce(buffer []byte, sized bool) (int, Size, error) {
 	if len(buffer) == 0 {
-		return 0, nil
+		return 0, Size{}, nil
 	}
 	if r.closed.Load() {
-		return 0, io.ErrClosedPipe
+		return 0, Size{}, io.ErrClosedPipe
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed.Load() {
-		return 0, io.ErrClosedPipe
+		return 0, Size{}, io.ErrClosedPipe
 	}
 	maxBytes := len(buffer)
 	if maxBytes > maxRPCChunk {
 		maxBytes = maxRPCChunk
 	}
-	params, err := json.Marshal(chunkReadParams{MaxBytes: maxBytes})
+	params, err := json.Marshal(chunkReadParams{MaxBytes: maxBytes, Sized: sized})
 	if err != nil {
-		return 0, err
+		return 0, Size{}, err
 	}
 	next := request{ID: 1, Method: rpcMethodOutputRead, Params: params}
 	if err := writeRequest(r.writer, next); err != nil {
-		return 0, contextErr(r.ctx, err)
+		return 0, Size{}, contextErr(r.ctx, err)
 	}
 	var resp response
 	if err := readResponse(r.reader, &resp); err != nil {
-		return 0, contextErr(r.ctx, err)
+		return 0, Size{}, contextErr(r.ctx, err)
 	}
 	if resp.ID != next.ID {
-		return 0, errors.New("ghostline: mismatched output response ID")
+		return 0, Size{}, errors.New("ghostline: mismatched output response ID")
 	}
 	if resp.Error != nil {
-		return 0, decodeRPCError(resp.Error)
+		return 0, Size{}, decodeRPCError(resp.Error)
 	}
 	var result outputReadResult
 	if err := json.Unmarshal(resp.Result, &result); err != nil {
-		return 0, err
+		return 0, Size{}, err
 	}
 	chunkBytes := resp.PayloadBytes
 	if chunkBytes > len(buffer) || chunkBytes > maxRPCChunk {
-		return 0, errors.New("ghostline: server returned oversized output chunk")
+		return 0, Size{}, errors.New("ghostline: server returned oversized output chunk")
 	}
 	if _, err := io.ReadFull(r.reader, buffer[:chunkBytes]); err != nil {
-		return 0, contextErr(r.ctx, err)
+		return 0, Size{}, contextErr(r.ctx, err)
 	}
 	r.cursor = result.Cursor
+	var size Size
+	if sized && result.Size != nil {
+		size = Size{Columns: result.Size.Columns, Rows: result.Size.Rows}
+	}
 	if chunkBytes != 0 {
-		return chunkBytes, nil
+		return chunkBytes, size, nil
 	}
 	if result.EOF {
-		return 0, io.EOF
+		return 0, Size{}, io.EOF
 	}
-	return 0, io.ErrNoProgress
+	if size != (Size{}) {
+		return 0, size, nil
+	}
+	return 0, Size{}, io.ErrNoProgress
 }
 
 func (r *remoteOutputSource) Cursor() Cursor {

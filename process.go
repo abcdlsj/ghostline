@@ -20,6 +20,11 @@ const (
 	builtinTerm          = "xterm-256color"
 	migrationDrainWindow = 50 * time.Millisecond
 	migrationDrainBudget = 8 << 20
+	// A resize drain runs under the output lock on the client's resize path,
+	// so it is bounded much tighter than a migration handoff. A child that
+	// outruns it is still writing; those bytes are attributed to the new size.
+	resizeDrainWindow = 10 * time.Millisecond
+	resizeDrainBudget = 1 << 20
 )
 
 type sessionState struct {
@@ -126,6 +131,7 @@ func startSession(ctx context.Context, options SessionOptions, size Size, output
 		vt.Close()
 		return nil, err
 	}
+	output.markSize(size)
 	migrationWakeReader, migrationWakeWriter, err := os.Pipe()
 	if err != nil {
 		output.discard()
@@ -239,20 +245,30 @@ func copyOutputLoop(state *sessionState, buffer []byte) bool {
 		if !ready {
 			continue
 		}
+		// Read and record under outputMu, so a resize can never fall between
+		// reading old-size bytes and appending them. Readiness is checked
+		// again under the lock because a resize drain may have consumed the
+		// bytes the poll reported.
+		state.outputMu.Lock()
+		ready, err = waitReadable(state.master, 0)
+		if err != nil || !ready {
+			state.outputMu.Unlock()
+			if err != nil {
+				return false
+			}
+			continue
+		}
 		read, readErr := state.master.Read(buffer)
+		var appendErr error
 		if read > 0 {
 			chunk := buffer[:read]
-			state.outputMu.Lock()
-			appendErr := state.output.append(chunk)
+			appendErr = state.output.append(chunk)
 			if appendErr == nil {
 				state.vt.Feed(chunk)
 			}
-			state.outputMu.Unlock()
-			if appendErr != nil {
-				return false
-			}
 		}
-		if readErr != nil {
+		state.outputMu.Unlock()
+		if appendErr != nil || readErr != nil {
 			return false
 		}
 	}
@@ -361,6 +377,37 @@ func drainOutput(state *sessionState, buffer []byte) error {
 			return readErr
 		}
 	}
+}
+
+// drainResizeOutput records the output that is readable right now, without
+// blocking. The caller holds outputMu. A read error is left for the copy loop,
+// which owns the session's end of life; the resize itself still proceeds.
+func drainResizeOutput(state *sessionState) error {
+	if state.master == nil {
+		return nil
+	}
+	buffer := make([]byte, 32*1024)
+	deadline := time.Now().Add(resizeDrainWindow)
+	drained := 0
+	for drained < resizeDrainBudget && time.Now().Before(deadline) {
+		ready, err := waitReadable(state.master, 0)
+		if err != nil || !ready {
+			return nil
+		}
+		read, readErr := state.master.Read(buffer)
+		if read > 0 {
+			drained += read
+			chunk := buffer[:read]
+			if err := state.output.append(chunk); err != nil {
+				return err
+			}
+			state.vt.Feed(chunk)
+		}
+		if readErr != nil || read == 0 {
+			return nil
+		}
+	}
+	return nil
 }
 
 // waitSessionCommand treats output persistence failure as fatal. Continuing
@@ -551,6 +598,9 @@ func adoptStateWithTerminal(name string, master *os.File, vt *vtTerminal, output
 		close(state.reaped)
 	} else {
 		state.masterFD = int(master.Fd())
+		// Output recorded before this adoption has no known size; from here
+		// on it is produced for the adopted size.
+		state.output.markSize(size)
 	}
 	return state, nil
 }

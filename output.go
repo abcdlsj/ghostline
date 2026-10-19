@@ -110,9 +110,21 @@ func (r *OutputReader) Close() error { return r.source.Close() }
 // Cursor returns the next raw output position Read will deliver.
 func (r *OutputReader) Cursor() Cursor { return r.source.Cursor() }
 
+// ReadSized reads like Read and also reports the terminal grid size the
+// returned bytes were produced for. A chunk never spans a resize: when the
+// size changes, ReadSized first returns zero bytes with the new size, then
+// bytes produced for it. That zero-length result is not an error and is
+// delivered even if the child writes nothing after the resize.
+//
+// A zero Size means the size is unknown, which happens for output recorded
+// before the serving process adopted the session or when the server predates
+// size reporting. Do not mix Read and ReadSized on one reader.
+func (r *OutputReader) ReadSized(p []byte) (int, Size, error) { return r.source.ReadSized(p) }
+
 type outputSource interface {
 	io.ReadCloser
 	Cursor() Cursor
+	ReadSized([]byte) (int, Size, error)
 }
 
 type outputSegment struct {
@@ -132,6 +144,17 @@ type outputLog struct {
 	changed    chan struct{}
 	closed     bool
 	err        error
+	// sizes records where the terminal grid changed, in cursor order. Every
+	// byte at or after a mark's cursor was produced for that mark's size, up
+	// to the next mark. The marks are held in memory only: output recorded
+	// before this process adopted the log has no known size.
+	sizes []sizeMark
+}
+
+// sizeMark is one grid change at an exact output position.
+type sizeMark struct {
+	cursor Cursor
+	size   Size
 }
 
 func createOutputLog(root, name string) (*outputLog, error) {
@@ -330,6 +353,11 @@ func (l *outputLog) rotate() (Cursor, error) {
 	l.generation = next
 	l.segments[next] = outputSegment{path: path}
 	l.active = active
+	// Start every generation with its size so a reader that begins there
+	// never depends on a mark in a generation prune may remove.
+	if count := len(l.sizes); count > 0 {
+		l.sizes = append(l.sizes, sizeMark{cursor: Cursor{generation: next}, size: l.sizes[count-1].size})
+	}
 	l.signalLocked()
 	closeQuietly(previous)
 	return Cursor{generation: next}, nil
@@ -361,8 +389,73 @@ func (l *outputLog) prune(before Cursor) error {
 		// size after this entry is removed.
 		delete(l.segments, generation)
 	}
+	retained := l.sizes[:0]
+	for _, mark := range l.sizes {
+		if _, ok := l.segments[mark.cursor.generation]; ok {
+			retained = append(retained, mark)
+		}
+	}
+	l.sizes = retained
 	l.signalLocked()
 	return nil
+}
+
+// markSize records that output appended from now on is produced for size.
+// The caller holds the session output lock, so no byte can be appended
+// between the grid change and this mark.
+func (l *outputLog) markSize(size Size) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return
+	}
+	cursor := Cursor{generation: l.generation, offset: l.segments[l.generation].size}
+	if count := len(l.sizes); count > 0 {
+		last := &l.sizes[count-1]
+		if last.size == size {
+			return
+		}
+		if last.cursor == cursor {
+			// No byte was produced for the previous size; it never applied.
+			last.size = size
+			l.collapseSizesLocked()
+			l.signalLocked()
+			return
+		}
+	}
+	l.sizes = append(l.sizes, sizeMark{cursor: cursor, size: size})
+	l.signalLocked()
+}
+
+// collapseSizesLocked drops a trailing mark that repeats its predecessor's
+// size, which a replaced zero-length mark can leave behind.
+func (l *outputLog) collapseSizesLocked() {
+	count := len(l.sizes)
+	if count >= 2 && l.sizes[count-1].size == l.sizes[count-2].size &&
+		l.sizes[count-1].cursor.generation == l.sizes[count-2].cursor.generation {
+		l.sizes = l.sizes[:count-1]
+	}
+}
+
+// sizeSpanLocked reports the size in effect at cursor and how many bytes
+// from cursor that size covers before the next mark. A zero Size means the
+// size is unknown; a false bounded means no later mark exists in cursor's
+// generation yet.
+func (l *outputLog) sizeSpanLocked(cursor Cursor) (size Size, span uint64, bounded bool) {
+	for _, mark := range l.sizes {
+		if mark.cursor.generation != cursor.generation {
+			if mark.cursor.generation > cursor.generation {
+				break
+			}
+			continue
+		}
+		if mark.cursor.offset <= cursor.offset {
+			size = mark.size
+			continue
+		}
+		return size, mark.cursor.offset - cursor.offset, true
+	}
+	return size, 0, false
 }
 
 func (l *outputLog) close(err error) {
@@ -399,10 +492,12 @@ func (l *outputLog) signalLocked() {
 }
 
 type localOutputSource struct {
-	ctx       context.Context
-	log       *outputLog
-	mu        sync.Mutex
-	cursor    Cursor
+	ctx    context.Context
+	log    *outputLog
+	mu     sync.Mutex
+	cursor Cursor
+	// reported is the size last returned by ReadSized.
+	reported  Size
 	file      *os.File
 	fileGen   uint64
 	fileLimit uint64
@@ -422,17 +517,30 @@ func (r *localOutputSource) Cursor() Cursor {
 }
 
 func (r *localOutputSource) Read(buffer []byte) (int, error) {
+	n, _, err := r.read(buffer, false)
+	return n, err
+}
+
+func (r *localOutputSource) ReadSized(buffer []byte) (int, Size, error) {
+	return r.read(buffer, true)
+}
+
+// read serves Read and ReadSized. A sized read never returns bytes that span
+// a size mark, and it returns a zero-length chunk to report a size change
+// that no byte has followed yet, so the caller learns of a resize even while
+// the child is silent.
+func (r *localOutputSource) read(buffer []byte, sized bool) (int, Size, error) {
 	if len(buffer) == 0 {
-		return 0, nil
+		return 0, Size{}, nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for {
 		select {
 		case <-r.done:
-			return 0, io.ErrClosedPipe
+			return 0, Size{}, io.ErrClosedPipe
 		case <-r.ctx.Done():
-			return 0, r.ctx.Err()
+			return 0, Size{}, r.ctx.Err()
 		default:
 		}
 
@@ -449,17 +557,34 @@ func (r *localOutputSource) Read(buffer []byte) (int, error) {
 		}
 		if !exists && !(r.file != nil && r.fileGen == r.cursor.generation && r.complete) {
 			r.log.mu.Unlock()
-			return 0, ErrCursorExpired
+			return 0, Size{}, ErrCursorExpired
 		}
-		if r.cursor.offset < r.fileLimit {
+		var size Size
+		end := r.fileLimit
+		if sized {
+			var span uint64
+			var bounded bool
+			size, span, bounded = r.log.sizeSpanLocked(r.cursor)
+			if size != (Size{}) && size != r.reported {
+				r.reported = size
+				r.log.mu.Unlock()
+				return 0, size, nil
+			}
+			if bounded && r.cursor.offset+span < end {
+				// Stop at the next mark; the following call reports it before
+				// any byte produced for the new size.
+				end = r.cursor.offset + span
+			}
+		}
+		if r.cursor.offset < end {
 			path := segment.path
 			if !exists {
 				path = r.file.Name()
 			}
-			limit := r.fileLimit - r.cursor.offset
+			limit := end - r.cursor.offset
 			r.log.mu.Unlock()
 			if err := r.openFile(path); err != nil {
-				return 0, err
+				return 0, Size{}, err
 			}
 			readBuffer := buffer
 			if uint64(len(readBuffer)) > limit {
@@ -468,11 +593,11 @@ func (r *localOutputSource) Read(buffer []byte) (int, error) {
 			n, err := r.file.ReadAt(readBuffer, int64(r.cursor.offset))
 			r.cursor.offset += uint64(n)
 			if n > 0 && (err == nil || errors.Is(err, io.EOF)) {
-				return n, nil
+				return n, size, nil
 			}
-			return n, err
+			return n, size, err
 		}
-		if r.complete {
+		if r.complete && r.cursor.offset >= r.fileLimit {
 			next := r.cursor.generation + 1
 			r.log.mu.Unlock()
 			r.closeFile()
@@ -483,15 +608,15 @@ func (r *localOutputSource) Read(buffer []byte) (int, error) {
 		r.log.mu.Unlock()
 		if closed {
 			if terminalErr != nil {
-				return 0, terminalErr
+				return 0, Size{}, terminalErr
 			}
-			return 0, io.EOF
+			return 0, Size{}, io.EOF
 		}
 		select {
 		case <-r.done:
-			return 0, io.ErrClosedPipe
+			return 0, Size{}, io.ErrClosedPipe
 		case <-r.ctx.Done():
-			return 0, r.ctx.Err()
+			return 0, Size{}, r.ctx.Err()
 		case <-changed:
 		}
 	}

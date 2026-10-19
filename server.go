@@ -550,6 +550,9 @@ func (s *Server) serveBlob(connection net.Conn, wireReader *bufio.Reader, writer
 			data = state.Payload
 			opened.Cursor = state.Cursor
 			opened.Format = state.Format
+			if state.Size != (Size{}) {
+				opened.Grid = &sizeResult{Columns: state.Size.Columns, Rows: state.Size.Rows}
+			}
 		}
 	}
 	close(stop)
@@ -666,12 +669,24 @@ func (s *Server) serveOutput(connection net.Conn, wireReader *bufio.Reader, writ
 				defer close(monitored)
 				monitorConnection(connection, cancel, stop)
 			}()
-			n, readErr := output.Read(buffer)
+			var (
+				n       int
+				size    Size
+				readErr error
+			)
+			if readParams.Sized {
+				n, size, readErr = output.ReadSized(buffer)
+			} else {
+				n, readErr = output.Read(buffer)
+			}
 			close(stop)
 			_ = connection.SetReadDeadline(time.Now())
 			<-monitored
 			_ = connection.SetReadDeadline(time.Time{})
 			result := outputReadResult{Cursor: output.Cursor()}
+			if size != (Size{}) {
+				result.Size = &sizeResult{Columns: size.Columns, Rows: size.Rows}
+			}
 			if errors.Is(readErr, io.EOF) {
 				result.EOF = true
 				readErr = nil
